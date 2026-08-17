@@ -15,6 +15,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
 | 6 | `<tfoot>` before `<tbody>` renders at the top of the table | — | real, single-page | **open** — see below |
+| 7 | `break-inside: avoid` block overflows the page instead of moving | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **open** — see below |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -268,3 +269,29 @@ cargo run -p fulgur-cli -- render -o out-ful.pdf in.html
 # compare text positions in mm
 pdftotext -bbox -f 1 -l 1 out.pdf -    # xMin/yMin are pt; * 25.4/72 = mm
 ```
+
+## 7 — a `break-inside: avoid` block overflows the page bottom
+
+Found by `scripts/refdiff`, not by hand — the first thing that harness caught
+that nothing else had. Pre-existing: rendering the fixture with the `<thead>` /
+`<tfoot>` band machinery forced off is **byte-identical**, so defect 2's change
+is not the cause.
+
+Four 120mm blocks with `break-inside: avoid`, after a lead paragraph, A4/20mm
+(content band y 56.7–785.2pt). fulgur's block pitch is 349pt:
+
+| engine | pages | page 1 | page 2 | page 3 |
+|---|---|---|---|---|
+| WeasyPrint 69 | 3 | Lead, Block0@96 | Block1@62, Block2@412 | Block3@62 |
+| fulgur | 2 | Lead, Block0@97, **Block1@447** | Block2@63, Block3@412 | — |
+
+`Block1` at y=447 spans to ≈796pt, past the 785pt content bottom. fulgur neither
+splits it nor moves it to the next page — it lets it overflow, and the document
+paginates to 2 pages where WeasyPrint uses 3.
+
+Not font noise: the blocks are sized in mm, so the divergence survives any font
+difference. Not yet root-caused — the strip-overflow cut in
+`fragment_block_subtree` fires on `child_page_y > page_start_y`, and an oversized
+atomic leaf is deliberately allowed to emit whole rather than be pushed (that is
+what keeps a too-tall row from being pushed page after page), so the interaction
+with `break-inside: avoid` needs its own look.
