@@ -159,6 +159,20 @@ workerd) against **1128 ms** through Chrome + Paged.js — no browser, no contai
 Chrome stays for the rest. Four defects are written up in `paperworx-repros/`; the plan is
 to fix each here and offer it upstream as a separate PR.
 
+**Check the git history before believing "fulgur never implemented X".** Defect 2 was
+written up as an unimplemented feature; `<thead>` repetition had in fact shipped in the v1
+`Pageable` architecture (`TablePageable`, PR #14) and was dropped in the Phase 4 migration
+to `Drawables`. The "not modelled in PR 5" / "deferred to a later change" comments were
+the v2 authors recording a removal, not an absence. `git log --all -S <symbol>` found it in
+seconds and turned the change from an invention into a port — with the original algorithm,
+its example, and a review-fixed bug (`4d44c483`) to inherit.
+
+Paged.js is not a design reference for pagination features: 0.4.3's only table-aware code
+propagates `break-inside: avoid` from `<tbody>`/`<thead>`, and it has no repeat concept at
+all. Because it replaces Chrome's own pagination with DOM chunking, Chrome's native header
+repetition never engages either — so the Chrome + Paged.js path we ship today does not
+repeat theads. WeasyPrint's `layout/table.py` is the reference worth reading.
+
 ### Baselines
 
 `cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).

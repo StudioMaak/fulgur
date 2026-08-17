@@ -10,7 +10,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | # | defect | file | severity | status |
 |---|---|---|---|---|
 | 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | **misdiagnosed** — see below |
-| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **unimplemented feature** — scoped |
+| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **fixed** — was a v2 regression, not a missing feature |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
@@ -53,49 +53,81 @@ reference: WeasyPrint emits exactly one `/Link` here, and on `element(title, las
 agrees with fulgur page-for-page (Override / Override / Two), which it did not before —
 the running elements had been occupying space and mis-paginating the document.
 
-## 2 — an unimplemented feature, not a defect; scoped and ready to start
+## 2 — fixed; it was a regression, not a missing feature
 
-fulgur never claimed this. Both `drawables.rs` and `render.rs` say so outright: *"Multi-page
-header repetition (`<thead>` cloned on continuation pages) is **not** modelled in PR 5"* and
-*"deferred to a later change"*. Upstream scheduled it as its own PR, and the `is_header`
-flag threaded through `convert::table::collect_table_cells` is dead plumbing left for it.
+**The earlier framing here was wrong, and the repo's own git history disproves it.**
+fulgur *did* implement `<thead>` repetition — `TablePageable`, shipped in PR #14
+(`065def71`, March 2026) — and lost it in the Phase 4 migration from the `Pageable`
+tree to geometry-driven `Drawables` (`cd740c3d`, "delete pageable.rs, all Pageable
+types removed"). The comments in `drawables.rs` ("not modelled in PR 5") and
+`render.rs` ("deferred to a later change") were the v2 authors recording that they
+had dropped it, not that it had never existed. `examples/table-header/` is v1's own
+example, and the `is_header` flag in `convert::table::collect_table_cells` is what
+survives of v1's classification.
 
-Measured on a 300-row A4 fixture — the reported 1/9 reproduces as 1/7 here:
+Offer this upstream as *restoring* behaviour lost in the Drawables migration.
+
+### The fixture was broken
+
+`02-thead-repeat.html` had lost its `<html><head><style>` opening tags — the file
+went straight from the HTML comment to bare CSS text and a stray `</style>`, so none
+of the CSS applied. That is why WeasyPrint measured 8 pages here rather than the 7
+recorded in this table. Repaired as part of this change; both engines then reproduce
+the documented numbers exactly.
+
+### Measured after the fix
 
 | engine | pages | pages with header | unique rows | duplicated |
 |---|---|---|---|---|
 | WeasyPrint 69 | 7 | **7/7** | 300/300 | 0 |
-| fulgur | 7 | **1/7** | 300/300 | 0 |
+| fulgur (before) | 7 | 1/7 | 300/300 | 0 |
+| fulgur (after) | 7 | **7/7** | 300/300 | 0 |
 
-Row integrity is perfect and must stay that way — it is the thing a careless fragmenter
-change would break.
+Header bottom lands within **0.03pt** of WeasyPrint's on every page — the same order
+as the font-metric residual seen in defect 4. Verified on three shapes: the fixture,
+a table with no CSS at all, and a table starting mid-page after a heading.
 
-### Groundwork already in place
+### How it works
 
-- `PaginationGeometry::is_repeat` already models per-page repetition, and `is_split()`
-  already refuses to subdivide such fragments.
-- `record_fixed_subtree_descendants` is a working precedent: it walks a subtree and emits
-  one fragment per page with `is_repeat = true`, under an `emitted` budget bounding
-  O(descendants x pages).
-- The fragmenter is a cursor-based fill (`cursor_y + h > page_height_px` -> advance page,
-  reset cursor), not a naive `y / page_height` map — so reserving header height on a
-  continuation page is expressible.
-- `crates/fulgur/tests/thead_repeat.rs` encodes the requirement, currently `#[ignore]`d
-  with the reason. Un-ignore it to start; the single-page control beside it already passes
-  and guards against a reservation that fires when it should not.
+The header must *reserve* space, so it cannot be a post-pass like
+`append_position_fixed_fragments` — `position: fixed` is out of flow and displaces
+nothing, whereas header fragments emitted without reservation land on top of the
+first row of every continuation page. `thead_repeat.rs` pins that: disabling the
+reservation while keeping the emission puts the header's bottom *below* the topmost
+row.
 
-### Why it is not a small change
+Blitz lays a `<table>` out as a flat cell grid — the table's `layout_children` are
+the `<th>` / `<td>` boxes, and `<thead>` / `<tbody>` / `<tr>` carry no layout at all
+— so a header cell is found by DOM ancestry, not by walking a `<thead>` layout child.
 
-The header must also **reserve** space, so it cannot be done as a post-pass the way
-`append_position_fixed_fragments` adds `position: fixed` repeats — those are out of flow
-and never displace anything. Emitting header fragments without reservation would overlap
-the first row of every continuation page, which is worse than the current omission.
+`fragment_block_subtree` computes the band once per table and reserves it at the
+strip-overflow page cut, emitting `is_repeat = true` geometry for the header cells so
+the existing per-NodeId dispatch redraws them whole on each page. Whether to reserve
+is decided **per page**, following WeasyPrint's
+`layout/table.py::all_groups_layout`: a header that would leave no room for a row is
+dropped for that page. That makes the pathological cases — a header taller than the
+page, or one that starves the first row — fall out instead of needing their own
+guards, and guarantees the fragmenter still makes progress.
 
-Reservation belongs in `fragment_block_subtree`, which carries `RowState` co-splitting,
-`page_taffy_origin`, `origin_pending_same_row`, grid/flex parallel-sibling handling and
-**four** page-advance sites, each with its own state restoration. That is the delicate
-core of the engine, and it is why this is the largest of the five items by a wide margin —
-and why upstream made it a separate PR.
+Only the header carries `is_repeat`. v1 shipped a bug where table *body* cells were
+cloned wholesale onto every page instead of sliced per page (fixed in `4d44c483`);
+widening `is_repeat` past the header would reintroduce exactly that.
+
+### Known limitations
+
+- **`<tfoot>` is not repeated.** WeasyPrint repeats both; this change scopes to the
+  header, matching the upstream PR's scope.
+- **Collapsed borders are not resolved for the repeated header.** With
+  `border-collapse: collapse`, WeasyPrint tracks `body_rows_offset = skipped_rows -
+  header_rows` in `draw/__init__.py` purely to resolve a repeated header row's
+  borders against the first body row. fulgur does not.
+- **A cell whose own content splits across pages does not carry the header** on the
+  pages that split spans. The recursion places that content from y = 0 on the new
+  page, so there is no reserved room there; the header is omitted rather than
+  overlapped.
+- **Forced breaks inside a table do not repeat the header** — measured: `break-before:
+  page` on a `<td>` is not honoured by fulgur at all, so those page-advance paths are
+  unreachable for tables today and deliberately carry no reservation logic.
 
 ## 3 — fixed
 
