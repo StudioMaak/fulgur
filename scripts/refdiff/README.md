@@ -67,4 +67,7 @@ so far, and the one place the two disagree with each other is documented in
 
 Its first run caught two things: it independently rediscovered the `<tfoot>`
 source-order defect (found by hand while implementing footer repetition), and
-surfaced a `break-inside: avoid` overflow that nothing else had.
+surfaced one nothing else had — page 0 being over-filled by the body's own
+offset, so content spilled past the page bottom into the margin band where
+`@bottom-center` draws. That one is now fixed (defect 7); the fixture reports
+`AGREE` at 3 pages against WeasyPrint's 3.

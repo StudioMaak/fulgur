@@ -22,12 +22,11 @@ always differ. Statuses are ranked by how much they mean:
 | `SHIFT` | same content and pages, max Δy > 12pt | usually font metrics |
 | `AGREE` | same content, same pages, positions within tolerance | no |
 
-Summary: **1 MISSING**, **1 PAGES**, **5 PACKING**, **2 SHIFT**, **5 AGREE**.
+Summary: **1 MISSING**, **5 PACKING**, **2 SHIFT**, **6 AGREE**.
 
 | fixture | what it isolates | status | fulgur | weasy | detail |
 |---|---|---|---|---|---|
 | `table-tfoot-source-order` | tfoot written before tbody must still render last | `MISSING` | 3 | 3 | fulgur omits `Foot` (1 of 3), `Total` (1 of 3) |
-| `break-inside-avoid` | break-inside:avoid keeps a block whole | `PAGES` | 2 | 3 | fulgur 2 pages, WeasyPrint 3 |
 | `list-markers` | ordered list markers across a page break | `PACKING` | 2 | 2 | 6 runs cross a page boundary differently (reading order identical) |
 | `orphans-widows` | orphans and widows defaults at a page boundary | `PACKING` | 2 | 2 | 66 runs cross a page boundary differently (reading order identical) |
 | `table-caption` | caption placement across a page break | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
@@ -36,6 +35,7 @@ Summary: **1 MISSING**, **1 PAGES**, **5 PACKING**, **2 SHIFT**, **5 AGREE**.
 | `multicol-basic` | two-column flow | `SHIFT` | 1 | 1 | max Δy 109.2pt (`Mc66`) |
 | `table-cell-break-before` | break-before:page on a table cell | `SHIFT` | 1 | 1 | max Δy 42.8pt (`R0039`) |
 | `break-before-page` | break-before:page forces a new page | `AGREE` | 3 | 3 | max Δy 10.3pt |
+| `break-inside-avoid` | break-inside:avoid keeps a block whole | `AGREE` | 3 | 3 | max Δy 1.3pt |
 | `counter-page` | counter(page) in a margin box | `AGREE` | 2 | 2 | max Δy 0.8pt |
 | `page-margin-boxes` | @page margin boxes on every page | `AGREE` | 2 | 2 | max Δy 0.8pt |
 | `position-fixed` | position:fixed repeats on every page | `AGREE` | 2 | 2 | max Δy 5.3pt |

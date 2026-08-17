@@ -15,7 +15,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
 | 6 | `<tfoot>` before `<tbody>` renders at the top of the table | — | real, single-page | **open** — see below |
-| 7 | `break-inside: avoid` block overflows the page instead of moving | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **open** — see below |
+| 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -270,28 +270,78 @@ cargo run -p fulgur-cli -- render -o out-ful.pdf in.html
 pdftotext -bbox -f 1 -l 1 out.pdf -    # xMin/yMin are pt; * 25.4/72 = mm
 ```
 
-## 7 — a `break-inside: avoid` block overflows the page bottom
+## 7 — fixed; page 0 was over-filled by the body offset
 
 Found by `scripts/refdiff`, not by hand — the first thing that harness caught
-that nothing else had. Pre-existing: rendering the fixture with the `<thead>` /
-`<tfoot>` band machinery forced off is **byte-identical**, so defect 2's change
-is not the cause.
+that nothing else had. **The name is a misnomer**: the fixture that surfaced it
+uses `break-inside: avoid`, but the defect has nothing to do with it. The same
+divergence reproduces with `break-inside: auto` and with empty blocks, which is
+what killed the first hypothesis.
 
-Four 120mm blocks with `break-inside: avoid`, after a lead paragraph, A4/20mm
-(content band y 56.7–785.2pt). fulgur's block pitch is 349pt:
+### Root cause
 
-| engine | pages | page 1 | page 2 | page 3 |
-|---|---|---|---|---|
-| WeasyPrint 69 | 3 | Lead, Block0@96 | Block1@62, Block2@412 | Block3@62 |
-| fulgur | 2 | Lead, Block0@97, **Block1@447** | Block2@63, Block3@412 | — |
+`render_v2` shifts page 0's fragments down by `body_offset_pt.1` — body's own
+`location.y`, which absorbs the collapsed top margin of the first in-flow child
+— and applies it to **page 0 only**; continuation pages are already
+page-content-area-relative because the fragmenter resets `cursor_y` to 0
+(`render.rs`: *"only on page 0 (continuation pages are already
+page-content-area-relative after the fragmenter resets cursor_y)"*).
 
-`Block1` at y=447 spans to ≈796pt, past the 785pt content bottom. fulgur neither
-splits it nor moves it to the next page — it lets it overflow, and the document
-paginates to 2 pages where WeasyPrint uses 3.
+The fragmenter, however, compared body-relative cursors against the **full**
+page height. So page 0's usable height was over-stated by exactly the body
+offset, and whatever landed last on it spilled past the page bottom.
 
-Not font noise: the blocks are sized in mm, so the divergence survives any font
-difference. Not yet root-caused — the strip-overflow cut in
-`fragment_block_subtree` fires on `child_page_y > page_start_y`, and an oversized
-atomic leaf is deliberately allowed to emit whole rather than be pushed (that is
-what keeps a too-tall row from being pushed page after page), so the interaction
-with `break-inside: avoid` needs its own look.
+Measured on the fixture: page height 971.35px, body offset 15px, page 0's
+content reaching 964px body-relative — true bottom 979px, a **5.74pt overflow**,
+and 2 pages where WeasyPrint uses 3.
+
+### It was not rare
+
+A 100-paragraph document with fulgur's default 20mm margins (content band
+56.69–785.20pt) drew **12 words below the content bottom**, worst overflow
+8.74pt — into the band where `@bottom-center` renders the page number, so body
+text and the page number overlap. After the fix: **0 words below the bottom**,
+matching WeasyPrint exactly (4 pages, 0 overflow, both engines).
+
+It only changes the *page count* when the last block on page 0 happens to land
+within the offset window, which is why it stayed invisible: usually it just
+prints a line or two into the bottom margin.
+
+### The fix
+
+Page 0's capacity is `page_height_px - body_offset_y`; every later page keeps
+the full height. Applied at the four decision sites in
+`fragment_pagination_root` — inline-root promotion, the recursion gate's
+available strip, the block strip-overflow cut, and an oversized child's first
+slice.
+
+Covered by `crates/fulgur/tests/body_offset_capacity.rs`, whose fixture is
+font-independent (every height an explicit `mm`) and places the page boundary
+inside the offset window so the two capacity models give 3 pages versus 2. Its
+control asserts that a document with **no** body offset keeps the full first
+page — guarding against "fixing" this by shrinking every page, which would
+under-fill documents that never had an offset.
+
+`scripts/refdiff` now reports this fixture as `AGREE` at 3 pages against
+WeasyPrint's 3, max Δy 1.3pt.
+
+### Two goldens had encoded it
+
+`gcpm_multipage_counter` and `gcpm_string_set_chapter_title` both changed. Their
+committed snapshots placed a text baseline at **792.44pt** against a content
+bottom of **785.20pt** — 7.24pt into the bottom margin. They were regenerated
+only after measuring that the pre-fix build drew 12 words past the page bottom
+and the post-fix build draws none.
+
+That is the fourth golden in this fork found to have encoded a defect as
+expected output. Regenerating is never verification; see
+`docs/test-harnesses.md`.
+
+### Still open
+
+The same capacity model applies inside `fragment_block_subtree`, which receives
+`page_height_px` and does its own overflow comparisons. No fixture reproduces a
+failure there — a body-direct child would have to recurse on page 0 *and* have
+its internal break land within the body offset of the bottom — so it is
+deliberately left alone rather than changed speculatively without a failing
+test.

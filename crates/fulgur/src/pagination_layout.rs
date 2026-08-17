@@ -420,6 +420,31 @@ impl<'a> PaginationLayoutTree<'a> {
         let body_w = body_layout.size.width;
         let body_x = body_layout.location.x;
 
+        // fulgur defect 7: page 0's usable height is short by body's own
+        // offset from the page content top.
+        //
+        // `render_v2` shifts page 0's fragments down by `body_offset_pt.1` —
+        // body's `location.y`, which absorbs the collapsed top margin of the
+        // first in-flow child — and does so on page 0 **only**; continuation
+        // pages are already page-content-area-relative because the walk below
+        // resets `cursor_y` to 0 when it advances. So a body-relative cursor
+        // compared against the full page height over-fills page 0 by exactly
+        // that offset, and its last block overflows the page bottom.
+        //
+        // Measured against WeasyPrint 69 on
+        // `scripts/refdiff/fixtures/break-inside-avoid.html`: body offset 15px,
+        // page 0's content reaching 964px of a 971.35px page, true bottom 979px —
+        // a 5.74pt overflow, and 2 pages where WeasyPrint uses 3.
+        let body_offset_y = body_layout.location.y;
+        let page_h = self.page_height_px;
+        let capacity = move |page: u32| {
+            if page == 0 {
+                (page_h - body_offset_y).max(0.0)
+            } else {
+                page_h
+            }
+        };
+
         // fulgur-s67g Phase 2.3 (counter parity follow-up): record
         // body itself as a fragment on page 0. body's own
         // counter-reset / string-set / bookmark declarations must fire
@@ -747,7 +772,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     .last()
                     .map(|l| l.1 - line_metrics[0].0)
                     .unwrap_or(child_h);
-                if cursor_y > 0.0 && cursor_y + para_total_h > self.page_height_px {
+                if cursor_y > 0.0 && cursor_y + para_total_h > capacity(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
                 }
@@ -834,7 +859,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             .is_some_and(crate::blitz_adapter::has_column_span_all)
                     })
                 });
-            let available_strip = (self.page_height_px - cursor_y).max(0.0);
+            let available_strip = (capacity(page_index) - cursor_y).max(0.0);
             let needs_recursion = has_splittable_children
                 && (!is_multicol || multicol_has_span_all)
                 && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
@@ -889,7 +914,7 @@ impl<'a> PaginationLayoutTree<'a> {
             // `avoid_inside` above (it just suppresses the inline
             // split branch; remaining-strip overflow handling is
             // identical).
-            if cursor_y > 0.0 && cursor_y + child_h > self.page_height_px {
+            if cursor_y > 0.0 && cursor_y + child_h > capacity(page_index) {
                 page_index += 1;
                 cursor_y = 0.0;
             }
@@ -944,7 +969,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 .primary_styles()
                 .is_some_and(|s| !s.get_box().transform.0.is_empty());
             if !has_transform && child_h > self.page_height_px + 1.0 {
-                let first_slice_h = (self.page_height_px - cursor_y).min(child_h);
+                let first_slice_h = (capacity(page_index) - cursor_y).min(child_h);
                 self.geometry
                     .entry(child_id)
                     .or_default()
@@ -4885,9 +4910,21 @@ mod tests {
         let html = r#"<html><body><div style="height: 4000px"></div></body></html>"#;
         let mut doc = parse(html, 600.0);
         let table = run_pass(&mut doc, 800.0);
+        // body keeps its default 8px margin, so body's origin — and with it
+        // page 0's usable height — is 8px down: page 0 shows 792px of the
+        // band, then 800px per page. 792 + 800x4 + 8 = 4000, so six pages
+        // carry the whole band and nothing is drawn past a page bottom.
+        //
+        // This asserted 5 until defect 7 was fixed. Five pages x 800px also
+        // sums to 4000, but only because page 0's slice was measured from the
+        // full page height while `render_v2` shifts page 0 down by the body
+        // offset — so its last 8px landed below the page bottom. The count
+        // here is arithmetic, not a magic number: what the test is really
+        // pinning is that a sub-cap childless band renders fully rather than
+        // collapsing to one page (the `collapse_childless` DoS guard).
         assert_eq!(
             implied_page_count(&table),
-            5,
+            6,
             "a sub-cap childless band must render fully, not collapse",
         );
     }
