@@ -10,7 +10,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | # | defect | file | severity | status |
 |---|---|---|---|---|
 | 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | **misdiagnosed** — see below |
-| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | open |
+| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **unimplemented feature** — scoped |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
@@ -52,6 +52,50 @@ margin-box render" to carry a link annotation. All four were corrected against t
 reference: WeasyPrint emits exactly one `/Link` here, and on `element(title, last)` it now
 agrees with fulgur page-for-page (Override / Override / Two), which it did not before —
 the running elements had been occupying space and mis-paginating the document.
+
+## 2 — an unimplemented feature, not a defect; scoped and ready to start
+
+fulgur never claimed this. Both `drawables.rs` and `render.rs` say so outright: *"Multi-page
+header repetition (`<thead>` cloned on continuation pages) is **not** modelled in PR 5"* and
+*"deferred to a later change"*. Upstream scheduled it as its own PR, and the `is_header`
+flag threaded through `convert::table::collect_table_cells` is dead plumbing left for it.
+
+Measured on a 300-row A4 fixture — the reported 1/9 reproduces as 1/7 here:
+
+| engine | pages | pages with header | unique rows | duplicated |
+|---|---|---|---|---|
+| WeasyPrint 69 | 7 | **7/7** | 300/300 | 0 |
+| fulgur | 7 | **1/7** | 300/300 | 0 |
+
+Row integrity is perfect and must stay that way — it is the thing a careless fragmenter
+change would break.
+
+### Groundwork already in place
+
+- `PaginationGeometry::is_repeat` already models per-page repetition, and `is_split()`
+  already refuses to subdivide such fragments.
+- `record_fixed_subtree_descendants` is a working precedent: it walks a subtree and emits
+  one fragment per page with `is_repeat = true`, under an `emitted` budget bounding
+  O(descendants x pages).
+- The fragmenter is a cursor-based fill (`cursor_y + h > page_height_px` -> advance page,
+  reset cursor), not a naive `y / page_height` map — so reserving header height on a
+  continuation page is expressible.
+- `crates/fulgur/tests/thead_repeat.rs` encodes the requirement, currently `#[ignore]`d
+  with the reason. Un-ignore it to start; the single-page control beside it already passes
+  and guards against a reservation that fires when it should not.
+
+### Why it is not a small change
+
+The header must also **reserve** space, so it cannot be done as a post-pass the way
+`append_position_fixed_fragments` adds `position: fixed` repeats — those are out of flow
+and never displace anything. Emitting header fragments without reservation would overlap
+the first row of every continuation page, which is worse than the current omission.
+
+Reservation belongs in `fragment_block_subtree`, which carries `RowState` co-splitting,
+`page_taffy_origin`, `origin_pending_same_row`, grid/flex parallel-sibling handling and
+**four** page-advance sites, each with its own state restoration. That is the delicate
+core of the engine, and it is why this is the largest of the five items by a wide margin —
+and why upstream made it a separate PR.
 
 ## 3 — fixed
 
