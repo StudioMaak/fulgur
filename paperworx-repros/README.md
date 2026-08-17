@@ -13,6 +13,31 @@ Intent: fix here, then offer upstream as separate PRs.
 | 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | open |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | open |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
+| 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
+
+## 5 — deferred until 1-3 are done
+
+Found while checking whether 4's fix was a general capability or only enough for our own
+documents. It is a real conformance gap, but nothing paperworx renders depends on it, so
+it waits.
+
+A red `background` on `@bottom-center`, A4/25mm (band = x 25-185mm, y 272-297mm):
+
+| engine | horizontal | vertical |
+|---|---|---|
+| WeasyPrint 69 | 103.0-105.8mm (shrink-wrapped to the text) | 272.3-296.3mm (full band) |
+| fulgur | 25.4-184.1mm (full width) | 282.9-285.8mm (**content height only**) |
+| Chrome 151 | 24.7-184.1mm (full width) | 272.3-296.3mm (full band) |
+
+**This is the one case where the two reference engines disagree with each other**, so
+their agreement cannot settle it. Chrome's model — the margin box *is* its rect, on both
+axes — is the one matching §5.3.3, and it also explains the `text-align` divergence:
+WeasyPrint shrink-wraps horizontally, so alignment inside the box is moot there.
+
+The cause is that an author's `declarations` render on an inner element rather than on the
+box. Moving them to the wrapper fixes the background, but the wrapper zeroes
+`margin`/`padding` precisely so the renderer can paint at `rect.x, rect.y` with a (0, 0)
+body offset — so author `margin` has to be handled in the same change.
 
 ## 4 — fixed
 
