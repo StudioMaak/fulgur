@@ -1591,7 +1591,28 @@ fn has_page_name_change_below(
 /// Returns `(final_page_index, final_cursor_y)`: the page and y where
 /// the parent's last child finished. The caller resumes its outer
 /// cursor from these values.
-/// A `<table>`'s repeatable header band — its `<thead>` cells and their height.
+/// Which repeatable band of a `<table>` a [`TableSectionBand`] describes.
+///
+/// The two are mirror images at the fragmenter: a repeated `<thead>`
+/// offsets where each page's strip *starts*, a repeated `<tfoot>` shrinks
+/// where it *ends*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableSection {
+    Head,
+    Foot,
+}
+
+impl TableSection {
+    fn tag(self) -> &'static str {
+        match self {
+            TableSection::Head => "thead",
+            TableSection::Foot => "tfoot",
+        }
+    }
+}
+
+/// A `<table>`'s repeatable band — the cells of one `<thead>` / `<tfoot>`,
+/// and the extent they occupy in the table's own coordinate system.
 ///
 /// fulgur shipped `<thead>` repetition once, in the v1 `Pageable`
 /// architecture (`TablePageable`, PR #14), and lost it in the Phase 4
@@ -1599,29 +1620,37 @@ fn has_page_name_change_below(
 /// `drawables.rs` ("not modelled in PR 5") and `render.rs` ("deferred to a
 /// later change") record that drop, and the `is_header` flag still threaded
 /// through `convert::table::collect_table_cells` is what remains of the v1
-/// classification. This type revives it.
+/// classification.
 ///
 /// Blitz lays a `<table>` out as a flat cell grid: the table's
 /// `layout_children` are the `<th>` / `<td>` boxes themselves, while
-/// `<thead>` / `<tbody>` / `<tr>` carry no layout at all. A header cell is
-/// therefore identified by DOM ancestry (`th < tr < thead < table`), not by
-/// finding a `<thead>` among the layout children.
-struct TableHeaderBand {
-    /// The `<thead>`-descended cells among the table's layout children.
+/// `<thead>` / `<tbody>` / `<tfoot>` / `<tr>` carry no layout at all. A band
+/// cell is therefore identified by DOM ancestry (`th < tr < thead < table`),
+/// not by finding a section among the layout children.
+struct TableSectionBand {
+    /// The section's cells among the table's layout children.
     cell_ids: Vec<usize>,
-    /// Band height in the table's own coordinate system: `max(location.y +
-    /// height)` over the header cells. Same quantity v1 computed as
-    /// `header_cells.fold(0.0, |m, pc| m.max(pc.y + pc.height))`.
+    /// Topmost cell edge, in the table's coordinate system.
+    top: f32,
+    /// Band extent: `max(location.y + height) - top`. For a `<thead>` at the
+    /// top of the table `top` is 0 and this is the same quantity v1 computed
+    /// as `header_cells.fold(0.0, |m, pc| m.max(pc.y + pc.height))`.
     height: f32,
 }
 
-/// Whether `node_id` sits inside a `<thead>` belonging to `table_id`.
+/// Whether `node_id` sits inside a `<thead>` / `<tfoot>` belonging to
+/// `table_id`.
 ///
-/// Walks DOM parents (not layout parents — see [`TableHeaderBand`]) and
-/// stops at the table, so a nested table's own `<thead>` cannot claim an
-/// outer table's cell. Bounded by [`crate::MAX_DOM_DEPTH`] so a malformed
-/// parent chain cannot spin.
-fn is_in_table_header(doc: &BaseDocument, node_id: usize, table_id: usize) -> bool {
+/// Walks DOM parents (not layout parents — see [`TableSectionBand`]) and
+/// stops at the table, so a nested table's own section cannot claim an outer
+/// table's cell. Bounded by [`crate::MAX_DOM_DEPTH`] so a malformed parent
+/// chain cannot spin.
+fn is_in_table_section(
+    doc: &BaseDocument,
+    node_id: usize,
+    table_id: usize,
+    section: TableSection,
+) -> bool {
     let mut cur = doc.get_node(node_id).and_then(|n| n.parent);
     for _ in 0..crate::MAX_DOM_DEPTH {
         let Some(id) = cur else {
@@ -1635,7 +1664,7 @@ fn is_in_table_header(doc: &BaseDocument, node_id: usize, table_id: usize) -> bo
         };
         if node
             .element_data()
-            .is_some_and(|e| e.name.local.as_ref() == "thead")
+            .is_some_and(|e| e.name.local.as_ref() == section.tag())
         {
             return true;
         }
@@ -1644,96 +1673,99 @@ fn is_in_table_header(doc: &BaseDocument, node_id: usize, table_id: usize) -> bo
     false
 }
 
-/// Identify the repeatable header band of a `<table>`, if it has one.
+/// Identify a repeatable band of a `<table>`, if it has one.
 ///
-/// Returns `None` for any parent that is not a `<table>`, for a table with
-/// no `<thead>` cells, and — deliberately — for a table whose header is not
-/// the top strip of the grid. Reserving space for a band that does not sit
-/// at the top would displace content whose placement we have not measured,
-/// so the conservative bail is the safety valve for layouts outside the
-/// measured corpus.
-fn table_header_band(
+/// Returns `None` for any parent that is not a `<table>`, for a table with no
+/// cells in that section, and — deliberately — when the band is not at the
+/// edge it belongs at: a `<thead>` must be the table's top strip and a
+/// `<tfoot>` its bottom strip. Reserving for a band that sits elsewhere would
+/// displace content whose placement we have not measured.
+///
+/// The `<tfoot>` check is load-bearing rather than theoretical: fulgur lays
+/// table sections out in source order, so a `<tfoot>` written before
+/// `<tbody>` (as HTML4 required) renders at the *top* of the table. That is a
+/// separate single-page layout defect; until it is fixed, this bail keeps the
+/// fragmenter from repeating an already-misplaced footer.
+fn table_section_band(
     doc: &BaseDocument,
     parent_id: usize,
     walk_children: &[usize],
-) -> Option<TableHeaderBand> {
+    section: TableSection,
+) -> Option<TableSectionBand> {
     let parent = doc.get_node(parent_id)?;
     if parent.element_data()?.name.local.as_ref() != "table" {
         return None;
     }
 
     let mut cell_ids: Vec<usize> = Vec::new();
-    let mut height = 0.0_f32;
-    let mut first_body_top = f32::INFINITY;
+    let (mut band_top, mut band_bottom) = (f32::INFINITY, f32::NEG_INFINITY);
+    let (mut other_top, mut other_bottom) = (f32::INFINITY, f32::NEG_INFINITY);
     for &child_id in walk_children {
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
         let layout = child.final_layout;
-        // A non-finite cell coordinate would poison the band height and
-        // every reservation derived from it — same guard as the
-        // fragmenter's `child_h` sanitization (fulgur-2m6w).
+        // A non-finite cell coordinate would poison the band extent and every
+        // reservation derived from it — same guard as the fragmenter's
+        // `child_h` sanitization (fulgur-2m6w).
         if !layout.location.y.is_finite() || !layout.size.height.is_finite() {
             return None;
         }
-        if is_in_table_header(doc, child_id, parent_id) {
+        let (top, bottom) = (layout.location.y, layout.location.y + layout.size.height);
+        if is_in_table_section(doc, child_id, parent_id, section) {
             cell_ids.push(child_id);
-            height = height.max(layout.location.y + layout.size.height);
+            band_top = band_top.min(top);
+            band_bottom = band_bottom.max(bottom);
         } else {
-            first_body_top = first_body_top.min(layout.location.y);
+            other_top = other_top.min(top);
+            other_bottom = other_bottom.max(bottom);
         }
     }
 
-    if cell_ids.is_empty() || height <= 0.0 {
+    if cell_ids.is_empty() {
         return None;
     }
-    // The band must be the table's top strip: every body cell starts at or
-    // below its bottom edge. A `<thead>` interleaved with body rows is not
-    // reservable.
-    if first_body_top.is_finite() && height > first_body_top + 0.5 {
+    let height = band_bottom - band_top;
+    if !height.is_finite() || height <= 0.0 {
         return None;
     }
-    Some(TableHeaderBand { cell_ids, height })
+    // The band must sit at its own edge of the table: every other cell below
+    // a `<thead>`, every other cell above a `<tfoot>`.
+    let at_edge = match section {
+        TableSection::Head => !other_top.is_finite() || band_bottom <= other_top + 0.5,
+        TableSection::Foot => !other_bottom.is_finite() || band_top + 0.5 >= other_bottom,
+    };
+    if !at_edge {
+        return None;
+    }
+    Some(TableSectionBand {
+        cell_ids,
+        top: band_top,
+        height,
+    })
 }
 
-/// Emit one repeat fragment per header cell on `page_index` and return the
-/// height to reserve at the top of that page's strip.
+/// Append one repeat fragment per band cell on `page_index`, shifting each
+/// cell's natural y by `dy`, and recurse into its descendants.
 ///
-/// The per-page decision follows WeasyPrint's reference implementation
-/// (`layout/table.py::all_groups_layout`), which re-lays the header on
-/// every page fragment but drops it for any page where reserving it would
-/// leave no room for a row — *"If no row can be rendered because of the
-/// header and the footer, the header and/or the footer are not rendered."*
-/// Deciding per page rather than once per table makes the pathological
-/// cases fall out instead of needing their own guards: a header taller
-/// than the page, and a header that fits but starves the first row, both
-/// simply return `0.0` here, so the fragmenter always makes progress.
-///
-/// Header cells are marked `is_repeat = true`, which makes
-/// [`PaginationGeometry::is_split`] false so consumers redraw each cell
-/// whole per page instead of slicing it — the same contract
+/// Band cells are marked `is_repeat = true`, which makes
+/// [`PaginationGeometry::is_split`] false so consumers redraw each cell whole
+/// per page instead of slicing it — the same contract
 /// [`append_position_fixed_fragments`] already relies on. Nothing else is
 /// marked: v1 shipped a bug where table *body* cells were cloned wholesale
 /// onto every page rather than sliced per page (fixed in `4d44c483`), and
-/// widening `is_repeat` beyond the header would reintroduce exactly that.
+/// widening `is_repeat` beyond the repeated bands would reintroduce it.
 #[allow(clippy::too_many_arguments)]
-fn reserve_repeated_header(
+fn emit_repeated_band(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
-    band: Option<&TableHeaderBand>,
+    band: &TableSectionBand,
     page_index: u32,
     parent_x_in_body: f32,
-    next_child_h: f32,
-    page_height_px: f32,
+    dy: f32,
     emitted: &mut usize,
     depth: usize,
-) -> f32 {
-    let Some(band) = band else {
-        return 0.0;
-    };
-    if band.height + next_child_h > page_height_px {
-        return 0.0;
-    }
+) {
     for &cell_id in &band.cell_ids {
         if *emitted >= crate::MAX_SUBTREE_PAGE_FRAGMENTS {
             break;
@@ -1743,12 +1775,13 @@ fn reserve_repeated_header(
         };
         let layout = cell.final_layout;
         let cell_x = parent_x_in_body + layout.location.x;
+        let cell_y = layout.location.y + dy;
         let entry = geometry.entry(cell_id).or_default();
         entry.is_repeat = true;
         entry.fragments.push(Fragment {
             page_index,
             x: cell_x.as_px(),
-            y: layout.location.y.as_px(),
+            y: cell_y.as_px(),
             width: layout.size.width.as_px(),
             height: layout.size.height.as_px(),
         });
@@ -1758,25 +1791,107 @@ fn reserve_repeated_header(
             doc,
             cell_id,
             page_index,
-            layout.location.y,
+            cell_y,
             cell_x,
             depth + 1,
             emitted,
         );
     }
+}
+
+/// Repeat the table header at the top of `page_index` and return the height
+/// to reserve there.
+///
+/// The per-page decision follows WeasyPrint's reference implementation
+/// (`layout/table.py::all_groups_layout`), which re-lays the header on every
+/// page fragment but drops it for any page where reserving it would leave no
+/// room for a row — *"If no row can be rendered because of the header and the
+/// footer, the header and/or the footer are not rendered."* Deciding per page
+/// rather than once per table makes the pathological cases fall out instead
+/// of needing their own guards: a header taller than the page, and a header
+/// that fits but starves the first row, both simply return `0.0` here, so the
+/// fragmenter always makes progress.
+///
+/// `footer_reserve` is the room already promised to a repeated `<tfoot>` on
+/// the same page, so the two bands cannot jointly starve the strip.
+#[allow(clippy::too_many_arguments)]
+fn reserve_repeated_header(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    band: Option<&TableSectionBand>,
+    page_index: u32,
+    parent_x_in_body: f32,
+    next_child_h: f32,
+    footer_reserve: f32,
+    page_height_px: f32,
+    emitted: &mut usize,
+    depth: usize,
+) -> f32 {
+    let Some(band) = band else {
+        return 0.0;
+    };
+    if band.height + next_child_h + footer_reserve > page_height_px {
+        return 0.0;
+    }
+    // The header repeats at its natural position: the band already starts at
+    // the table's top edge, and a continuation strip starts at y = 0.
+    emit_repeated_band(
+        geometry,
+        doc,
+        band,
+        page_index,
+        parent_x_in_body,
+        -band.top,
+        emitted,
+        depth,
+    );
     band.height
 }
 
-/// Per-page repeat walk for a header cell's descendants.
+/// Repeat the table footer directly beneath the last row placed on
+/// `page_index`.
+///
+/// WeasyPrint places the footer at the body's end position rather than flush
+/// to the page bottom (`footer.translate(dy=end_position_y -
+/// footer.position_y)`), and both reference engines agree on that. `content_bottom`
+/// is the page-local y where this page's rows finished, so the band's own top
+/// edge is rebased onto it.
+#[allow(clippy::too_many_arguments)]
+fn emit_repeated_footer(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    band: Option<&TableSectionBand>,
+    page_index: u32,
+    parent_x_in_body: f32,
+    content_bottom: f32,
+    emitted: &mut usize,
+    depth: usize,
+) {
+    let Some(band) = band else {
+        return;
+    };
+    emit_repeated_band(
+        geometry,
+        doc,
+        band,
+        page_index,
+        parent_x_in_body,
+        content_bottom - band.top,
+        emitted,
+        depth,
+    );
+}
+
+/// Per-page repeat walk for a band cell's descendants.
 ///
 /// Mirrors [`record_fixed_subtree_descendants`] — the `position: fixed`
-/// precedent for per-page repetition — with one difference: it *appends*
-/// to each descendant's fragments instead of clearing them, because the
-/// header's first-page placement was already recorded by the normal walk
-/// and this adds the continuation pages on top.
+/// precedent for per-page repetition — with one difference: it *appends* to
+/// each descendant's fragments instead of clearing them, because the band's
+/// in-flow placement was already recorded by the normal walk and this adds
+/// the repeated pages on top.
 ///
-/// Shares the caller's `emitted` budget, so the aggregate cost stays
-/// bounded at O(header descendants × pages) against
+/// Shares the caller's `emitted` budget, so the aggregate cost stays bounded
+/// at O(band descendants × pages) against
 /// [`crate::MAX_SUBTREE_PAGE_FRAGMENTS`].
 #[allow(clippy::too_many_arguments)]
 fn record_repeated_subtree_descendants(
@@ -1993,10 +2108,20 @@ fn fragment_block_subtree(
 
     // Multi-page `<thead>` repetition. `None` for every parent that is not
     // a `<table>`, so no other subtree pays for this.
-    let header_band = table_header_band(doc, parent_id, &walk_children);
+    let header_band = table_section_band(doc, parent_id, &walk_children, TableSection::Head);
+    let footer_band = table_section_band(doc, parent_id, &walk_children, TableSection::Foot);
+    // Room promised to the repeated `<tfoot>` at the bottom of every page
+    // this table spans. Constant for the table (unlike the header's per-page
+    // decision) because the footer's own height does not depend on which row
+    // lands last. Dropped entirely if it could not leave a usable strip.
+    let footer_reserve = footer_band
+        .as_ref()
+        .map(|b| b.height)
+        .filter(|h| *h < page_height_px)
+        .unwrap_or(0.0);
     // Aggregate budget for the repeat fragments, bounding
     // O(header cells x pages) the way the `position: fixed` walk does.
-    let mut header_emitted: usize = 0;
+    let mut repeat_emitted: usize = 0;
     // Height reserved at the top of the CURRENT page strip, and zero
     // whenever this page carries no repeated header: on the table's first
     // page (the normal walk places the header there) and on every page
@@ -2277,6 +2402,18 @@ fn fragment_block_subtree(
         // in-place split produces a `WithinChild`-shaped result on
         // the current strip, not a pre-advanced fresh page.)
 
+        // The footer's own cells are laid out in the strip the reservation
+        // protects, so they must be measured against the full page height —
+        // otherwise the real `<tfoot>` gets pushed off its own reserved room.
+        let child_is_footer = footer_band
+            .as_ref()
+            .is_some_and(|b| b.cell_ids.contains(&child_id));
+        let strip_limit = if child_is_footer {
+            page_height_px
+        } else {
+            page_height_px - footer_reserve
+        };
+
         let child_x_in_body = parent_x_in_body + layout.location.x;
 
         // fulgur-7hf5 (Phase 3.1.5c): unified recursion gate matching
@@ -2468,7 +2605,21 @@ fn fragment_block_subtree(
         // Use `child_page_y + child_h` (the actual placement bottom)
         // rather than `cursor_y + child_h` so a parallel sibling
         // returning to a smaller page-local y is checked correctly.
-        if child_page_y > page_start_y + header_reserve && child_page_y + child_h > page_height_px {
+        if child_page_y > page_start_y + header_reserve && child_page_y + child_h > strip_limit {
+            // Repeat the footer directly beneath the last row placed on this
+            // page — where WeasyPrint puts it, rather than flush to the page
+            // bottom. `footer_reserve` is the room the gate above kept free
+            // for exactly this.
+            emit_repeated_footer(
+                geometry,
+                doc,
+                footer_band.as_ref().filter(|_| footer_reserve > 0.0),
+                page_index,
+                parent_x_in_body,
+                cursor_y,
+                &mut repeat_emitted,
+                depth,
+            );
             let should_emit = row_state
                 .as_mut()
                 .map(|rs| rs.emitted_parent_pages.insert(page_index))
@@ -2483,7 +2634,9 @@ fn fragment_block_subtree(
                         x: parent_x_in_body.as_px(),
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
-                        height: (cursor_y - page_start_y).as_px(),
+                        // The closed page carries the repeated footer too, so
+                        // the table's own background / border spans it.
+                        height: (cursor_y + footer_reserve - page_start_y).as_px(),
                     });
             }
             page_index += 1;
@@ -2498,8 +2651,9 @@ fn fragment_block_subtree(
                 page_index,
                 parent_x_in_body,
                 child_h,
+                footer_reserve,
                 page_height_px,
-                &mut header_emitted,
+                &mut repeat_emitted,
                 depth,
             );
             cursor_y = header_reserve;
@@ -4297,7 +4451,8 @@ mod tests {
             .as_deref()
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        let band = super::table_header_band(d, table_id, &children).expect("band");
+        let band = super::table_section_band(d, table_id, &children, super::TableSection::Head)
+            .expect("band");
         assert_eq!(band.cell_ids.len(), 1, "one `<th>` in the header");
         assert!(
             (band.height - 30.0).abs() < 0.5,
@@ -4320,7 +4475,9 @@ mod tests {
             .as_deref()
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        assert!(super::table_header_band(d, table_id, &children).is_none());
+        assert!(
+            super::table_section_band(d, table_id, &children, super::TableSection::Head).is_none()
+        );
     }
 
     /// The band is a table-only concept: every other parent opts out
@@ -4332,13 +4489,15 @@ mod tests {
         let d: &BaseDocument = &doc;
         let div_id = find_tag(d, d.root_element().id, "div").expect("div");
         let children = d.get_node(div_id).unwrap().children.clone();
-        assert!(super::table_header_band(d, div_id, &children).is_none());
+        assert!(
+            super::table_section_band(d, div_id, &children, super::TableSection::Head).is_none()
+        );
     }
 
     /// `is_in_table_header` stops at the table it was asked about, so an
     /// inner table's cell is never claimed by an outer table's `<thead>`.
     #[test]
-    fn is_in_table_header_stops_at_the_table_boundary() {
+    fn is_in_table_section_stops_at_the_table_boundary() {
         let html = "<html><body><table><thead><tr><th>H</th></tr></thead>\
              <tbody><tr><td><table><tbody><tr><td id=\"inner\">x</td></tr>\
              </tbody></table></td></tr></tbody></table></body></html>";
@@ -4347,7 +4506,7 @@ mod tests {
         let outer = find_tag(d, d.root_element().id, "table").expect("outer table");
         let th = find_tag(d, outer, "th").expect("th");
         assert!(
-            super::is_in_table_header(d, th, outer),
+            super::is_in_table_section(d, th, outer, super::TableSection::Head),
             "the outer table's own `<th>` is in its header"
         );
         // The inner table's cell is below the outer `<tbody>`, so walking
@@ -4356,8 +4515,84 @@ mod tests {
             find_tag(d, find_tag(d, outer, "tbody").unwrap(), "table").expect("inner table");
         let inner_td = find_tag(d, inner_table, "td").expect("inner td");
         assert!(
-            !super::is_in_table_header(d, inner_td, inner_table),
+            !super::is_in_table_section(d, inner_td, inner_table, super::TableSection::Head),
             "a cell in the inner table's body is not a header cell"
+        );
+    }
+
+    /// A `<tfoot>` after `<tbody>` forms a band at the table's bottom edge.
+    #[test]
+    fn table_section_band_finds_a_tfoot_at_the_table_bottom() {
+        let html = "<html><body><table>\
+             <tbody><tr><td style=\"height:20px;padding:0\">a</td></tr>\
+             <tr><td style=\"height:20px;padding:0\">b</td></tr></tbody>\
+             <tfoot><tr><td style=\"height:15px;padding:0\">f</td></tr></tfoot>\
+             </table></body></html>";
+        let doc = parse(html, 600.0);
+        let d: &BaseDocument = &doc;
+        let table_id = find_tag(d, d.root_element().id, "table").expect("table");
+        let children: Vec<usize> = d
+            .get_node(table_id)
+            .unwrap()
+            .layout_children
+            .borrow()
+            .as_deref()
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        let band = super::table_section_band(d, table_id, &children, super::TableSection::Foot)
+            .expect("footer band");
+        assert_eq!(band.cell_ids.len(), 1, "one `<td>` in the footer");
+        assert!(
+            (band.height - 15.0).abs() < 0.5,
+            "band height tracks the 15px footer cell, got {}",
+            band.height
+        );
+        assert!(
+            (band.top - 40.0).abs() < 0.5,
+            "the band sits below both 20px body rows, got top {}",
+            band.top
+        );
+    }
+
+    /// A `<tfoot>` written *before* `<tbody>` — as HTML4 required — is laid
+    /// out by fulgur in source order, so it renders at the top of the table
+    /// rather than the bottom. That is a separate single-page layout defect;
+    /// until it is fixed the band must bail, so the fragmenter never repeats
+    /// an already-misplaced footer.
+    #[test]
+    fn table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band() {
+        let html = "<html><body><table>\
+             <tfoot><tr><td style=\"height:15px;padding:0\">f</td></tr></tfoot>\
+             <tbody><tr><td style=\"height:20px;padding:0\">a</td></tr>\
+             <tr><td style=\"height:20px;padding:0\">b</td></tr></tbody>\
+             </table></body></html>";
+        let doc = parse(html, 600.0);
+        let d: &BaseDocument = &doc;
+        let table_id = find_tag(d, d.root_element().id, "table").expect("table");
+        let children: Vec<usize> = d
+            .get_node(table_id)
+            .unwrap()
+            .layout_children
+            .borrow()
+            .as_deref()
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        // Guard the premise: if fulgur ever starts ordering `<tfoot>` last,
+        // this test's setup no longer reproduces the misplacement and the
+        // assertion below should be revisited rather than silently passing.
+        let foot_top = d
+            .get_node(children[0])
+            .expect("first cell")
+            .final_layout
+            .location
+            .y;
+        assert!(
+            foot_top < 1.0,
+            "premise: the misordered footer is laid out first, got top {foot_top}"
+        );
+        assert!(
+            super::table_section_band(d, table_id, &children, super::TableSection::Foot).is_none(),
+            "a footer that is not the bottom band must not be repeated"
         );
     }
 
@@ -4380,7 +4615,8 @@ mod tests {
             .as_deref()
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        let band = super::table_header_band(d, table_id, &children).expect("band");
+        let band = super::table_section_band(d, table_id, &children, super::TableSection::Head)
+            .expect("band");
 
         let mut geometry = PaginationGeometryTable::new();
         let mut emitted = 0usize;
@@ -4392,6 +4628,7 @@ mod tests {
             1,
             0.0,
             20.0,
+            0.0,
             35.0,
             &mut emitted,
             0,
@@ -4408,6 +4645,7 @@ mod tests {
             1,
             0.0,
             20.0,
+            0.0,
             800.0,
             &mut emitted,
             0,

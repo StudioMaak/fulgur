@@ -10,10 +10,11 @@ Intent: fix here, then offer upstream as separate PRs.
 | # | defect | file | severity | status |
 |---|---|---|---|---|
 | 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | **misdiagnosed** — see below |
-| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **fixed** — was a v2 regression, not a missing feature |
+| 2 | `<thead>` / `<tfoot>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **fixed** — was a v2 regression, not a missing feature |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
+| 6 | `<tfoot>` before `<tbody>` renders at the top of the table | — | real, single-page | **open** — see below |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -54,6 +55,10 @@ agrees with fulgur page-for-page (Override / Override / Two), which it did not b
 the running elements had been occupying space and mis-paginating the document.
 
 ## 2 — fixed; it was a regression, not a missing feature
+
+Covers both `<thead>` and `<tfoot>` repetition. Footer repetition is the mirror of
+the header's, not a copy: a repeated header offsets where each page's strip
+*starts*, a repeated footer shrinks where it *ends*.
 
 **The earlier framing here was wrong, and the repo's own git history disproves it.**
 fulgur *did* implement `<thead>` repetition — `TablePageable`, shipped in PR #14
@@ -113,10 +118,29 @@ Only the header carries `is_repeat`. v1 shipped a bug where table *body* cells w
 cloned wholesale onto every page instead of sliced per page (fixed in `4d44c483`);
 widening `is_repeat` past the header would reintroduce exactly that.
 
+### `<tfoot>` measured
+
+Same 300-row fixture with a `<tfoot>` after `<tbody>`:
+
+| engine | pages | header | footer | rows | dup | footer overlaps |
+|---|---|---|---|---|---|---|
+| WeasyPrint 69 | 7 | 7/7 | **7/7** | 300/300 | 0 | 0 |
+| fulgur (before) | 7 | 7/7 | 1/7 | 300/300 | 0 | 0 |
+| fulgur (after) | 7 | 7/7 | **7/7** | 300/300 | 0 | 0 |
+
+Both engines place the footer immediately after the last row on each page rather
+than flush to the page bottom — WeasyPrint via
+`footer.translate(dy=end_position_y - footer.position_y)`. fulgur holds a constant
+**+6.00pt** gap from the last row on every page including the last, where the table
+ends mid-page; WeasyPrint holds **+4.50pt**. The 1.5pt difference is row
+padding / line-height, not a placement error.
+
+Absolute footer positions diverge on the final page (261pt vs 635pt) purely because
+of row packing: WeasyPrint fits 48 rows per page against fulgur's 44, so 13 rows land
+on page 7 rather than 36. Both total 300. That difference predates this change.
+
 ### Known limitations
 
-- **`<tfoot>` is not repeated.** WeasyPrint repeats both; this change scopes to the
-  header, matching the upstream PR's scope.
 - **Collapsed borders are not resolved for the repeated header.** With
   `border-collapse: collapse`, WeasyPrint tracks `body_rows_offset = skipped_rows -
   header_rows` in `draw/__init__.py` purely to resolve a repeated header row's
@@ -125,9 +149,40 @@ widening `is_repeat` past the header would reintroduce exactly that.
   pages that split spans. The recursion places that content from y = 0 on the new
   page, so there is no reserved room there; the header is omitted rather than
   overlapped.
-- **Forced breaks inside a table do not repeat the header** — measured: `break-before:
+- **Forced breaks inside a table do not repeat either band** — measured: `break-before:
   page` on a `<td>` is not honoured by fulgur at all, so those page-advance paths are
   unreachable for tables today and deliberately carry no reservation logic.
+- **A `<tfoot>` written before `<tbody>` is not repeated at all** — it is mis-placed to
+  begin with (defect 6), so `table_section_band` bails rather than repeating a footer
+  that is already in the wrong place.
+
+## 6 — `<tfoot>` before `<tbody>` renders at the top of the table
+
+Found while measuring defect 2's footer half. **Not a pagination defect** — it needs no
+multi-page document, and it lives in table layout rather than in the fragmenter.
+
+fulgur lays table sections out in source order. CSS requires a `<tfoot>` at the bottom
+of the table regardless of where it appears in the source, and HTML4 *required* authors
+to write it before `<tbody>`, so real documents hit this.
+
+Single page, 40 rows, `yMin` top-down (bigger = lower on the page):
+
+| fixture | engine | header | rows | footer | verdict |
+|---|---|---|---|---|---|
+| `<tfoot>` before `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | **657.8** | below rows |
+| `<tfoot>` before `<tbody>` | fulgur | 65.7 | 96-703 | **80.7** | **above rows** |
+| `<tfoot>` after `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | 657.8 | below rows |
+| `<tfoot>` after `<tbody>` | fulgur | 65.7 | 80-687 | 703.2 | below rows |
+
+WeasyPrint's output is identical for both orderings, as it should be. fulgur is correct
+only when the author already wrote the sections in visual order.
+
+Until it is fixed, defect 2's footer repetition deliberately bails on this shape
+(`table_section_band` requires the band to be the table's bottom strip), so a misplaced
+footer is never repeated onto every page. Pinned by
+`table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band`, which also asserts
+its own premise — if section ordering is ever fixed, that test fails loudly rather than
+passing for the wrong reason.
 
 ## 3 — fixed
 
