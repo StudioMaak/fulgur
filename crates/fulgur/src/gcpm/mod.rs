@@ -410,8 +410,17 @@ pub struct MarginBoxRule {
     pub position: MarginBoxPosition,
     /// Parsed content items from the `content` property.
     pub content: Vec<ContentItem>,
-    /// Raw CSS declarations (excluding `content`) for future use.
+    /// Raw CSS declarations (excluding `content` and `vertical-align`) for future use.
     pub declarations: String,
+    /// The box's own `vertical-align`, when the author set one.
+    ///
+    /// Held apart from `declarations` because it describes the *box*, not its
+    /// content: it says where the content block sits inside the box, so it has
+    /// to reach the wrapper the renderer sizes to the box rect. Left in the
+    /// declarations string it would land on the inner element and do nothing.
+    /// `None` means the slot's §5.3.2 default applies — see
+    /// [`margin_box::MarginBoxPosition::default_block_align`].
+    pub vertical_align: Option<margin_box::BlockAlign>,
 }
 
 /// Aggregated GCPM context extracted from a stylesheet.
@@ -532,6 +541,7 @@ mod tests {
                     style: CounterStyle::Decimal,
                 }],
                 declarations: String::new(),
+                vertical_align: None,
             }],
             running_mappings: vec![],
             string_set_mappings: vec![],
@@ -586,6 +596,7 @@ mod tests {
                 position: MarginBoxPosition::TopCenter,
                 content: vec![],
                 declarations: String::new(),
+                vertical_align: None,
             }],
             running_mappings: vec![RunningMapping {
                 parsed: ParsedSelector::Class("b-header".to_string()),
@@ -701,6 +712,7 @@ mod content_item_target_tests {
                 kind: TargetTextKind::Content,
             }],
             declarations: String::new(),
+            vertical_align: None,
         });
         assert!(ctx.has_target_references());
     }

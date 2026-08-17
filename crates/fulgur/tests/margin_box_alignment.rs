@@ -39,9 +39,16 @@ const CONTENT_BOTTOM: f32 = PAGE_H_PT - MARGIN_PT;
 /// The body is deliberately empty and the box's text is set at 8pt so it can
 /// be told apart from any body text by size alone.
 fn margin_box_text_pos(slot: &str) -> (f32, f32) {
+    margin_box_text_pos_with(slot, "")
+}
+
+/// As [`margin_box_text_pos`], with `extra` appended to the box's own
+/// declarations — used to check that an author's properties override the
+/// §5.3.2 defaults rather than being ignored.
+fn margin_box_text_pos_with(slot: &str, extra: &str) -> (f32, f32) {
     let mut assets = AssetBundle::new();
     assets.add_css(format!(
-        "@page {{ size: A4; margin: 25mm; @{slot} {{ content: \"Xx\"; font-size: 8pt }} }}"
+        "@page {{ size: A4; margin: 25mm; @{slot} {{ content: \"Xx\"; font-size: 8pt{extra} }} }}"
     ));
     let pdf = Engine::builder()
         .assets(assets)
@@ -245,5 +252,60 @@ fn side_band_boxes_centre_across_their_narrow_band() {
         x_left_band > 1.0,
         "@left-middle must be centred in its band, not flush to the paper edge \
          (got {x_left_band:.2}pt)"
+    );
+}
+
+/// §5.3.2's alignment is a *default*, not a fixed behaviour: an author who
+/// writes `vertical-align` in the at-rule must override it.
+///
+/// Both reference engines agree here (WeasyPrint 69 and Chrome 151 put
+/// `vertical-align: bottom` on `@top-center` at 21.87mm / 21.83mm, against
+/// 10.94mm for the default), which is what makes this a conformance gap
+/// rather than a preference.
+///
+/// Checked without needing any font metric. The three alignments place the
+/// content block at `0`, `(H - h) / 2` and `H - h` inside the box, so the
+/// three baselines are *equally spaced* whatever `h` turns out to be —
+/// middle sits exactly halfway between top and bottom.
+#[test]
+fn author_vertical_align_overrides_the_slot_default() {
+    let (_, y_top) = margin_box_text_pos_with("top-center", "; vertical-align: top");
+    let (_, y_middle) = margin_box_text_pos_with("top-center", "; vertical-align: middle");
+    let (_, y_bottom) = margin_box_text_pos_with("top-center", "; vertical-align: bottom");
+
+    let (top, middle, bottom) = (
+        from_page_top(y_top),
+        from_page_top(y_middle),
+        from_page_top(y_bottom),
+    );
+
+    assert!(
+        top < middle && middle < bottom,
+        "author vertical-align must move the content \
+         (top={top:.2}, middle={middle:.2}, bottom={bottom:.2}) — \
+         equal values mean the declaration was ignored"
+    );
+    assert_close(
+        middle - top,
+        bottom - middle,
+        "middle sits exactly halfway between top and bottom",
+    );
+    // `top` puts the content block flush to the band's top edge.
+    assert!(
+        top < MARGIN_PT * 0.3,
+        "vertical-align:top must sit at the band's top edge, got {top:.2}pt"
+    );
+}
+
+/// The default still applies when the author says nothing — overriding one
+/// slot must not disturb the table.
+#[test]
+fn omitting_vertical_align_keeps_the_slot_default() {
+    let (_, y_default) = margin_box_text_pos("top-center");
+    let (_, y_middle) = margin_box_text_pos_with("top-center", "; vertical-align: middle");
+    assert_close(
+        from_page_top(y_default),
+        from_page_top(y_middle),
+        "@top-center defaults to vertical-align: middle",
     );
 }

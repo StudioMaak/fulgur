@@ -479,10 +479,12 @@ impl<'i, 'a> AtRuleParser<'i> for PageRuleParser<'a> {
     ) -> Result<Self::AtRule, ParseError<'i, ()>> {
         let mut content_items = Vec::new();
         let mut declarations = String::new();
+        let mut vertical_align = None;
 
         let mut parser = MarginBoxParser {
             content: &mut content_items,
             declarations: &mut declarations,
+            vertical_align: &mut vertical_align,
         };
         let iter = RuleBodyParser::new(input, &mut parser);
         for item in iter {
@@ -494,6 +496,7 @@ impl<'i, 'a> AtRuleParser<'i> for PageRuleParser<'a> {
             position,
             content: content_items,
             declarations,
+            vertical_align,
         });
 
         Ok(())
@@ -561,9 +564,38 @@ impl<'i, 'a> RuleBodyItemParser<'i, (), ()> for PageRuleParser<'a> {
 // 3. Margin box block parser (MarginBoxParser)
 // ---------------------------------------------------------------------------
 
+/// Parse a margin box's `vertical-align` value.
+///
+/// Only the three keywords a page-margin box can meaningfully take are
+/// accepted. The baseline-relative values (`baseline`, `sub`, `super`, …)
+/// align an inline box against surrounding text, and a margin box has no
+/// surrounding text to align to — so they are treated as invalid and the
+/// slot's default is kept.
+fn parse_margin_box_vertical_align<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Option<crate::gcpm::margin_box::BlockAlign> {
+    use crate::gcpm::margin_box::BlockAlign;
+    // CSS keywords are ASCII case-insensitive; matching the same way
+    // `MarginBoxPosition::from_at_keyword` does keeps the two consistent.
+    let ident = input.expect_ident().ok()?.to_ascii_lowercase();
+    let value = match ident.as_str() {
+        "top" => Some(BlockAlign::Top),
+        "middle" => Some(BlockAlign::Middle),
+        "bottom" => Some(BlockAlign::Bottom),
+        _ => None,
+    };
+    // A trailing token means the declaration was malformed (`middle red`),
+    // and CSS says to drop the whole thing rather than keep the prefix.
+    if input.next().is_ok() {
+        return None;
+    }
+    value
+}
+
 struct MarginBoxParser<'a> {
     content: &'a mut Vec<ContentItem>,
     declarations: &'a mut String,
+    vertical_align: &'a mut Option<crate::gcpm::margin_box::BlockAlign>,
 }
 
 impl<'i, 'a> DeclarationParser<'i> for MarginBoxParser<'a> {
@@ -578,6 +610,15 @@ impl<'i, 'a> DeclarationParser<'i> for MarginBoxParser<'a> {
     ) -> Result<(), ParseError<'i, ()>> {
         if name.eq_ignore_ascii_case("content") {
             *self.content = parse_content_value(input);
+        } else if name.eq_ignore_ascii_case("vertical-align") {
+            // Taken out of the raw declarations on purpose: this one
+            // positions the box's content *within the box*, so the renderer
+            // has to apply it to the wrapper it sizes to the box rect.
+            // Passed through as raw text it would style the inner element,
+            // where it has no effect. An unrecognised value leaves `None`
+            // standing, so the slot's default survives — per CSS, an invalid
+            // declaration is ignored rather than poisoning the property.
+            *self.vertical_align = parse_margin_box_vertical_align(input);
         } else {
             // Accumulate other declarations as raw text
             let start_pos = input.position();
@@ -1626,6 +1667,65 @@ mod tests {
         );
         assert!(mb.declarations.contains("font-size"));
         assert!(mb.declarations.contains("color"));
+    }
+
+    /// `vertical-align` is lifted out of the raw declarations because it
+    /// positions the content *within the box*: the renderer has to put it on
+    /// the wrapper it sizes to the box rect. Left in the string it would
+    /// style the inner element, where it does nothing — which is exactly the
+    /// bug this parsing fixes.
+    #[test]
+    fn margin_box_vertical_align_is_lifted_out_of_the_declarations() {
+        use crate::gcpm::margin_box::BlockAlign;
+        let css = "@page { @top-center { content: \"x\"; vertical-align: bottom; color: gray } }";
+        let mb = &parse_gcpm(css).margin_boxes[0];
+        assert_eq!(mb.vertical_align, Some(BlockAlign::Bottom));
+        assert!(
+            !mb.declarations.contains("vertical-align"),
+            "vertical-align must not also reach the inner element: {:?}",
+            mb.declarations
+        );
+        assert!(
+            mb.declarations.contains("color"),
+            "sibling declarations must survive: {:?}",
+            mb.declarations
+        );
+    }
+
+    #[test]
+    fn margin_box_vertical_align_accepts_the_three_box_keywords() {
+        use crate::gcpm::margin_box::BlockAlign;
+        for (keyword, expected) in [
+            ("top", BlockAlign::Top),
+            ("middle", BlockAlign::Middle),
+            ("bottom", BlockAlign::Bottom),
+            ("BOTTOM", BlockAlign::Bottom), // CSS keywords are case-insensitive
+        ] {
+            let css =
+                format!("@page {{ @top-center {{ content: \"x\"; vertical-align: {keyword} }} }}");
+            assert_eq!(
+                parse_gcpm(&css).margin_boxes[0].vertical_align,
+                Some(expected),
+                "keyword={keyword}"
+            );
+        }
+    }
+
+    /// An invalid declaration is dropped, leaving the slot's default to
+    /// apply — CSS ignores what it cannot parse rather than poisoning the
+    /// property. `baseline` and friends align an inline box against
+    /// surrounding text, and a margin box has none.
+    #[test]
+    fn margin_box_vertical_align_ignores_values_a_box_cannot_take() {
+        for value in ["baseline", "super", "10px", "middle red", ""] {
+            let css =
+                format!("@page {{ @top-center {{ content: \"x\"; vertical-align: {value} }} }}");
+            let boxes = parse_gcpm(&css).margin_boxes;
+            assert_eq!(
+                boxes[0].vertical_align, None,
+                "value={value:?} should have been ignored"
+            );
+        }
     }
 
     #[test]

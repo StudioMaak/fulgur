@@ -3903,8 +3903,16 @@ impl<'a> MarginBoxRenderer<'a> {
             // Without it every box renders flush to the top-left of its
             // rect, which for a lone `@bottom-right` — whose rect spans the
             // whole content width — puts the footer at the *left* margin.
+            //
+            // It is a *default*, so an author's own `vertical-align` in the
+            // at-rule replaces it. `text-align` needs no equivalent here: it
+            // is inherited, so the author's copy rides along in
+            // `declarations` on the inner element and wins by cascade.
             let text_align = pos.default_text_align();
-            let block_align = pos.default_block_align();
+            let block_align = effective_boxes
+                .get(&pos)
+                .and_then(|rule| rule.vertical_align)
+                .unwrap_or_else(|| pos.default_block_align());
 
             let cache_key = (
                 html.clone(),

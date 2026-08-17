@@ -281,6 +281,32 @@ author's at-rule declarations render on an **inner** element — and an inline s
 inherited value, so the author still wins. The zeroed `margin`/`padding` already rely on
 this.
 
+### The margin box's box model is not settled — and we only match Chrome on one axis
+
+Measured with a red `background` on `@bottom-center`, A4/25mm (band =
+x 25-185mm, y 272-297mm):
+
+| engine | horizontal | vertical |
+|---|---|---|
+| WeasyPrint 69 | 103.0-105.8mm (shrink-wrapped to the text) | 272.3-296.3mm (full band) |
+| fulgur | 25.4-184.1mm (full width) | 282.9-285.8mm (content height only) |
+| Chrome 151 | 24.7-184.1mm (full width) | 272.3-296.3mm (full band) |
+
+Chrome's box *is* the rect on both axes, which is what §5.3.3 implies;
+WeasyPrint and fulgur are transposed versions of it. This is the one place
+the two references disagree with each other, so "they agree, therefore
+reference" does not settle it — Chrome's reading does.
+
+It explains the `text-align` divergence too: WeasyPrint shrink-wraps
+horizontally, so alignment inside the box is moot and an author's
+`text-align` looks ignored. fulgur is full-width there and matches Chrome.
+
+The open gap is vertical: a margin box's background does not fill its band,
+because author `declarations` render on an inner element rather than on the
+box. Moving them to the wrapper would fix it — but the wrapper zeroes
+`margin`/`padding` precisely so the renderer can paint at `rect.x, rect.y`
+with a (0, 0) body offset, so an author `margin` would need handling first.
+
 ### Known noise
 
 `ERROR: Unexpected token` on stderr during renders comes from the upstream CSS parser
