@@ -313,6 +313,22 @@ impl Engine {
             crate::gcpm::running::RunningElementStore::new()
         };
 
+        // Take the harvested running elements out of the flow. The
+        // `position: running()` -> `display: none` rewrite only reaches CSS
+        // that goes through `cleaned_css`, and an inline `<style>` block's
+        // text never does — so an inline-declared running element used to
+        // render in its margin box *and* again in the body, displacing
+        // everything after it. Injected after the harvest above, and by the
+        // same `InjectCssPass` route `counter_css` and the static pseudo
+        // content already use for exactly this gap.
+        if !gcpm.running_mappings.is_empty() {
+            let hide_css = crate::blitz_adapter::build_running_hide_css(&gcpm.running_mappings);
+            if !hide_css.is_empty() {
+                let inject_pass = crate::blitz_adapter::InjectCssPass { css: hide_css };
+                crate::blitz_adapter::apply_single_pass(&inject_pass, &mut doc, &ctx);
+            }
+        }
+
         // BookmarkPass downstream consumes per-node snapshots from
         // StringSetPass and CounterPass when (and only when) bookmarks
         // will actually be emitted. The 2-pass `target-*` path

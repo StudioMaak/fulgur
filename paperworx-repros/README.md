@@ -9,11 +9,49 @@ Intent: fix here, then offer upstream as separate PRs.
 
 | # | defect | file | severity | status |
 |---|---|---|---|---|
-| 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | open |
+| 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | **misdiagnosed** — see below |
 | 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | open |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
+
+## 1 — misdiagnosed; the real fault was different
+
+**Running elements were never the problem.** Re-measured at the fork point `682bcbf3`,
+`RUNHEAD` was already on *both* pages — it was drawn at **y = 0.3mm**, a third of a
+millimetre from the paper edge, inside the non-printable margin. That is defect 4's
+signature exactly (every margin box flush to the top-left of its rect), and defect 4's fix
+moved it to 92.3 / 21.4mm against WeasyPrint's 92.3 / 21.5mm.
+
+The repro's own note that `@top-left` "appeared to work" is the tell: `@top-left`'s correct
+x *is* the left margin, so the old bug left it looking right while `@top-center` looked
+broken. The same Left/Right pattern shows up in the `page-selector` VRT golden.
+
+### What the comparison did expose
+
+A real, separate defect the repro did not isolate: `position: running()` did not take the
+element out of the flow, so the source rendered **in the body as well** and displaced
+everything after it — body text at 35.3mm where WeasyPrint puts it at 29.2mm.
+
+The `position: running()` → `display: none` rewrite is applied while building
+`cleaned_css`, and an inline `<style>` block's text is never rewritten:
+`extract_gcpm_from_inline_styles` reads the constructs out of the DOM and leaves the
+stylesheet alone. Delivered through an `AssetBundle` the same CSS behaved correctly, which
+is what isolated it. **A themed document ships its CSS in a `<style>` block, so this is the
+path real documents take.**
+
+Fixed by injecting the hide rule with `InjectCssPass` after `RunningElementPass` has
+harvested the content — the same route `counter_css` and the static pseudo-content already
+use for exactly this gap. Covered by `crates/fulgur/tests/running_element_flow.rs`, which
+asserts the general property: an inline `<style>` and an `AssetBundle` carrying the same
+CSS must lay out identically.
+
+**Three snapshots and one link test had baked the defect in**, asserting the duplicate as
+correct output — `link_integration` literally expected "both source running element and
+margin-box render" to carry a link annotation. All four were corrected against the
+reference: WeasyPrint emits exactly one `/Link` here, and on `element(title, last)` it now
+agrees with fulgur page-for-page (Override / Override / Two), which it did not before —
+the running elements had been occupying space and mis-paginating the document.
 
 ## 3 — fixed
 

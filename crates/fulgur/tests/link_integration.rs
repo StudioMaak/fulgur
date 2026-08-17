@@ -143,10 +143,20 @@ fn margin_box_running_element_link_keeps_pdf_annotation() {
         "margin-box anchor should emit a PDF link annotation"
     );
     assert!(text.contains("/URI"), "missing /URI action type");
+    // Exactly one: the margin box's. This used to assert `>= 2` — "both
+    // source running element and margin-box render" — which was locking in
+    // a defect. `position: running()` takes the source out of the document
+    // flow, so there is no second copy to annotate; it only had one because
+    // an inline `<style>` never got the `display: none` rewrite and the
+    // element was rendered twice.
+    //
+    // WeasyPrint 69 on this same input: one `/Link`, one `/Annots`, one URI
+    // occurrence — which is what settles the expected count.
     let uri_count = text.matches("https://margin-box-link.test").count();
-    assert!(
-        uri_count >= 2,
-        "expected both source running element and margin-box render to keep link annotations, got {uri_count} URI entries"
+    assert_eq!(
+        uri_count, 1,
+        "the margin-box render should carry the only link annotation; \
+         a second means the running element also rendered in the body"
     );
 }
 

@@ -3034,6 +3034,39 @@ fn css_escape_ident(s: &str) -> String {
 /// O(mappings): unlike `CounterPass`, no DOM walk and no per-node rule, so a
 /// hostile document cannot amplify a small input into an OOM (see
 /// [`crate::gcpm::StaticContentMapping`]).
+/// Build the CSS that takes running elements out of the document flow.
+///
+/// `position: running(<name>)` is normally rewritten to `display: none`
+/// while `cleaned_css` is assembled, but an inline `<style>` block's text is
+/// never rewritten that way — `extract_gcpm_from_inline_styles` reads the
+/// constructs out of the DOM and leaves the stylesheet itself alone. A
+/// running element declared inline was therefore harvested into its margin
+/// box *and* left in the body, printing twice and displacing everything
+/// after it. Since a themed document ships its CSS in a `<style>` block,
+/// that is the path real documents take.
+///
+/// Injecting the rule covers both sources: for bundled CSS the declaration
+/// is already there and this is a harmless repeat. It must be injected only
+/// after `RunningElementPass` has harvested the content — the pass reads the
+/// DOM directly, so hiding the element first would cost nothing, but the
+/// ordering is what makes that safe to rely on.
+pub(crate) fn build_running_hide_css(mappings: &[crate::gcpm::RunningMapping]) -> String {
+    use std::fmt::Write;
+    let mut css = String::new();
+    for m in mappings {
+        // Same escaping rationale as `build_static_content_css`: these come
+        // from trusted author CSS, but a bare token can still carry
+        // metacharacters via CSS escapes.
+        let selector = match &m.parsed {
+            ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
+            ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
+            ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
+        };
+        let _ = write!(css, "{selector}{{display:none}}");
+    }
+    css
+}
+
 pub(crate) fn build_static_content_css(mappings: &[StaticContentMapping]) -> String {
     use std::fmt::Write;
     let mut css = String::new();
