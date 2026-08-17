@@ -298,6 +298,56 @@ pub fn parse_html_with_local_resources(
     (doc, gcpm)
 }
 
+/// Make the registered fonts the collection's last resort, but only when it
+/// would otherwise have none.
+///
+/// A font-family list that matches nothing has to land somewhere. With system
+/// fonts present that somewhere already exists, and this leaves the collection
+/// untouched — a desktop caller who registers one font still gets the host's
+/// `serif` for `serif`. With no system fonts there is nothing behind the
+/// lookup at all, so every glyph resolves to nothing and the page comes out
+/// blank while the render still reports success. A Worker isolate is always in
+/// that state: WASM has no system fonts whatsoever.
+///
+/// Emptiness is tested by asking the collection rather than by trusting the
+/// `system_fonts` flag. The flag says what was *requested*; on a host where
+/// the request cannot be honoured — WASM again, where it defaults to `true`
+/// and still yields nothing — only the collection knows what is actually
+/// there.
+///
+/// Both hooks are needed. The generic families catch `font-family: Georgia,
+/// serif`, where `serif` is a real fallback the author wrote. The script
+/// fallbacks catch `font-family: Georgia` on its own, which names no generic
+/// for the mapping to reach.
+fn install_last_resort_families(ctx: &mut FontContext, registered: &[parley::fontique::FamilyId]) {
+    use parley::fontique::{FallbackKey, GenericFamily, Script};
+
+    if registered.is_empty() {
+        return;
+    }
+    let has_system_fallback = ctx
+        .collection
+        .generic_families(GenericFamily::SansSerif)
+        .next()
+        .is_some();
+    if has_system_fallback {
+        return;
+    }
+
+    for generic in GenericFamily::all() {
+        ctx.collection
+            .set_generic_families(*generic, registered.iter().copied());
+    }
+    // Fallbacks are keyed by script. Latin is what a document with no system
+    // fonts is overwhelmingly asking for, and registering under it is what
+    // turns a bare unmatched family name into drawn glyphs rather than
+    // nothing at all.
+    ctx.collection.set_fallbacks(
+        FallbackKey::new(Script(*b"Latn"), None),
+        registered.iter().copied(),
+    );
+}
+
 /// The single primitive that actually constructs an `HtmlDocument`.
 /// All other `parse*` functions in this module funnel through here.
 fn parse_inner(
@@ -329,10 +379,16 @@ fn parse_inner(
             collection,
             source_cache: parley::fontique::SourceCache::new(Default::default()),
         };
+        let mut registered: Vec<parley::fontique::FamilyId> = Vec::new();
         for data in font_data {
             let blob: parley::fontique::Blob<u8> = (**data).clone().into();
-            ctx.collection.register_fonts(blob, None);
+            for (family_id, _) in ctx.collection.register_fonts(blob, None) {
+                if !registered.contains(&family_id) {
+                    registered.push(family_id);
+                }
+            }
         }
+        install_last_resort_families(&mut ctx, &registered);
         Some(ctx)
     };
 

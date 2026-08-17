@@ -11,9 +11,39 @@ Intent: fix here, then offer upstream as separate PRs.
 |---|---|---|---|---|
 | 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | open |
 | 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | open |
-| 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | open |
+| 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
+
+## 3 — fixed
+
+**Not WASM-only.** It reproduces on any host with `system_fonts(false)`, which is what the
+tests use — WASM is simply always in that state, having no system fonts at all. That
+reframing is what made it testable without a Worker.
+
+The registered fonts are now installed as the collection's generic families *and* as its
+Latin script fallback, so a family the document names but nobody registered still lands on
+a real font (`blitz_adapter::install_last_resort_families`). Both hooks are needed:
+generic families catch `font-family: Georgia, serif`, script fallbacks catch a bare
+`font-family: Georgia` that names no generic for the mapping to reach.
+
+It only applies when the collection would otherwise have **no** fallback at all, and that
+is decided by asking the collection rather than by trusting the `system_fonts` flag — the
+flag says what was requested, and on WASM it defaults to `true` while still yielding
+nothing. A desktop caller who registers one font therefore still gets the host's `serif`
+for `serif`, unchanged.
+
+Covered by `crates/fulgur/tests/font_fallback.rs`: four tests that fail without the fix,
+plus two controls that must not regress. The sharpest is pagination — unrendered text
+occupies no space, so the reported 40-paragraph document collapsed to a single page. It
+now lays out identically to the same document naming a registered family.
+
+**One narrower case is still silent**: *no* font registered and no system fonts either.
+Nothing can be fallen back to there, so it needs an error rather than a fallback — and
+erroring at parse time would be wrong for a document that draws only shapes and has no
+text to render. Distinguishing the two means noticing that text was laid out but shaped
+to zero glyphs, which is a separate change. It matters for paperworx: a theme whose
+`assets[]` carries no font at all lands exactly here.
 
 ## 5 — deferred until 1-3 are done
 
