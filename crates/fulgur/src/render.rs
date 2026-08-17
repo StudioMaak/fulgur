@@ -4,7 +4,9 @@ use crate::drawables::Drawables;
 use crate::error::{Error, Result};
 use crate::gcpm::GcpmContext;
 use crate::gcpm::counter::resolve_content_to_html_with_anchor;
-use crate::gcpm::margin_box::{Edge, MarginBoxPosition, MarginBoxRect, compute_edge_layout};
+use crate::gcpm::margin_box::{
+    BlockAlign, Edge, MarginBoxPosition, MarginBoxRect, TextAlign, compute_edge_layout,
+};
 use crate::gcpm::running::RunningElementStore;
 use crate::gcpm::target_ref::AnchorMap;
 use crate::units::F32Units;
@@ -3558,11 +3560,17 @@ fn parse_datetime(s: &str) -> Option<krilla::metadata::DateTime> {
 
 /// Cached max-content width and rendered `Drawables` for margin boxes.
 /// Measure cache: (html, page_height as bits) → max-content width.
-/// Render cache: (html, final_width as bits, final_height as bits) →
-/// (`Drawables`, `PaginationGeometryTable`).
+/// Render cache: (html, final_width as bits, final_height as bits,
+/// alignment) → (`Drawables`, `PaginationGeometryTable`).
+///
+/// The alignment belongs in the render key because it is written into the
+/// wrapper *before* layout, so it decides where the glyphs land: `@top-left`
+/// and `@top-right` holding identical content on identically-sized rects are
+/// not interchangeable renders. Two slots that do share an alignment still
+/// share the entry.
 type MeasureCache = HashMap<(String, u32, u32), crate::units::Pt>;
 type RenderCache = HashMap<
-    (String, u32, u32),
+    (String, u32, u32, TextAlign, BlockAlign),
     (
         crate::drawables::Drawables,
         crate::pagination_layout::PaginationGeometryTable,
@@ -3891,15 +3899,27 @@ impl<'a> MarginBoxRenderer<'a> {
                 .copied()
                 .unwrap_or_else(|| pos.bounding_rect(page_size, resolved_margin));
 
+            // CSS Paged Media 3 §5.3.2 gives each slot a default alignment.
+            // Without it every box renders flush to the top-left of its
+            // rect, which for a lone `@bottom-right` — whose rect spans the
+            // whole content width — puts the footer at the *left* margin.
+            let text_align = pos.default_text_align();
+            let block_align = pos.default_block_align();
+
             let cache_key = (
                 html.clone(),
                 width_key(rect.width.to_f32()),
                 width_key(rect.height.to_f32()),
+                text_align,
+                block_align,
             );
             if !self.render_cache.contains_key(&cache_key) {
-                let render_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
-                    self.margin_css, html
+                let render_html = margin_box_document(
+                    &self.margin_css,
+                    html,
+                    rect.height,
+                    text_align,
+                    block_align,
                 );
                 let mut render_doc = crate::blitz_adapter::parse_and_layout(
                     &render_html,
@@ -3981,6 +4001,57 @@ impl<'a> MarginBoxRenderer<'a> {
         // unclickable.
         !resolved_htmls.is_empty()
     }
+}
+
+/// Build the document Blitz lays out for one margin box.
+///
+/// This is the handoff between the two halves of margin-box layout. fulgur
+/// owns the box's rect: `compute_edge_layout` implements the CSS Paged
+/// Media 3 §5.3.3 distribution in Rust, over intrinsic sizes the engine
+/// measured. Everything *inside* that rect is the engine's, so the rect and
+/// the slot's §5.3.2 default alignment are handed over as ordinary CSS
+/// rather than applied afterwards to the painted result — a paint-time
+/// translation would drag the box's background and borders along with its
+/// content, when only the content is meant to move.
+///
+/// The wrapper carries the box's own height so there is something for the
+/// content to be aligned *within*: laid out at its natural height, as the
+/// measure passes do, a vertical alignment would have no room to mean
+/// anything. The single block-level child keeps the author's content in a
+/// normal block formatting context — it is the only flex item, so nothing
+/// the author wrote gets reinterpreted as one.
+///
+/// Alignment goes on the wrapper, so it is inherited but loses to an
+/// author's own `text-align`: declarations from the at-rule render on an
+/// inner element, and an inline style beats an inherited value. That is the
+/// same precedence the zeroed `margin` / `padding` here already rely on.
+fn margin_box_document(
+    margin_css: &str,
+    content_html: &str,
+    height: crate::units::Pt,
+    text_align: TextAlign,
+    block_align: BlockAlign,
+) -> String {
+    // Column flex is how the engine is asked to place the content block.
+    // Measured on Blitz: `justify-content` resolves exactly, while
+    // `display: table-cell` + `vertical-align: middle` leaves the content
+    // sitting at the box's top edge.
+    let justify = match block_align {
+        BlockAlign::Top => "flex-start",
+        BlockAlign::Middle => "center",
+        BlockAlign::Bottom => "flex-end",
+    };
+    format!(
+        "<html><head><style>{}</style></head>\
+         <body style=\"margin:0;padding:0;height:{}pt;\
+         display:flex;flex-direction:column;justify-content:{};text-align:{};\">\
+         <div>{}</div></body></html>",
+        margin_css,
+        height.to_f32(),
+        justify,
+        text_align.as_css(),
+        content_html
+    )
 }
 
 /// Get a layout dimension of the first non-zero child of `<body>` in a Blitz document.

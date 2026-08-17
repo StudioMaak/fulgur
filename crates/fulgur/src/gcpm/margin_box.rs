@@ -27,6 +27,47 @@ pub struct MarginBoxRect {
     pub height: Pt,
 }
 
+/// Horizontal alignment of a margin box's content within its rect.
+///
+/// CSS Paged Media 3 §5.3.2 gives every margin box a default `text-align`
+/// that depends on which slot it occupies. This is that property, and it
+/// is applied by injecting the keyword into the box's wrapper style, so
+/// an author's own `text-align` in the at-rule's declarations still wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextAlign {
+    Left,
+    Center,
+    Right,
+}
+
+impl TextAlign {
+    /// The CSS keyword for this alignment.
+    pub fn as_css(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Center => "center",
+            Self::Right => "right",
+        }
+    }
+}
+
+/// Vertical placement of a margin box's content block within its rect.
+///
+/// The companion to [`TextAlign`]: §5.3.2 also gives every margin box a
+/// default `vertical-align`. Distinct from [`crate::paragraph::VerticalAlign`],
+/// which aligns an inline replaced element against a text baseline — this
+/// one positions a whole laid-out content block inside a fixed-height box.
+///
+/// This names *what* the alignment is; how it reaches the layout engine is
+/// the renderer's business, the same way §5.3.3's box rect is computed here
+/// but realised as a viewport there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BlockAlign {
+    Top,
+    Middle,
+    Bottom,
+}
+
 /// The 16 CSS page margin box positions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MarginBoxPosition {
@@ -85,6 +126,43 @@ impl MarginBoxPosition {
             "bottom-right" => Some(Self::BottomRight),
             "bottom-right-corner" => Some(Self::BottomRightCorner),
             _ => None,
+        }
+    }
+
+    /// This slot's default `text-align`, per CSS Paged Media 3 §5.3.2.
+    ///
+    /// Boxes on the top and bottom bands align to the side they are named
+    /// for; boxes on the narrow left and right bands centre across the
+    /// band. The four corners align *toward* the page's own content area's
+    /// far side — `top-left-corner` is right-aligned so it sits against
+    /// the content edge rather than the paper edge.
+    pub fn default_text_align(&self) -> TextAlign {
+        match self {
+            Self::TopLeftCorner | Self::BottomLeftCorner => TextAlign::Right,
+            Self::TopRightCorner | Self::BottomRightCorner => TextAlign::Left,
+            Self::TopLeft | Self::BottomLeft => TextAlign::Left,
+            Self::TopCenter | Self::BottomCenter => TextAlign::Center,
+            Self::TopRight | Self::BottomRight => TextAlign::Right,
+            Self::LeftTop
+            | Self::LeftMiddle
+            | Self::LeftBottom
+            | Self::RightTop
+            | Self::RightMiddle
+            | Self::RightBottom => TextAlign::Center,
+        }
+    }
+
+    /// This slot's default `vertical-align`, per CSS Paged Media 3 §5.3.2.
+    ///
+    /// Every box on a horizontal band centres in it — the band's height is
+    /// the page margin, and content hugging the paper edge is never what
+    /// was meant. Only the left and right bands, whose slots are *named*
+    /// by their vertical position, align top or bottom.
+    pub fn default_block_align(&self) -> BlockAlign {
+        match self {
+            Self::LeftTop | Self::RightTop => BlockAlign::Top,
+            Self::LeftBottom | Self::RightBottom => BlockAlign::Bottom,
+            _ => BlockAlign::Middle,
         }
     }
 
@@ -476,6 +554,85 @@ mod tests {
         assert!((rect.y.to_f32() - 0.0).abs() < 0.01);
         assert!((rect.width.to_f32() - 70.0).abs() < 0.01);
         assert!((rect.height.to_f32() - 50.0).abs() < 0.01);
+    }
+
+    // --- default alignment (CSS Paged Media 3 §5.3.2) ---
+    //
+    // The expected values below were MEASURED, not recalled: each of the
+    // sixteen slots was rendered alone on A4/25mm by WeasyPrint 69 and by
+    // Chrome 151 headless-shell, and the drawn text's box was read back
+    // with `pdftotext -bbox`. Both engines agreed on every slot (to within
+    // glyph-bearing noise, <= 0.15mm), so the table is the reference
+    // behaviour rather than one engine's reading of the spec.
+    //
+    // Alone on an edge a box spans that edge's whole band, so the text's
+    // position within the band names its alignment directly — e.g.
+    // `@top-right` put the glyphs' right edge exactly on the content right
+    // edge (185.00mm), and `@top-right-corner` put their left edge exactly
+    // on the right band's left edge (185.00mm).
+
+    #[test]
+    fn default_text_align_matches_reference_engines() {
+        use MarginBoxPosition as P;
+        let cases: &[(MarginBoxPosition, TextAlign)] = &[
+            // Corners align *away* from the page: toward the adjacent edge.
+            (P::TopLeftCorner, TextAlign::Right),
+            (P::TopRightCorner, TextAlign::Left),
+            (P::BottomLeftCorner, TextAlign::Right),
+            (P::BottomRightCorner, TextAlign::Left),
+            // Top / bottom bands: named by their slot.
+            (P::TopLeft, TextAlign::Left),
+            (P::TopCenter, TextAlign::Center),
+            (P::TopRight, TextAlign::Right),
+            (P::BottomLeft, TextAlign::Left),
+            (P::BottomCenter, TextAlign::Center),
+            (P::BottomRight, TextAlign::Right),
+            // Left / right bands: always centred across the narrow band.
+            (P::LeftTop, TextAlign::Center),
+            (P::LeftMiddle, TextAlign::Center),
+            (P::LeftBottom, TextAlign::Center),
+            (P::RightTop, TextAlign::Center),
+            (P::RightMiddle, TextAlign::Center),
+            (P::RightBottom, TextAlign::Center),
+        ];
+        for (pos, expected) in cases {
+            assert_eq!(pos.default_text_align(), *expected, "position={pos:?}");
+        }
+    }
+
+    #[test]
+    fn default_block_align_matches_reference_engines() {
+        use MarginBoxPosition as P;
+        let cases: &[(MarginBoxPosition, BlockAlign)] = &[
+            // Everything on a horizontal band centres vertically in it.
+            (P::TopLeftCorner, BlockAlign::Middle),
+            (P::TopLeft, BlockAlign::Middle),
+            (P::TopCenter, BlockAlign::Middle),
+            (P::TopRight, BlockAlign::Middle),
+            (P::TopRightCorner, BlockAlign::Middle),
+            (P::BottomLeftCorner, BlockAlign::Middle),
+            (P::BottomLeft, BlockAlign::Middle),
+            (P::BottomCenter, BlockAlign::Middle),
+            (P::BottomRight, BlockAlign::Middle),
+            (P::BottomRightCorner, BlockAlign::Middle),
+            // Side bands are named by their vertical slot, so they honour it.
+            (P::LeftTop, BlockAlign::Top),
+            (P::LeftMiddle, BlockAlign::Middle),
+            (P::LeftBottom, BlockAlign::Bottom),
+            (P::RightTop, BlockAlign::Top),
+            (P::RightMiddle, BlockAlign::Middle),
+            (P::RightBottom, BlockAlign::Bottom),
+        ];
+        for (pos, expected) in cases {
+            assert_eq!(pos.default_block_align(), *expected, "position={pos:?}");
+        }
+    }
+
+    #[test]
+    fn text_align_emits_the_css_keyword() {
+        assert_eq!(TextAlign::Left.as_css(), "left");
+        assert_eq!(TextAlign::Center.as_css(), "center");
+        assert_eq!(TextAlign::Right.as_css(), "right");
     }
 
     // --- flex_distribute tests ---

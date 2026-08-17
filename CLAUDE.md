@@ -145,3 +145,158 @@ callers don't get this guarantee by default — see the tracking issue
   (PR #244 で実例)。最初から両方書くこと。
 - **`Engine` is a builder**: `Engine::builder().page_size(PageSize::A4).base_path(root).build()` + single-arg `render(html)`. `render_html(html)` still exists as a `#[deprecated(since = "0.19.0")]` alias — do not use it in new code. There is no `Engine::new().with_*()`.
 - **VRT は PDF byte 比較**: `crates/fulgur-vrt` は HTML → PDF を生成して `goldens/fulgur/**/*.pdf` と byte-wise 比較する (`crates/fulgur-cli/tests/examples_determinism.rs` と同じ哲学)。pdftocairo は失敗時の diff 画像生成のみで使う。golden 更新は `FONTCONFIG_FILE="$PWD/examples/.fontconfig/fonts.conf" FULGUR_VRT_UPDATE=1 cargo test -p fulgur-vrt`。
+
+---
+
+## Fork notes (StudioMaak) — not for upstream PRs
+
+This is the **StudioMaak fork**. Everything above is upstream's; this section is ours, and
+should be stripped from any branch offered upstream.
+
+Why we forked: paperworx renders a large segment of documents needing no JavaScript.
+Measured **102 ms** for a real NBB jaarrekening inside a Worker isolate (fulgur-wasm in
+workerd) against **1128 ms** through Chrome + Paged.js — no browser, no container. Full
+Chrome stays for the rest. Four defects are written up in `paperworx-repros/`; the plan is
+to fix each here and offer it upstream as a separate PR.
+
+### Baselines
+
+`cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).
+The "~340 unit tests" figure in Common Commands above is long stale. `cargo test -p fulgur`
+adds ~30 integration binaries — 2468 passing in total.
+
+**`fulgur-vrt` needs `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8** — that is the only
+environment its byte-exact goldens reproduce in. Measured:
+
+| environment | DejaVu | result at `682bcbf3` |
+|---|---|---|
+| macOS host | resolves *Helvetica* | 29 of 64 fail |
+| `debian:bookworm` arm64 | 2.37-**6** | 29 fail, but within 0-36 bytes |
+| **`ubuntu:24.04` arm64** | 2.37-**8** | **64/64 pass, byte-identical** |
+
+Two things follow. **Architecture is irrelevant** — arm64 reproduces goldens cut on x86_64
+CI exactly, so fulgur's PDF output really is arch-independent and only the font floats.
+And the requirement is that *specific font package revision*: Debian's 2.37-6 and Ubuntu's
+2.37-8 are the same upstream version with different bytes, which is the whole 0-36 byte
+residual.
+
+`FONTCONFIG_FILE` does not save you here — it is a **proven no-op on macOS** (rendering is
+byte-identical with and without it), because fontconfig is not macOS's font mechanism.
+Note also that the goldens embed **DejaVuSans**, not the bundled Noto Sans the pinned
+`fonts.conf` asks for, so VRT's determinism actually rests on the runner image's default
+font rather than on the bundled set. A runner image bump would break every text fixture at
+once. `gcpm_snapshot.rs` shows the robust alternative: it injects Noto via
+`AssetBundle::add_font_file`, and its 19 byte-exact goldens pass unmodified on macOS.
+
+To run VRT (~2 min, mostly the build):
+
+```bash
+docker volume create vrt-target
+docker run --rm -v "$PWD":/work -v vrt-target:/tmp/lt -w /work \
+  -e CARGO_TARGET_DIR=/tmp/lt ubuntu:24.04 bash -c '
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y -qq fonts-dejavu-core fontconfig \
+      poppler-utils curl build-essential pkg-config python3
+    curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+    export PATH=/root/.cargo/bin:$PATH
+    export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
+    export FONTCONFIG_FILE=/work/examples/.fontconfig/fonts.conf
+    cargo test -p fulgur-vrt --test vrt_test -j 4'
+```
+
+`python3` is required (stylo's build script) and `poppler-utils` only on the failure path.
+Keep `-j 4` and `debug=0`: ten parallel linkers with full debug info OOM-kill `ld` in
+Docker's 8 GB VM.
+
+**Do not gate on VRT from macOS.** It cannot see your change — 17 of its 29 local failures
+are font noise, and real regressions hide behind them.
+
+### Never trust a README over a measurement
+
+WeasyPrint 69 and Chrome 151 headless-shell **agree to ~0.1 mm** on every case tested, so
+together they are the reference. This has caught four defects, killed one plausible
+hypothesis, and corrected two confident-but-wrong claims.
+
+```bash
+uvx --from weasyprint weasyprint in.html out-weasy.pdf     # reference A
+cargo run -p fulgur-cli -- render -o out-ful.pdf in.html   # subject
+pdftotext -bbox -f 1 -l 1 out.pdf -                        # xMin/yMin in pt; × 25.4/72 = mm
+```
+
+Chrome 151: `~/.cache/puppeteer/chrome-headless-shell/mac_arm-151.0.7922.71/` via
+`puppeteer-core`, `headless: 'shell'`, viewport 1920×1080. The driver script must sit in a
+directory that resolves `puppeteer-core` — a bare ESM import resolves against the script's
+own path, not the cwd.
+
+**Isolate one variable per file.** A margin box alone on its edge is given that edge's
+whole band, so where the glyphs land names its alignment directly, with none of the width
+distribution mixed in. Sixteen one-slot files beat one sixteen-slot file.
+
+**Confirm output is non-blank before believing a timing.** A 7 ms render of an empty page
+benchmarks beautifully.
+
+### Two traps when reading PDF output back
+
+- **`inspect`'s `width` is a crude `chars × font_size` estimate** — 32pt for a run that
+  measures 24pt. Never assert on it or derive a right edge from it. Use `pdftotext -bbox`
+  for real ink extents, or write assertions that need no width at all.
+- **`inspect` cannot recover text**: lopdf 0.40 does not read krilla's `ToUnicode` CMap, so
+  strings come back as raw glyph ids. Position is sound; content is not.
+
+**Prefer anchor invariants to absolute coordinates.** Absolute positions bake in the
+reference engine's font. Assert relations that survive any font: a left-aligned box's
+`xMin` equals its band's left edge; a centred box's midpoint equals the band centre; three
+boxes sharing a rect satisfy `right − left == 2 × (centre − left)` exactly, the glyph width
+cancelling out. See `crates/fulgur/tests/margin_box_alignment.rs`.
+
+### Where margin-box layout responsibility splits
+
+Know this before touching `gcpm/` or `render.rs` — a fix on the wrong side of the line
+looks fine and is wrong.
+
+- **fulgur owns the box's rect.** `gcpm/margin_box.rs::compute_edge_layout` implements the
+  CSS Paged Media 3 §5.3.3 distribution in Rust, fed by intrinsic sizes the engine measured.
+- **Blitz owns everything inside the rect.** `render_page` hands it a document whose
+  viewport *is* the rect.
+
+So per-box presentation belongs in that handed-over document (`margin_box_document`), as
+ordinary CSS through the normal cascade — **not** as an adjustment to the painted result.
+Translating the paint origin would drag the box's background and borders along with its
+content when only the content is meant to move.
+
+`gcpm/ua_css.rs` is *not* the seam: it is GCPM-only (`bookmark-level` and friends, parsed
+by fulgur's own parser) and by its own doc comment "never reaches Blitz".
+
+Measured Blitz/Taffy behaviour behind that choice:
+
+- `display:flex; flex-direction:column; justify-content:center|flex-start|flex-end`
+  resolves **exactly** (verified to 0.05pt).
+- `display:table-cell` + `vertical-align:middle` **silently does nothing** — content stays
+  at the box's top edge.
+- Content taller than its box degrades to top-aligned and stays inside the box; the
+  pagination pass fragments it and only page 0 is drawn. It does not spill upward.
+
+Precedence inside a box: the wrapper's inline style carries fulgur's defaults, while an
+author's at-rule declarations render on an **inner** element — and an inline style beats an
+inherited value, so the author still wins. The zeroed `margin`/`padding` already rely on
+this.
+
+### Known noise
+
+`ERROR: Unexpected token` on stderr during renders comes from the upstream CSS parser
+meeting the nested `@page { @bottom-right { … } }` at-rules. Pre-existing and cosmetic —
+don't chase it while debugging something else.
+
+### The WASM/Worker path
+
+```bash
+wasm-pack build crates/fulgur-wasm --target web --release   # speed build
+mise run wasm-build                                         # -Oz size build (~7 MB)
+```
+
+Speed build: 10.8 MB raw → 3.9 MB gzip → **2.6 MB brotli**. Worker limits are 3 MB free /
+10 MB paid compressed, so it fits. Runs under `workerd serve` with wasm/font/fixture
+embedded as capnp modules; `initSync({module})` at module scope costs ~1 ms per isolate.
+
+**WASM has no system fonts**, so registering `theme.assets[]` fonts is mandatory — see
+defect 3, where a font miss yields a blank document of record and still reports success.

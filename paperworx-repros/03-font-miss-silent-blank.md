@@ -11,7 +11,7 @@ reports success.
 Document: 16.5 KB, 40 paragraphs, `font-family: Georgia, "Times New Roman", serif`.
 Only `NotoSans-Regular.ttf` was registered.
 
-```
+```text
 renderMs: [6, 7, 8]          <- looks healthy
 pdfBytes: 1697               <- 1 page, ZERO text
 htmlBytes: 16499             <- input arrived intact
