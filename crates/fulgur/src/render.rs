@@ -3751,6 +3751,7 @@ impl<'a> MarginBoxRenderer<'a> {
             .get(&page_idx)
             .map(String::as_str);
         let mut resolved_htmls: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
+        let mut resolved_contents: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
         for (&pos, rule) in &effective_boxes {
             let content_html = resolve_content_to_html_with_anchor(
                 &rule.content,
@@ -3765,8 +3766,19 @@ impl<'a> MarginBoxRenderer<'a> {
                 implicit_href,
             );
             if !content_html.is_empty() {
+                // Two forms of the same box. `resolved_htmls` keeps the
+                // author's declarations wrapped around the content, which is
+                // what the measure passes size and what the caches key on —
+                // unchanged, because a declaration like `font-size` legitimately
+                // changes the box's max-content width.
+                //
+                // `resolved_contents` keeps the bare content. The render pass
+                // uses it and hands the declarations to `margin_box_document`
+                // separately, so they can style the *box* — a background has to
+                // fill the box's whole band, and an inner wrapper sized to its
+                // own content cannot do that.
                 let html = if rule.declarations.is_empty() {
-                    content_html
+                    content_html.clone()
                 } else {
                     format!(
                         "<div style=\"{}\">{}</div>",
@@ -3775,6 +3787,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     )
                 };
                 resolved_htmls.insert(pos, html);
+                resolved_contents.insert(pos, content_html);
             }
         }
 
@@ -3922,9 +3935,18 @@ impl<'a> MarginBoxRenderer<'a> {
                 block_align,
             );
             if !self.render_cache.contains_key(&cache_key) {
+                let declarations = effective_boxes
+                    .get(&pos)
+                    .map(|rule| rule.declarations.as_str())
+                    .unwrap_or("");
+                let content = resolved_contents
+                    .get(&pos)
+                    .map(String::as_str)
+                    .unwrap_or(html.as_str());
                 let render_html = margin_box_document(
                     &self.margin_css,
-                    html,
+                    declarations,
+                    content,
                     rect.height,
                     text_align,
                     block_align,
@@ -3937,9 +3959,21 @@ impl<'a> MarginBoxRenderer<'a> {
                     self.system_fonts,
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
+                // Half a CSS pixel of slack on the page height. A box whose
+                // content exactly fills it — a bottom-aligned box, whose
+                // content's bottom edge lands precisely on the box's own
+                // height — otherwise trips the fragmenter's boundary test on
+                // a float comparison, spills onto a second page, and vanishes:
+                // only page 0 is ever drawn. `@left-bottom` / `@right-bottom`
+                // lost their content outright this way.
+                //
+                // The slack is far too small to change where genuinely
+                // overflowing content is cut, which must keep happening —
+                // that clipping is what stops an oversized margin box from
+                // painting over the page body.
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
                     &mut render_doc,
-                    rect.height.in_px(),
+                    rect.height.in_px() + 0.5.as_px(),
                     &empty_column_styles,
                 );
                 let dummy_store = RunningElementStore::new();
@@ -4022,19 +4056,48 @@ impl<'a> MarginBoxRenderer<'a> {
 /// translation would drag the box's background and borders along with its
 /// content, when only the content is meant to move.
 ///
-/// The wrapper carries the box's own height so there is something for the
-/// content to be aligned *within*: laid out at its natural height, as the
-/// measure passes do, a vertical alignment would have no room to mean
-/// anything. The single block-level child keeps the author's content in a
-/// normal block formatting context — it is the only flex item, so nothing
-/// the author wrote gets reinterpreted as one.
+/// Two nested elements, because they are two different things:
 ///
-/// Alignment goes on the wrapper, so it is inherited but loses to an
-/// author's own `text-align`: declarations from the at-rule render on an
-/// inner element, and an inline style beats an inherited value. That is the
-/// same precedence the zeroed `margin` / `padding` here already rely on.
+/// Two nested elements, because they are two different things:
+///
+/// - `<body>` is the **slot**: its `margin` / `padding` are zeroed so the
+///   renderer can paint at `rect.x, rect.y` against a (0, 0) body offset.
+/// - the `<div>` is the **margin box**: it takes the rect's height, carries
+///   the author's declarations, and aligns the content inside itself.
+///
+/// The author's declarations have to land on that div rather than on an
+/// inner wrapper, because an inner wrapper is sized to its own content — a
+/// `background` then painted only the strip the text occupied instead of the
+/// whole band. They cannot go on the body either: a body background is not
+/// emitted by this render path at all.
+///
+/// Content taller than its band now spills out of it rather than being cut
+/// off, because the box has an explicit height and centring overflows in
+/// both directions. The reference engines disagree on this degenerate case —
+/// WeasyPrint spills the same way, Chrome contains it — and `overflow:
+/// hidden` does not clip in this render path, so containing it needs the
+/// clip machinery the main path uses. Tracked in paperworx-repros as the
+/// remaining half of item 5.
+///
+/// `margin` is re-zeroed *after* the declarations, so it is the one property
+/// an author cannot set here. The box is positioned by fulgur, not by the
+/// document, and a margin would shift it off the rect the renderer paints
+/// against. `padding` stays overridable — it insets content within the
+/// background, which is exactly what it should do.
+///
+/// Keeping them apart is what makes a `background` fill the whole band, as
+/// Chrome does — the author's declarations used to render on an inner
+/// wrapper sized to its own content, so a background painted only the strip
+/// the text occupied. It also makes an author `margin` behave: it insets the
+/// box within the slot, which is what margin means, while the slot itself
+/// stays pinned to the rect the renderer paints against.
+///
+/// Author declarations come last in the box's style attribute, so they beat
+/// the defaults written before them. `text-align` is inherited, so content
+/// picks it up either way.
 fn margin_box_document(
     margin_css: &str,
+    declarations: &str,
     content_html: &str,
     height: crate::units::Pt,
     text_align: TextAlign,
@@ -4051,13 +4114,14 @@ fn margin_box_document(
     };
     format!(
         "<html><head><style>{}</style></head>\
-         <body style=\"margin:0;padding:0;height:{}pt;\
-         display:flex;flex-direction:column;justify-content:{};text-align:{};\">\
-         <div>{}</div></body></html>",
+         <body style=\"margin:0;padding:0;\">\
+         <div style=\"height:{}pt;display:flex;flex-direction:column;\
+         justify-content:{};text-align:{};{};margin:0;\">{}</div></body></html>",
         margin_css,
         height.to_f32(),
         justify,
         text_align.as_css(),
+        escape_attr(declarations),
         content_html
     )
 }

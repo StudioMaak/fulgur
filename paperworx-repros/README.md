@@ -13,7 +13,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **unimplemented feature** — scoped |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
-| 5 | Margin-box background does not fill the box's band | — | cosmetic | **deferred** — after 1-3 |
+| 5 | Margin-box background does not fill the box's band | — | cosmetic | **fixed** (one part deferred) |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -127,29 +127,47 @@ text to render. Distinguishing the two means noticing that text was laid out but
 to zero glyphs, which is a separate change. It matters for paperworx: a theme whose
 `assets[]` carries no font at all lands exactly here.
 
-## 5 — deferred until 1-3 are done
+## 5 — fixed; and it uncovered a silent content-loss bug
 
-Found while checking whether 4's fix was a general capability or only enough for our own
-documents. It is a real conformance gap, but nothing paperworx renders depends on it, so
-it waits.
+A margin box's background now fills its whole band, matching Chrome exactly
+(**y 272.3-296.3mm**, against Chrome's 272.3-296.3). It used to paint only
+282.9-285.8mm — the strip the text happened to occupy.
 
-A red `background` on `@bottom-center`, A4/25mm (band = x 25-185mm, y 272-297mm):
+The author's declarations used to render on an inner wrapper, and a wrapper is sized to
+its own content. They now go on a box `<div>` that takes the rect's height, inside a
+`<body>` that stays the untouched slot. `margin` is re-zeroed after them — the box is
+positioned by fulgur, not by the document — while `padding` stays overridable, since
+insetting content within the background is what padding is for.
 
-| engine | horizontal | vertical |
-|---|---|---|
-| WeasyPrint 69 | 103.0-105.8mm (shrink-wrapped to the text) | 272.3-296.3mm (full band) |
-| fulgur | 25.4-184.1mm (full width) | 282.9-285.8mm (**content height only**) |
-| Chrome 151 | 24.7-184.1mm (full width) | 272.3-296.3mm (full band) |
+Chrome is the authority here because the two references disagree: Chrome's box *is* its
+rect on both axes, WeasyPrint shrink-wraps horizontally. That disagreement also explains
+the `text-align` divergence noted under item 4.
 
-**This is the one case where the two reference engines disagree with each other**, so
-their agreement cannot settle it. Chrome's model — the margin box *is* its rect, on both
-axes — is the one matching §5.3.3, and it also explains the `text-align` divergence:
-WeasyPrint shrink-wraps horizontally, so alignment inside the box is moot there.
+### The bug it uncovered
 
-The cause is that an author's `declarations` render on an inner element rather than on the
-box. Moving them to the wrapper fixes the background, but the wrapper zeroes
-`margin`/`padding` precisely so the renderer can paint at `rect.x, rect.y` with a (0, 0)
-body offset — so author `margin` has to be handled in the same change.
+Building this exposed a **pre-existing silent content-loss bug at the fork point**:
+`@left-bottom` and `@right-bottom` boxes drew **nothing at all** unless the at-rule
+happened to carry extra declarations. A bottom-aligned box puts its content's bottom edge
+exactly on its own height, which is also the render pass's page height — a float
+comparison then tips it onto a second page that is never drawn. Every probe in the
+original defect-4 work carried `font-size: 8pt`, whose extra nesting level dodged the
+boundary, so it stayed hidden.
+
+Half a CSS pixel of slack on that page height fixes it. It is far too small to change
+where genuinely overflowing content is cut. Same class as item 3: content vanishing while
+the render reports success.
+
+### Still deferred: overflow containment
+
+Content *taller* than its band now spills out of it instead of being cut off, because the
+box has an explicit height and centring overflows in both directions. The references
+disagree again — WeasyPrint spills the same way, Chrome contains it — so this is a
+behaviour change, not a regression against the reference, but it does differ from what
+fulgur did before.
+
+`overflow: hidden` does not clip in the margin-box render path, so containing it needs the
+clip machinery the main render path uses (`clip_descendants` / `draw_under_clip_table`).
+That is the remaining half of this item.
 
 ## 4 — fixed
 
