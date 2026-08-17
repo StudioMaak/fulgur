@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+DEFECT 2 — <thead> is not repeated on continuation pages.
+
+Expected (WeasyPrint 69 AND Chrome 151, both 9/9): the header row appears once per
+page the table spans.
+Actual (fulgur 0.40.0): 1/9 — first page only.
+
+Row integrity itself is fine: 300/300 unique row codes present, zero duplicated.
+Only the repeated header is missing.
+-->
+<html><head><meta charset="utf-8"><style>
+  @page { size: A4; margin: 20mm }
+  table { width: 100%; border-collapse: collapse; font-size: 9pt }
+  th, td { border-bottom: .5pt solid #999; padding: 2pt 3pt }
+  tr { break-inside: avoid }
+</style></head><body>
+<table>
+  <thead><tr><th>Code</th><th>REPEATME</th><th>Amount</th></tr></thead>
+  <tbody>
+  <!-- 300 rows; generate or paste. Each code must be unique to audit row loss. -->
+  </tbody>
+</table>
+</body></html>
