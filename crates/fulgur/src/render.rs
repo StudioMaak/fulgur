@@ -2837,9 +2837,12 @@ fn draw_block_inner_paint(
 ///
 /// Tables with `overflow: hidden | clip` route through
 /// [`draw_under_clip_table`] instead so the clip path wraps every
-/// cell dispatched in the same scope. Multi-page table header
-/// repetition (`<thead>` cloned on continuation pages) is deferred
-/// to a later change.
+/// cell dispatched in the same scope.
+///
+/// Multi-page header repetition needs nothing here either: the
+/// fragmenter gives each `<thead>` cell `is_repeat = true` geometry
+/// with one fragment per page (`pagination_layout::reserve_repeated_header`),
+/// so the header redraws through the same per-NodeId cell dispatch.
 fn draw_table_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     entry: &crate::drawables::TableEntry,

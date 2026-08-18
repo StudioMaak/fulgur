@@ -10,10 +10,12 @@ Intent: fix here, then offer upstream as separate PRs.
 | # | defect | file | severity | status |
 |---|---|---|---|---|
 | 1 | Running elements not repeated per page | `01-running-element-per-page.html` | blocks NBB | **misdiagnosed** — see below |
-| 2 | `<thead>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **unimplemented feature** — scoped |
+| 2 | `<thead>` / `<tfoot>` not repeated on continuation pages | `02-thead-repeat.html` | blocks NBB | **fixed** — was a v2 regression, not a missing feature |
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **fixed** (one part deferred) |
+| 6 | `<tfoot>` before `<tbody>` renders at the top of the table | — | real, single-page | **open** — see below |
+| 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -53,49 +55,135 @@ reference: WeasyPrint emits exactly one `/Link` here, and on `element(title, las
 agrees with fulgur page-for-page (Override / Override / Two), which it did not before —
 the running elements had been occupying space and mis-paginating the document.
 
-## 2 — an unimplemented feature, not a defect; scoped and ready to start
+## 2 — fixed; it was a regression, not a missing feature
 
-fulgur never claimed this. Both `drawables.rs` and `render.rs` say so outright: *"Multi-page
-header repetition (`<thead>` cloned on continuation pages) is **not** modelled in PR 5"* and
-*"deferred to a later change"*. Upstream scheduled it as its own PR, and the `is_header`
-flag threaded through `convert::table::collect_table_cells` is dead plumbing left for it.
+Covers both `<thead>` and `<tfoot>` repetition. Footer repetition is the mirror of
+the header's, not a copy: a repeated header offsets where each page's strip
+*starts*, a repeated footer shrinks where it *ends*.
 
-Measured on a 300-row A4 fixture — the reported 1/9 reproduces as 1/7 here:
+**The earlier framing here was wrong, and the repo's own git history disproves it.**
+fulgur *did* implement `<thead>` repetition — `TablePageable`, shipped in PR #14
+(`065def71`, March 2026) — and lost it in the Phase 4 migration from the `Pageable`
+tree to geometry-driven `Drawables` (`cd740c3d`, "delete pageable.rs, all Pageable
+types removed"). The comments in `drawables.rs` ("not modelled in PR 5") and
+`render.rs` ("deferred to a later change") were the v2 authors recording that they
+had dropped it, not that it had never existed. `examples/table-header/` is v1's own
+example, and the `is_header` flag in `convert::table::collect_table_cells` is what
+survives of v1's classification.
+
+Offer this upstream as *restoring* behaviour lost in the Drawables migration.
+
+### The fixture was broken
+
+`02-thead-repeat.html` had lost its `<html><head><style>` opening tags — the file
+went straight from the HTML comment to bare CSS text and a stray `</style>`, so none
+of the CSS applied. That is why WeasyPrint measured 8 pages here rather than the 7
+recorded in this table. Repaired as part of this change; both engines then reproduce
+the documented numbers exactly.
+
+### Measured after the fix
 
 | engine | pages | pages with header | unique rows | duplicated |
 |---|---|---|---|---|
 | WeasyPrint 69 | 7 | **7/7** | 300/300 | 0 |
-| fulgur | 7 | **1/7** | 300/300 | 0 |
+| fulgur (before) | 7 | 1/7 | 300/300 | 0 |
+| fulgur (after) | 7 | **7/7** | 300/300 | 0 |
 
-Row integrity is perfect and must stay that way — it is the thing a careless fragmenter
-change would break.
+Header bottom lands within **0.03pt** of WeasyPrint's on every page — the same order
+as the font-metric residual seen in defect 4. Verified on three shapes: the fixture,
+a table with no CSS at all, and a table starting mid-page after a heading.
 
-### Groundwork already in place
+### How it works
 
-- `PaginationGeometry::is_repeat` already models per-page repetition, and `is_split()`
-  already refuses to subdivide such fragments.
-- `record_fixed_subtree_descendants` is a working precedent: it walks a subtree and emits
-  one fragment per page with `is_repeat = true`, under an `emitted` budget bounding
-  O(descendants x pages).
-- The fragmenter is a cursor-based fill (`cursor_y + h > page_height_px` -> advance page,
-  reset cursor), not a naive `y / page_height` map — so reserving header height on a
-  continuation page is expressible.
-- `crates/fulgur/tests/thead_repeat.rs` encodes the requirement, currently `#[ignore]`d
-  with the reason. Un-ignore it to start; the single-page control beside it already passes
-  and guards against a reservation that fires when it should not.
+The header must *reserve* space, so it cannot be a post-pass like
+`append_position_fixed_fragments` — `position: fixed` is out of flow and displaces
+nothing, whereas header fragments emitted without reservation land on top of the
+first row of every continuation page. `thead_repeat.rs` pins that: disabling the
+reservation while keeping the emission puts the header's bottom *below* the topmost
+row.
 
-### Why it is not a small change
+Blitz lays a `<table>` out as a flat cell grid — the table's `layout_children` are
+the `<th>` / `<td>` boxes, and `<thead>` / `<tbody>` / `<tr>` carry no layout at all
+— so a header cell is found by DOM ancestry, not by walking a `<thead>` layout child.
 
-The header must also **reserve** space, so it cannot be done as a post-pass the way
-`append_position_fixed_fragments` adds `position: fixed` repeats — those are out of flow
-and never displace anything. Emitting header fragments without reservation would overlap
-the first row of every continuation page, which is worse than the current omission.
+`fragment_block_subtree` computes the band once per table and reserves it at the
+strip-overflow page cut, emitting `is_repeat = true` geometry for the header cells so
+the existing per-NodeId dispatch redraws them whole on each page. Whether to reserve
+is decided **per page**, following WeasyPrint's
+`layout/table.py::all_groups_layout`: a header that would leave no room for a row is
+dropped for that page. That makes the pathological cases — a header taller than the
+page, or one that starves the first row — fall out instead of needing their own
+guards, and guarantees the fragmenter still makes progress.
 
-Reservation belongs in `fragment_block_subtree`, which carries `RowState` co-splitting,
-`page_taffy_origin`, `origin_pending_same_row`, grid/flex parallel-sibling handling and
-**four** page-advance sites, each with its own state restoration. That is the delicate
-core of the engine, and it is why this is the largest of the five items by a wide margin —
-and why upstream made it a separate PR.
+Only the header carries `is_repeat`. v1 shipped a bug where table *body* cells were
+cloned wholesale onto every page instead of sliced per page (fixed in `4d44c483`);
+widening `is_repeat` past the header would reintroduce exactly that.
+
+### `<tfoot>` measured
+
+Same 300-row fixture with a `<tfoot>` after `<tbody>`:
+
+| engine | pages | header | footer | rows | dup | footer overlaps |
+|---|---|---|---|---|---|---|
+| WeasyPrint 69 | 7 | 7/7 | **7/7** | 300/300 | 0 | 0 |
+| fulgur (before) | 7 | 7/7 | 1/7 | 300/300 | 0 | 0 |
+| fulgur (after) | 7 | 7/7 | **7/7** | 300/300 | 0 | 0 |
+
+Both engines place the footer immediately after the last row on each page rather
+than flush to the page bottom — WeasyPrint via
+`footer.translate(dy=end_position_y - footer.position_y)`. fulgur holds a constant
+**+6.00pt** gap from the last row on every page including the last, where the table
+ends mid-page; WeasyPrint holds **+4.50pt**. The 1.5pt difference is row
+padding / line-height, not a placement error.
+
+Absolute footer positions diverge on the final page (261pt vs 635pt) purely because
+of row packing: WeasyPrint fits 48 rows per page against fulgur's 44, so 13 rows land
+on page 7 rather than 36. Both total 300. That difference predates this change.
+
+### Known limitations
+
+- **Collapsed borders are not resolved for the repeated header.** With
+  `border-collapse: collapse`, WeasyPrint tracks `body_rows_offset = skipped_rows -
+  header_rows` in `draw/__init__.py` purely to resolve a repeated header row's
+  borders against the first body row. fulgur does not.
+- **A cell whose own content splits across pages does not carry the header** on the
+  pages that split spans. The recursion places that content from y = 0 on the new
+  page, so there is no reserved room there; the header is omitted rather than
+  overlapped.
+- **Forced breaks inside a table do not repeat either band** — measured: `break-before:
+  page` on a `<td>` is not honoured by fulgur at all, so those page-advance paths are
+  unreachable for tables today and deliberately carry no reservation logic.
+- **A `<tfoot>` written before `<tbody>` is not repeated at all** — it is mis-placed to
+  begin with (defect 6), so `table_section_band` bails rather than repeating a footer
+  that is already in the wrong place.
+
+## 6 — `<tfoot>` before `<tbody>` renders at the top of the table
+
+Found while measuring defect 2's footer half. **Not a pagination defect** — it needs no
+multi-page document, and it lives in table layout rather than in the fragmenter.
+
+fulgur lays table sections out in source order. CSS requires a `<tfoot>` at the bottom
+of the table regardless of where it appears in the source, and HTML4 *required* authors
+to write it before `<tbody>`, so real documents hit this.
+
+Single page, 40 rows, `yMin` top-down (bigger = lower on the page):
+
+| fixture | engine | header | rows | footer | verdict |
+|---|---|---|---|---|---|
+| `<tfoot>` before `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | **657.8** | below rows |
+| `<tfoot>` before `<tbody>` | fulgur | 65.7 | 96-703 | **80.7** | **above rows** |
+| `<tfoot>` after `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | 657.8 | below rows |
+| `<tfoot>` after `<tbody>` | fulgur | 65.7 | 80-687 | 703.2 | below rows |
+
+WeasyPrint's output is identical for both orderings, as it should be. fulgur is correct
+only when the author already wrote the sections in visual order.
+
+Until it is fixed, defect 2's footer repetition deliberately bails on this shape
+(`table_section_band` requires the band to be the table's bottom strip), so a misplaced
+footer is never repeated onto every page. Pinned by
+`table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band`, which also asserts
+its own premise — if section ordering is ever fixed, that test fails loudly rather than
+passing for the wrong reason.
 
 ## 3 — fixed
 
@@ -199,3 +287,79 @@ cargo run -p fulgur-cli -- render -o out-ful.pdf in.html
 # compare text positions in mm
 pdftotext -bbox -f 1 -l 1 out.pdf -    # xMin/yMin are pt; * 25.4/72 = mm
 ```
+
+## 7 — fixed; page 0 was over-filled by the body offset
+
+Found by `scripts/refdiff`, not by hand — the first thing that harness caught
+that nothing else had. **The name is a misnomer**: the fixture that surfaced it
+uses `break-inside: avoid`, but the defect has nothing to do with it. The same
+divergence reproduces with `break-inside: auto` and with empty blocks, which is
+what killed the first hypothesis.
+
+### Root cause
+
+`render_v2` shifts page 0's fragments down by `body_offset_pt.1` — body's own
+`location.y`, which absorbs the collapsed top margin of the first in-flow child
+— and applies it to **page 0 only**; continuation pages are already
+page-content-area-relative because the fragmenter resets `cursor_y` to 0
+(`render.rs`: *"only on page 0 (continuation pages are already
+page-content-area-relative after the fragmenter resets cursor_y)"*).
+
+The fragmenter, however, compared body-relative cursors against the **full**
+page height. So page 0's usable height was over-stated by exactly the body
+offset, and whatever landed last on it spilled past the page bottom.
+
+Measured on the fixture: page height 971.35px, body offset 15px, page 0's
+content reaching 964px body-relative — true bottom 979px, a **5.74pt overflow**,
+and 2 pages where WeasyPrint uses 3.
+
+### It was not rare
+
+A 100-paragraph document with fulgur's default 20mm margins (content band
+56.69–785.20pt) drew **12 words below the content bottom**, worst overflow
+8.74pt — into the band where `@bottom-center` renders the page number, so body
+text and the page number overlap. After the fix: **0 words below the bottom**,
+matching WeasyPrint exactly (4 pages, 0 overflow, both engines).
+
+It only changes the *page count* when the last block on page 0 happens to land
+within the offset window, which is why it stayed invisible: usually it just
+prints a line or two into the bottom margin.
+
+### The fix
+
+Page 0's capacity is `page_height_px - body_offset_y`; every later page keeps
+the full height. Applied at the four decision sites in
+`fragment_pagination_root` — inline-root promotion, the recursion gate's
+available strip, the block strip-overflow cut, and an oversized child's first
+slice.
+
+Covered by `crates/fulgur/tests/body_offset_capacity.rs`, whose fixture is
+font-independent (every height an explicit `mm`) and places the page boundary
+inside the offset window so the two capacity models give 3 pages versus 2. Its
+control asserts that a document with **no** body offset keeps the full first
+page — guarding against "fixing" this by shrinking every page, which would
+under-fill documents that never had an offset.
+
+`scripts/refdiff` now reports this fixture as `AGREE` at 3 pages against
+WeasyPrint's 3, max Δy 1.3pt.
+
+### Two goldens had encoded it
+
+`gcpm_multipage_counter` and `gcpm_string_set_chapter_title` both changed. Their
+committed snapshots placed a text baseline at **792.44pt** against a content
+bottom of **785.20pt** — 7.24pt into the bottom margin. They were regenerated
+only after measuring that the pre-fix build drew 12 words past the page bottom
+and the post-fix build draws none.
+
+That is the fourth golden in this fork found to have encoded a defect as
+expected output. Regenerating is never verification; see
+`docs/test-harnesses.md`.
+
+### Still open
+
+The same capacity model applies inside `fragment_block_subtree`, which receives
+`page_height_px` and does its own overflow comparisons. No fixture reproduces a
+failure there — a body-direct child would have to recurse on page 0 *and* have
+its internal break land within the body offset of the bottom — so it is
+deliberately left alone rather than changed speculatively without a failing
+test.
