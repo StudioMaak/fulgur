@@ -3434,17 +3434,161 @@ fn record_fixed_subtree_descendants(
     }
 }
 
-/// fulgur-a8m5: emit a Fragment for every body-direct
-/// `position: absolute` element whose effective containing block falls
-/// back to the viewport (when body's box collapses to zero because all
-/// of its children are out-of-flow — see CSS 2.1 §10.1.5 and the
-/// matching `viewport_size_px` body-zero fallback in
-/// `convert::positioned::resolve_cb_for_absolute`).
+/// Collect every `position: absolute` element whose containing block is
+/// the initial containing block — i.e. every ancestor between it and the
+/// root is `position: static` (CSS 2.1 §10.1: the CB is the nearest
+/// ancestor with a `position` other than `static`, else the ICB).
 ///
-/// `fragment_pagination_root` skips out-of-flow children unconditionally,
-/// so without this pass `<body><div style="position:absolute; bottom:0">…</div></body>`
-/// never reaches `pagination_geometry` and the v2 dispatch loop drops
-/// the element entirely (WPT `fixedpos-00{1,2,8}` ref-side breakage).
+/// Returns `(node_id, ancestor_offset)`, where `ancestor_offset` is the
+/// node's *parent's* border-box origin accumulated from `<body>` in CSS
+/// px. That is what an `auto` inset needs: an axis with no explicit
+/// inset keeps the static position, which Taffy reports relative to the
+/// immediate layout parent rather than to `<body>`.
+///
+/// Traversal rules, each mirroring a rule the abs / fixed passes already
+/// rely on:
+///   - `position: fixed` subtrees are skipped — [`append_position_fixed_fragments`]
+///     owns them, and it has already run by the time this pass does.
+///   - An `absolute` node is collected and **not** descended into: its own
+///     subtree (including nested absolutes) is walked by
+///     [`record_subtree_fragments_at_offset`], which resolves nested CBs
+///     itself.
+///   - Any other non-`static` node (`relative` / `sticky`) is a legitimate
+///     containing block, so its subtree is skipped entirely and Taffy's
+///     parent-relative placement stands.
+///
+/// `layout_children` is preferred over `children` so the accumulated
+/// offset stays in Taffy's frame when Stylo synthesized anonymous block
+/// wrappers (CSS 2.1 §9.2.1.1) — the same idiom as
+/// `record_subtree_descendants`.
+fn collect_icb_anchored_absolutes(
+    doc: &BaseDocument,
+    node_id: usize,
+    offset_from_body: (f32, f32),
+    depth: usize,
+    out: &mut Vec<(usize, (f32, f32))>,
+) {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+
+    if depth >= crate::MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return;
+    };
+    let children: Vec<usize> = {
+        let borrow = node.layout_children.borrow();
+        match borrow.as_deref() {
+            Some(lc) if !lc.is_empty() => lc.to_vec(),
+            _ => node.children.clone(),
+        }
+    };
+    for child_id in children {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        let position = child
+            .primary_styles()
+            .map(|s| s.get_box().clone_position())
+            .unwrap_or(Pos::Static);
+        match position {
+            Pos::Fixed => continue,
+            Pos::Absolute => {
+                // `depth == 0` is a body-direct absolute, already emitted by
+                // the caller's own loop over `body.children`.
+                if depth > 0 {
+                    out.push((child_id, offset_from_body));
+                }
+            }
+            Pos::Static => collect_icb_anchored_absolutes(
+                doc,
+                child_id,
+                (
+                    offset_from_body.0 + child.final_layout.location.x,
+                    offset_from_body.1 + child.final_layout.location.y,
+                ),
+                depth + 1,
+                out,
+            ),
+            // `relative` / `sticky`: a real containing block for anything
+            // absolute below it. Leave that subtree to Taffy.
+            _ => continue,
+        }
+    }
+}
+
+/// Drop every Fragment the in-flow fragmenter recorded for `root_id`'s
+/// subtree, so [`record_subtree_fragments_at_offset`] can rewrite it
+/// without doubling up.
+///
+/// Body-direct absolutes never need this — `fragment_pagination_root`
+/// skips out-of-flow children, so nothing was recorded. Deeper ones do:
+/// `record_subtree_descendants` walks *all* children (it has no
+/// out-of-flow filter) and therefore recorded the whole absolute subtree
+/// at Taffy's parent-relative location.
+///
+/// `position: fixed` subtrees are left alone — the fixed pass runs before
+/// this one and its fragments are the source of truth for them.
+fn clear_subtree_fragments(
+    geometry: &mut PaginationGeometryTable,
+    doc: &BaseDocument,
+    root_id: usize,
+    depth: usize,
+) {
+    if depth >= crate::MAX_DOM_DEPTH {
+        return;
+    }
+    if let Some(geom) = geometry.get_mut(&root_id) {
+        geom.fragments.clear();
+    }
+    let Some(node) = doc.get_node(root_id) else {
+        return;
+    };
+    let children: Vec<usize> = {
+        let borrow = node.layout_children.borrow();
+        match borrow.as_deref() {
+            Some(lc) if !lc.is_empty() => lc.to_vec(),
+            _ => node.children.clone(),
+        }
+    };
+    for child_id in children {
+        let is_fixed = doc.get_node(child_id).is_some_and(|c| {
+            use ::style::properties::longhands::position::computed_value::T as Pos;
+            c.primary_styles()
+                .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Fixed))
+        });
+        if is_fixed {
+            continue;
+        }
+        clear_subtree_fragments(geometry, doc, child_id, depth + 1);
+    }
+}
+
+/// fulgur-a8m5: emit a Fragment for every `position: absolute` element
+/// whose effective containing block is the initial containing block — the
+/// page area (CSS 2.1 §10.1). That is every absolute with no positioned
+/// ancestor, whether it is a direct child of `<body>` or nested arbitrarily
+/// deep inside `position: static` boxes.
+///
+/// Two distinct reasons this pass has to exist, one per shape:
+///
+///   - **Body-direct.** `fragment_pagination_root` skips out-of-flow
+///     children unconditionally, so without this pass
+///     `<body><div style="position:absolute; bottom:0">…</div></body>`
+///     never reaches `pagination_geometry` at all and the v2 dispatch loop
+///     drops the element (WPT `fixedpos-00{1,2,8}` ref-side breakage).
+///   - **Nested (paperworx repro 12).** `record_subtree_descendants` *does*
+///     record absolute descendants, but at Taffy's location — and Taffy
+///     resolves an absolute child's insets against its immediate parent's
+///     box, not against the nearest positioned ancestor. One unstyled
+///     `<section>` in between was enough to re-anchor `bottom: 0` onto the
+///     wrapper. Those stale fragments are cleared
+///     ([`clear_subtree_fragments`]) and rewritten here.
+///
+/// A nested absolute is only taken over when it carries an explicit inset
+/// on at least one axis. With both axes `auto` there is no containing
+/// block question to answer — the used position *is* the static position,
+/// which the in-flow fragmenter already computed (and paginated) correctly.
 ///
 /// Each visited in-flow node emits fragments for every page intersected
 /// by its resolved y range; off-page elements (e.g. `bottom: -100vh` in
@@ -3530,6 +3674,62 @@ pub fn append_position_absolute_body_direct_fragments(
         // the body offset down and let the walker subtract it from the
         // stored y while keeping page assignment based on the un-
         // compensated viewport-anchored y.
+        record_subtree_fragments_at_offset(
+            geometry,
+            doc,
+            child_id,
+            (resolved_x, resolved_y),
+            body_offset_xy,
+            viewport_h_px,
+            page_stride_px,
+            pages,
+            !body_has_in_flow_content,
+            &mut emitted,
+        );
+    }
+
+    // paperworx repro 12: the same treatment for absolutes further down
+    // the tree whose containing block is still the ICB. Taffy placed them
+    // against their immediate parent's box, which is only the CSS answer
+    // when that parent happens to be the nearest positioned ancestor.
+    let mut nested: Vec<(usize, (f32, f32))> = Vec::new();
+    collect_icb_anchored_absolutes(doc, body_id, (0.0, 0.0), 0, &mut nested);
+    for (child_id, ancestor_offset) in nested {
+        let Some(child) = doc.get_node(child_id) else {
+            continue;
+        };
+        // Both axes `auto` — the used position is the static position, and
+        // the in-flow fragmenter already recorded it (correctly, including
+        // its page assignment). Nothing to re-resolve.
+        let (explicit_x, explicit_y) = explicit_inset_axes(child);
+        if !explicit_x && !explicit_y {
+            continue;
+        }
+        let layout = child.final_layout;
+        let (w, h) = (layout.size.width, layout.size.height);
+        let (cb_x, cb_y) = resolve_viewport_cb_location(child, w, h, viewport_w_px, viewport_h_px)
+            .unwrap_or((layout.location.x, layout.location.y));
+        // Per axis: an explicit inset resolves against the ICB; an `auto`
+        // one keeps the static position, which Taffy reports relative to the
+        // immediate layout parent — hence `+ ancestor_offset`. For a
+        // body-direct absolute `ancestor_offset` would be `(0, 0)` and this
+        // reduces to the loop above, which is why that loop is left alone.
+        let resolved_x = if explicit_x {
+            cb_x
+        } else {
+            ancestor_offset.0 + layout.location.x
+        };
+        let resolved_y = if explicit_y {
+            cb_y
+        } else {
+            ancestor_offset.1 + layout.location.y
+        };
+        let page_stride_px = if uses_bottom_without_top(child) {
+            viewport_h_px.round()
+        } else {
+            viewport_h_px
+        };
+        clear_subtree_fragments(geometry, doc, child_id, 0);
         record_subtree_fragments_at_offset(
             geometry,
             doc,
@@ -5884,6 +6084,208 @@ h2 { string-set: chapter-title content(text); }
         assert!(
             (frag_y - 770.0).abs() < 1.0,
             "abs body-direct bottom:0 should land at y=770; got {frag_y}",
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // paperworx repro 12: an absolute nested inside `position: static`
+    // boxes still has the initial containing block (the page area) as
+    // its containing block — CSS 2.1 §10.1.
+    // ---------------------------------------------------------------
+
+    /// Run the fragmenter and then the absolute pass, the way
+    /// `Engine::render` does, and return the geometry of the unique node
+    /// sized `w × h`.
+    fn nested_abs_fragments(html: &str, w: f32, h: f32) -> Vec<Fragment> {
+        let mut doc = parse(html, 600.0);
+        let mut geom = run_pass(doc.deref_mut(), 800.0);
+        super::append_position_absolute_body_direct_fragments(
+            &mut geom,
+            doc.deref_mut(),
+            1,
+            600.0,
+            800.0,
+            None,
+        );
+        let mut found: Vec<Fragment> = Vec::new();
+        for g in geom.values() {
+            if g.fragments
+                .iter()
+                .any(|f| (f.width.to_f32() - w).abs() < 0.5 && (f.height.to_f32() - h).abs() < 0.5)
+            {
+                found = g.fragments.clone();
+            }
+        }
+        found
+    }
+
+    /// `bottom: 0` inside an unstyled 200px-tall wrapper must resolve
+    /// against the 800px page area (y = 800 − 30 = 770), not against the
+    /// wrapper (which would give y = 200 − 30 = 170).
+    #[test]
+    fn nested_absolute_bottom_resolves_against_the_page_area() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section style="height:200px">
+                <div style="position:absolute; bottom:0; left:0; width:50px; height:30px"></div>
+              </section>
+            </body></html>
+        "#;
+        let frags = nested_abs_fragments(html, 50.0, 30.0);
+        assert_eq!(
+            frags.len(),
+            1,
+            "expected exactly one fragment, got {frags:?}"
+        );
+        let y = frags[0].y.to_f32();
+        assert!(
+            (y - 770.0).abs() < 1.0,
+            "nested `bottom: 0` must resolve against the page area (y=770), \
+             not the 200px wrapper (y=170); got {y}",
+        );
+    }
+
+    /// The same on the inline axis: `left: 0` inside a wrapper indented
+    /// 120px must land at x = 0, not at x = 120.
+    #[test]
+    fn nested_absolute_left_resolves_against_the_page_area() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section style="margin-left:120px; width:200px">
+                <div style="position:absolute; left:0; top:100px; width:50px; height:30px"></div>
+              </section>
+            </body></html>
+        "#;
+        let frags = nested_abs_fragments(html, 50.0, 30.0);
+        assert_eq!(
+            frags.len(),
+            1,
+            "expected exactly one fragment, got {frags:?}"
+        );
+        let (x, y) = (frags[0].x.to_f32(), frags[0].y.to_f32());
+        assert!(
+            x.abs() < 1.0 && (y - 100.0).abs() < 1.0,
+            "nested `left: 0; top: 100px` must resolve against the page area \
+             ((0, 100)), not the indented wrapper ((120, 100)); got ({x}, {y})",
+        );
+    }
+
+    /// Nesting depth is irrelevant — every ancestor is still `static`.
+    #[test]
+    fn deeply_nested_absolute_resolves_against_the_page_area() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section><section><section style="height:200px">
+                <div style="position:absolute; bottom:0; left:0; width:50px; height:30px"></div>
+              </section></section></section>
+            </body></html>
+        "#;
+        let frags = nested_abs_fragments(html, 50.0, 30.0);
+        assert_eq!(
+            frags.len(),
+            1,
+            "expected exactly one fragment, got {frags:?}"
+        );
+        let y = frags[0].y.to_f32();
+        assert!(
+            (y - 770.0).abs() < 1.0,
+            "three static wrappers must not change the containing block; got {y}",
+        );
+    }
+
+    /// A `position: relative` wrapper *is* a containing block, so Taffy's
+    /// parent-relative placement is the CSS answer and must survive.
+    #[test]
+    fn a_relative_wrapper_stays_the_containing_block() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section style="position:relative; height:200px">
+                <div style="position:absolute; bottom:0; left:0; width:50px; height:30px"></div>
+              </section>
+            </body></html>
+        "#;
+        let frags = nested_abs_fragments(html, 50.0, 30.0);
+        assert_eq!(
+            frags.len(),
+            1,
+            "expected exactly one fragment, got {frags:?}"
+        );
+        let y = frags[0].y.to_f32();
+        assert!(
+            (y - 170.0).abs() < 1.0,
+            "a relative wrapper is the containing block: `bottom: 0` in a 200px \
+             box is y=170, not the page area's 770; got {y}",
+        );
+    }
+
+    /// With both axes `auto` the used position *is* the static position,
+    /// which the in-flow fragmenter already recorded. The absolute pass
+    /// must leave it alone.
+    #[test]
+    fn a_nested_absolute_without_insets_keeps_its_static_position() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section><div style="height:100px"></div>
+                <div style="position:absolute; width:50px; height:30px"></div>
+              </section>
+            </body></html>
+        "#;
+        let frags = nested_abs_fragments(html, 50.0, 30.0);
+        assert_eq!(
+            frags.len(),
+            1,
+            "expected exactly one fragment, got {frags:?}"
+        );
+        let y = frags[0].y.to_f32();
+        assert!(
+            (y - 100.0).abs() < 1.0,
+            "an inset-less absolute keeps its static position (y=100); got {y}",
+        );
+    }
+
+    /// `record_subtree_descendants` has no out-of-flow filter, so it
+    /// already recorded the whole absolute subtree at Taffy's location.
+    /// `clear_subtree_fragments` must drop those before the pass rewrites
+    /// them — otherwise every node in the subtree paints twice.
+    #[test]
+    fn nested_absolute_descendants_are_not_recorded_twice() {
+        let html = r#"
+            <html><body style="margin:0">
+              <section style="height:200px">
+                <div style="position:absolute; bottom:0; left:0; width:50px; height:30px">
+                  <div style="width:40px; height:20px"></div>
+                </div>
+              </section>
+            </body></html>
+        "#;
+        let mut doc = parse(html, 600.0);
+        let mut geom = run_pass(doc.deref_mut(), 800.0);
+        super::append_position_absolute_body_direct_fragments(
+            &mut geom,
+            doc.deref_mut(),
+            1,
+            600.0,
+            800.0,
+            None,
+        );
+        for (id, g) in &geom {
+            assert!(
+                g.fragments.len() <= 1,
+                "node {id} has {} fragments on a single page: {:?}",
+                g.fragments.len(),
+                g.fragments,
+            );
+        }
+        // The 40×20 inner div rides along at its parent's corrected origin.
+        let inner = geom
+            .values()
+            .flat_map(|g| g.fragments.iter())
+            .find(|f| (f.width.to_f32() - 40.0).abs() < 0.5)
+            .expect("inner div must keep a fragment");
+        let y = inner.y.to_f32();
+        assert!(
+            (y - 770.0).abs() < 1.0,
+            "the absolute's descendants must move with it; got {y}",
         );
     }
 
