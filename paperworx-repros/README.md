@@ -16,7 +16,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **fixed** (one part deferred) |
 | 6 | `<tfoot>` before `<tbody>` renders at the top of the table | `scripts/refdiff/fixtures/table-tfoot-source-order.html` | real, single-page | **fixed** |
 | 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
-| 8 | `@font-face` with a `data:` URI is ignored; text silently falls back to a system font | `08-fontface-data-uri.html` | **dangerous** | **open** |
+| 8 | `@font-face` is never loaded from an inline `<style>`; text silently falls back to a system font | `08-fontface-data-uri.html` | **dangerous** | **open** |
 | 9 | A GCPM construct on anything but a bare tag/class/id selector is dropped silently | `09-gcpm-compound-selector.html` | **blocks NBB** | **fixed** |
 | 10 | `vertical-align` is inert on an inline-block | `10-vertical-align-inline-block.html` | real | **open** |
 | 11 | `margin-top` after a *forced* break is truncated to zero | `11-margin-after-forced-break.html` | real | **open** |
@@ -426,38 +426,62 @@ puts `MARK` at 176.34mm / 282.85mm against the references' 176.50 / 282.90 — t
 is font-metric difference, the same order as Chrome's own 0.15mm disagreement with
 WeasyPrint.
 
-## 8 — `@font-face` with a `data:` URI is ignored
+## 8 — `@font-face` is never loaded from an inline `<style>`
 
 Found while measuring fulgur against production on a real NBB filing, and it invalidated
-the first run of that measurement.
+the first run of that measurement: Chrome embedded `LiberationSans`, fulgur embedded only
+`Helvetica`, so every position compared was against a different font.
 
-A theme delivers its fonts as `@font-face` rules with base64 `data:` URIs — that is how the
-rendered HTML is self-contained. fulgur ignores them and falls back to a system font,
-reporting success. Chrome and WeasyPrint both honour the rule.
-
-```bash
-fulgur render -o out.pdf 08-fontface-data-uri.html
-mutool clean -d out.pdf - | grep -o "/BaseFont */[A-Za-z0-9+-]*" | sort -u
-```
-
-| engine | embedded font |
+| engine | embedded font (minimal fixture) |
 |---|---|
 | WeasyPrint 69 | `ZRPRAM+Probe-Sans` |
 | fulgur | `XUZQRR+Helvetica` |
 
-Same on the real filing: Chrome embedded `LiberationSans`, fulgur embedded only
-`Helvetica`. Passing `--font` / `AssetBundle` is the workaround, and the integration plan
-already required it — but nothing says so at the point of failure, and the document still
-renders, so the substitution is invisible until you inspect the embedded fonts.
+### Root cause — not the `data:` scheme
 
-**This is the measurement trap of this whole exercise.** Every position taken against a
-substituted font is measuring the wrong document. A first pass here reported a
-`fi`-ligature corruption in the text layer (`financiële` extracting as `fnanciële`, x35)
-as a separate defect; it was entirely a symptom of this one. With the font registered,
-fulgur extracts `financiële` x35 — identical to Chrome. There is no ligature defect.
+The obvious suspect is `FulgurNetProvider`, whose own doc comment says it accepts only
+`file://` and silently drops `data:`. That is *not* the blocker. Instrumenting `fetch()`
+shows it is **never called for the font at all**: no request is ever made.
 
-Relation to item 3: that fix is what keeps this from being a blank page. The fallback is
-working as designed; the gap is that a declared, *available* font is never loaded.
+Blitz does implement `@font-face` — `blitz-dom`'s `fetch_font_face` walks a stylesheet's
+rules and fetches each source. But it is only invoked from `CssHandler::bytes` and
+`StylesheetLoaderInner::bytes`, i.e. for stylesheets that arrive **through the net
+provider**: `<link rel=stylesheet>` and `@import`. An inline `<style>` element is parsed
+directly and never reaches either, so its `@font-face` rules are never fetched — whatever
+scheme they name.
+
+**This is the third instance of one pattern**: an inline `<style>` bypassing the path that
+handles a construct. Repro 1 was the same shape (`position: running()` rewritten only in
+`cleaned_css`, which inline `<style>` text never becomes), and the static pseudo-content
+injection exists for the same reason. A themed document ships its CSS in a `<style>`
+block, so this is the path real documents take, every time.
+
+### What a fix needs
+
+Either Blitz calls `fetch_font_face` for inline stylesheets too — an upstream change — or
+fulgur extracts `@font-face` from inline CSS itself and registers the faces, the way
+`InjectCssPass` compensates for the same gap elsewhere. Registering under the *declared*
+family (rather than the font file's internal name) needs
+`fontique::FontInfoOverride { family_name, weight, style, .. }`, which
+`Collection::register_fonts` already accepts. `data-url 0.3.2` is already in the
+dependency graph for decoding.
+
+Allowing `data:` in the provider is a genuine prerequisite — it cannot violate
+offline-first, since the bytes are already in the document — but on its own it changes
+nothing, and a speculative patch doing only that was reverted rather than committed.
+
+`crates/fulgur/tests/fontface_data_uri.rs` encodes the requirement, `#[ignore]`d with the
+reason. It renders with system fonts off and nothing registered, so the `@font-face` is
+the only possible source of a glyph — which keeps it independent of how the face ends up
+named in the PDF.
+
+### Relation to repro 3
+
+That fix is what keeps this from being a blank page: the fallback works as designed. The
+gap is that a declared and *available* font is never loaded. A first pass here also
+reported a `fi`-ligature corruption (`financiële` extracting as `fnanciële`, x35) as a
+separate defect; building the minimal case disproved it — with the font registered fulgur
+extracts `financiële` x35, identical to Chrome. There is no ligature defect.
 
 ## How they were measured
 
