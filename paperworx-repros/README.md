@@ -267,6 +267,18 @@ moved order. Measured on `table > tbody:nth-child(3) td {padding-left: 40pt}` wi
 `<tfoot>` written first — the rule applies in WeasyPrint (first cell at `xMin` 102.7)
 and, in the first cut of this fix, no longer did in fulgur (65.7).
 
+Chrome 151 says the same thing directly rather than by inference: the `<table>`'s DOM
+children stay `[thead, tfoot, tbody]`, `tbody.matches(':nth-child(3)')` is true and
+`:nth-child(2)` false, the computed `padding-left` is 53.33px = 40pt — and the footer
+is still drawn below the last row (top 156.7 against 135.4). Boxes move, the DOM does
+not. All three engines agree on the shift the rule produces: +37pt, replacing a 3pt
+padding with a 40pt one.
+
+Note that Chrome's `getBoundingClientRect()` on the `<td>` reports `left: 8` either
+way — padding is inside the cell, so only its text moves. Measuring the element box
+makes the rule look inert; the text extent (`pdftotext -bbox`, or a `Range` over the
+cell contents) is what to probe.
+
 Fixed by separating the two things the mutator conflates. The pass resolves the cascade
 first, then reorders by rewriting `Node::children` directly — no restyle marking — so
 box construction walks the new order while the styles keep the ones matched against the

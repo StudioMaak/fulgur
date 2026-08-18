@@ -310,6 +310,10 @@ fn only_the_first_header_and_footer_group_are_promoted() {
 /// separated cascade from box order it did not (65.69) — the reorder had
 /// shifted the `<tbody>` to child 2.
 ///
+/// Chrome 151 confirms the model directly: the table's DOM children stay
+/// `[thead, tfoot, tbody]`, `tbody.matches(':nth-child(3)')` is true and
+/// `:nth-child(2)` false, and the footer is still drawn below the last row.
+///
 /// Asserted from both sides, since only the pair rules out the trivial
 /// explanations: `:nth-child(3)` must apply, and `:nth-child(2)` — the
 /// position the `<tbody>` would occupy if selectors saw the moved order —
