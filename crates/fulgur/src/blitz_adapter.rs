@@ -1345,6 +1345,59 @@ pub fn extract_strut_style(node: &blitz_dom::Node) -> Option<StrutStyle> {
     })
 }
 
+/// The used `margin-top` / `margin-left` of an atomic inline box, in CSS px.
+///
+/// This is the conversion between the two boxes fulgur has to hold in its
+/// head at once for an inline-block. Parley's inline box is the **margin**
+/// box — `blitz-dom-0.2.4 layout/inline.rs:56` builds it as
+/// `margin.left + margin.right + width` by `margin.top + margin.bottom +
+/// height` — so `InlineBoxItem::height`, and the line-box arithmetic that
+/// consumes it, are margin-box quantities. But every position fulgur records
+/// *for the node itself* is its **border** box: `layout/inline.rs:239` sets
+/// `location = ibox.{x,y} + margin.{left,top} + ...`, and that is the slot
+/// `render::dispatch_inline_box_content` writes `computed_y` / `x_offset`
+/// into. Mixing the two silently shifts a margined inline-block up and left
+/// by its own margins.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineBoxMargins {
+    pub top: crate::units::Px,
+    pub left: crate::units::Px,
+}
+
+/// Extract the [`InlineBoxMargins`] of an atomic inline box.
+///
+/// `auto` is zero on both axes for an inline-level box (CSS 2.1 §10.3.2,
+/// §10.6.4), and a percentage resolves against `cb_width` on both axes
+/// (§8.3). `cb_width` should be the inline formatting context root's own
+/// width, which is what blitz-dom resolves against.
+pub fn extract_inline_box_margins(
+    node: &blitz_dom::Node,
+    cb_width: crate::units::Px,
+) -> InlineBoxMargins {
+    use crate::units::F32Units;
+    use style::values::computed::Length;
+    use style::values::generics::length::GenericMargin as Margin;
+
+    let Some(styles) = node.primary_styles() else {
+        return InlineBoxMargins::default();
+    };
+    let basis = Length::new(cb_width.to_f32());
+    let resolve = |m: &Margin<style::values::computed::LengthPercentage>| match m {
+        Margin::LengthPercentage(lp) | Margin::AnchorContainingCalcFunction(lp) => {
+            lp.resolve(basis).px().as_px()
+        }
+        // `auto` is zero for an inline-level box; `anchor-size()` needs an
+        // anchor element fulgur does not resolve, and CSS Anchor Positioning 1
+        // makes an unresolvable one behave as its fallback, which is zero here.
+        Margin::Auto | Margin::AnchorSizeFunction(_) => crate::units::Px::ZERO,
+    };
+    let margin = styles.get_margin();
+    InlineBoxMargins {
+        top: resolve(&margin.margin_top),
+        left: resolve(&margin.margin_left),
+    }
+}
+
 /// Resolved multicol container properties.
 ///
 /// Only populated when at least one of `column-count` or `column-width` is

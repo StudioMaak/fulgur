@@ -626,6 +626,12 @@ pub(super) fn extract_paragraph(
     // drops it with the DOM, so we can't borrow.
     let text: Arc<str> = Arc::from(text_layout.text.as_str());
 
+    // Basis for a percentage `margin` on an atomic inline box. Blitz resolves
+    // those against the inline formatting context root's own box
+    // (`layout/inline.rs:51`, `inputs.parent_size`), so match it rather than
+    // the content box, or the two disagree whenever the root is padded.
+    let cb_width_px = node.final_layout.size.width.as_px();
+
     let mut shaped_lines = Vec::new();
     let mut accumulated_line_top = crate::units::Pt::ZERO;
     // Same accumulator in the *post-alignment* geometry. The two diverge only
@@ -755,20 +761,35 @@ pub(super) fn extract_paragraph(
                         .insert(node_id, descendants);
 
                     let link = ctx.link_cache.lookup(doc, node_id);
+                    // Parley's inline box is the box's *margin* box
+                    // (`blitz-dom-0.2.4 layout/inline.rs:57`), so `height`
+                    // and everything derived from it below are margin-box
+                    // quantities.
                     let height = positioned.height.as_px().in_pt();
+                    let box_node = doc.get_node(node_id);
+                    let margins = box_node
+                        .map(|n| crate::blitz_adapter::extract_inline_box_margins(n, cb_width_px))
+                        .unwrap_or_default();
+                    let margin_top = margins.top.in_pt();
                     // Read baseline from `out` (Drawables). The Drawables-aware
                     // lookup queries `out.paragraphs[node_id]` (and
-                    // `block_styles[node_id]` for top-inset) directly.
+                    // `block_styles[node_id]` for top-inset) directly, so it
+                    // comes back relative to the *border* box — add
+                    // `margin_top` to land in the same box as `height`, and
+                    // clamp in case the two disagree about a percentage.
                     // `None` (no in-flow line box, or `overflow` != visible)
                     // collapses to the box's bottom margin edge, which is the
                     // CSS 2.1 §10.8.1 fallback.
                     let baseline_offset =
                         inline_box_baseline_offset_from_drawables(doc, out, node_id)
+                            .map(|bo| (margin_top + bo).min(height))
                             .unwrap_or(height);
-                    let baseline_shift = height - baseline_offset;
+                    // Provisional: `align_inline_boxes` always overwrites this
+                    // for a line that has an inline box. It is the border-box
+                    // top of Parley's own placement, so a future early-out
+                    // would still leave a coherent value here.
                     let computed_y =
-                        positioned.y.as_px().in_pt() - accumulated_line_top + baseline_shift;
-                    let box_node = doc.get_node(node_id);
+                        positioned.y.as_px().in_pt() - accumulated_line_top + margin_top;
                     let visible = box_node
                         .map(super::style::extract_opacity_visible)
                         .map(|(_, v)| v)
@@ -782,13 +803,18 @@ pub(super) fn extract_paragraph(
                         node_id: content,
                         width: positioned.width.as_px().in_pt(),
                         height,
-                        x_offset: positioned.x.as_px().in_pt(),
+                        // Border-box left, to match `computed_y`. There is
+                        // no line-box arithmetic on the inline axis — Parley
+                        // already packed the margin boxes — so the margin
+                        // folds in here rather than needing to be carried.
+                        x_offset: positioned.x.as_px().in_pt() + margins.left.in_pt(),
                         computed_y,
                         link,
                         opacity: 1.0,
                         visible,
                         vertical_align,
                         baseline_offset,
+                        margin_top,
                     }));
                 }
             }
@@ -906,6 +932,7 @@ mod tests {
             visible: true,
             vertical_align: crate::paragraph::VerticalAlign::Baseline,
             baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         })
     }
 

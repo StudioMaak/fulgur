@@ -248,14 +248,22 @@ pub struct InlineBoxItem {
     /// box's *bottom* edge on the line's baseline. `align_inline_boxes`
     /// re-places the box from this value.
     pub vertical_align: VerticalAlign,
-    /// Distance from the box's own top edge down to the baseline it
-    /// contributes to the line (CSS 2.1 §10.8.1: the baseline of its last
-    /// in-flow line box).
+    /// Distance from the box's **margin** box top edge down to the baseline
+    /// it contributes to the line (CSS 2.1 §10.8.1: the baseline of its last
+    /// in-flow line box, measured from the edge `height` is measured from).
     ///
     /// Equal to `height` when the box has no usable baseline — no in-flow
     /// line box, or `overflow` other than `visible` — which is exactly the
     /// spec's "use the bottom margin edge" rule.
     pub baseline_offset: crate::units::Pt,
+    /// The box's own `margin-top`.
+    ///
+    /// `height` and `baseline_offset` are margin-box quantities because
+    /// that is what Parley hands over and what CSS aligns, but `computed_y`
+    /// has to come back out as a **border** box top for the renderer. This
+    /// is the offset between the two; see
+    /// `blitz_adapter::extract_inline_box_margin_top`.
+    pub margin_top: crate::units::Pt,
 }
 
 /// A single item in a shaped line: text glyph run, inline image, or an
@@ -1052,6 +1060,11 @@ pub struct TextLineExtent {
 ///   line-relative on exit (`convert::inline_root` rebases to
 ///   paragraph-absolute afterwards).
 /// * `InlineBoxItem::computed_y` is line-relative on entry and exit.
+/// * All box arithmetic here is in **margin** boxes — that is what
+///   `InlineBoxItem::height` and `baseline_offset` are, and what CSS 2.1
+///   §10.8 aligns for an atomic inline. `computed_y` is written back out as a
+///   *border* box top via `InlineBoxItem::margin_top`, because that is the
+///   edge `render::dispatch_inline_box_content` positions.
 /// * Any `LineItem::Image` present is assumed line-relative and is shifted
 ///   with the line; in practice this runs before pseudo-image injection, so
 ///   there are none.
@@ -1075,7 +1088,9 @@ pub fn align_inline_boxes(
         // CSS 2.1 §10.8.1: `baseline`, `sub`, `super` and a length/percentage
         // offset all align the box's *own* baseline, so they start from
         // `baseline_offset`; `middle`, `text-top` and `text-bottom` align an
-        // edge of the box and start from its top or bottom.
+        // edge of the box and start from its top or bottom. Every one of them
+        // is the *margin* box's edge — a margined inline-block hangs from its
+        // margin edge, not from its border.
         let top = match ib.vertical_align {
             VerticalAlign::Top | VerticalAlign::Bottom => continue,
             VerticalAlign::Baseline => baseline - ib.baseline_offset,
@@ -1117,7 +1132,10 @@ pub fn align_inline_boxes(
     line.baseline = baseline + shift;
     for (idx, top) in positions {
         if let LineItem::InlineBox(ib) = &mut line.items[idx] {
-            ib.computed_y = top + shift;
+            // `top` is the margin box's top edge, which is the box the line
+            // arithmetic above works in. `computed_y` is consumed as a
+            // *border* box top, so hand back the inner edge.
+            ib.computed_y = top + shift + ib.margin_top;
         }
     }
     if shift != crate::units::Pt::ZERO {
@@ -1263,6 +1281,7 @@ mod tests {
             visible: true,
             vertical_align: va,
             baseline_offset: baseline_offset.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         })
     }
 
@@ -1879,6 +1898,7 @@ mod tests {
             visible: true,
             vertical_align: crate::paragraph::VerticalAlign::Baseline,
             baseline_offset: 20.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         });
         match item {
             LineItem::InlineBox(ib) => {
@@ -1925,6 +1945,7 @@ mod tests {
             visible: true,
             vertical_align: crate::paragraph::VerticalAlign::Baseline,
             baseline_offset: 5.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         });
         let s = format!("{:?}", ib);
         assert!(s.contains("InlineBox"), "{}", s);
@@ -2117,6 +2138,7 @@ mod tests {
                     visible: true,
                     vertical_align: crate::paragraph::VerticalAlign::Baseline,
                     baseline_offset: 20.0_f32.as_pt(),
+                    margin_top: crate::units::Pt::ZERO,
                 }),
             ],
         };
