@@ -728,16 +728,22 @@ impl<'a> PaginationLayoutTree<'a> {
                 break_props.break_before,
                 Some(crate::draw_primitives::BreakBefore::Page)
             );
-            let page_filling_break_child = gap > 0.0
-                && child_h >= self.page_height_px * 0.9
-                && gap + child_h <= self.page_height_px + 0.5;
+            //
+            // css-break-3 §5.4: the margins adjoining the break are handled
+            // asymmetrically — the previous sibling's `margin-bottom` is
+            // truncated, this child's own (collapsed-through) `margin-top`
+            // is preserved. `gap` conflates the two, so the retained value
+            // is read from Taffy instead; see
+            // `retained_margin_after_forced_break`.
+            //
+            // A page-name change is a forced break too (CSS Page 3 §5.3, and
+            // it is already "treated identically to an authored
+            // `break-before: page`" above), so it retains the margin on the
+            // same terms — WeasyPrint 69 agrees, moving the new page's first
+            // baseline by the full `margin-top`.
             if (explicit_break_before || page_name_changed) && emitted > 0 && cursor_y > 0.0 {
                 page_index += 1;
-                cursor_y = if explicit_break_before && page_filling_break_child {
-                    gap
-                } else {
-                    0.0
-                };
+                cursor_y = retained_margin_after_forced_break(&layout);
             }
 
             let avoid_inside = matches!(
@@ -1408,6 +1414,44 @@ fn would_split_block_subtree(
         prev_bottom = this_top + h;
     }
     false
+}
+
+/// The block-start margin css-break-3 §5.4 **preserves** across a forced
+/// break, in CSS px.
+///
+/// > When an unforced break occurs before or after a block-level box, any
+/// > margins adjoining the break are truncated to zero. When a forced break
+/// > occurs there, adjoining margins *before* the break are truncated, but
+/// > margins *after* the break are preserved.
+///
+/// Taffy's `Layout::margin.top` is exactly the "after" half. `compute::block`
+/// stores `top_margin_set.resolve()` there — the box's own `margin-top`
+/// collapsed with whatever collapsed up out of its first in-flow children —
+/// and *not* the previous sibling's `margin-bottom`, which the parent applies
+/// separately from its own `active_collapsible_margin_set` when placing the
+/// box. That distinction is the whole point: the inter-child gap the
+/// fragmenter tracks conflates the two, so retaining the gap would also
+/// retain a preceding `margin-bottom`, which §5.4 truncates. WeasyPrint 69
+/// confirms both halves — see `paperworx-repros/README.md` item 11 and
+/// `crates/fulgur/tests/forced_break_margin.rs`, whose control pins the
+/// `margin-bottom` case.
+///
+/// Only *forced* breaks reach this. A box relocated to the next page by
+/// overflow or by `break-inside: avoid` takes an unforced break (§4.3: a
+/// forced break is one indicated by a forced value of `break-before` /
+/// `break-after`), and those paths keep resetting the cursor to zero.
+///
+/// A negative collapsed margin is clamped away: honouring it would place the
+/// fragment above the fragmentainer's content top, which nothing downstream
+/// models. Non-finite values are treated as zero, matching the `child_h`
+/// guard in `fragment_pagination_root` (fulgur-2m6w).
+fn retained_margin_after_forced_break(layout: &taffy::Layout) -> f32 {
+    let margin_top = layout.margin.top;
+    if margin_top.is_finite() {
+        margin_top.max(0.0)
+    } else {
+        0.0
+    }
 }
 
 /// fulgur-a36m (Phase 3.1.5b): true if any descendant of `node_id`
@@ -2412,15 +2456,19 @@ fn fragment_block_subtree(
                 });
             page_index += 1;
             header_reserve = 0.0;
-            cursor_y = 0.0;
             page_start_y = 0.0;
             // The breaking child is the first in-flow child on the
-            // new page strip. Rebase the Taffy origin to its
-            // `this_top_in_parent` so it lands at `page_start_y` (= 0)
-            // — discarding the inter-child gap, matching CSS 3
-            // Fragmentation §3 (margins at forced breaks truncate).
-            page_taffy_origin = this_top_in_parent;
-            child_page_y = 0.0;
+            // new page strip. Rebase the Taffy origin so it lands at
+            // `page_start_y` (= 0) **plus its own block-start margin**:
+            // css-break-3 §5.4 truncates the margins adjoining the break on
+            // the before side (the previous sibling's `margin-bottom`, which
+            // is the rest of the inter-child gap) but preserves the ones
+            // after it. See `retained_margin_after_forced_break` — the
+            // comment this replaces read §5.4 as truncating both sides.
+            let retained = retained_margin_after_forced_break(&layout);
+            page_taffy_origin = this_top_in_parent - retained;
+            cursor_y = retained;
+            child_page_y = retained;
         }
 
         // (Strip-overflow page cut moved below the recursion gate as
@@ -6818,21 +6866,31 @@ h2 { string-set: chapter-title content(text); }
         );
     }
 
-    /// Devin Review on PR #285 (fulgur-a36m Phase 3.1.5b):
-    /// `fragment_block_subtree` had `break-before: page` firing BEFORE
-    /// the inter-child gap was folded into `cursor_y`, so the gap was
-    /// re-applied AFTER the break-before reset — placing the child at
-    /// `y=gap` on the new page instead of `y=0`. The body-level
-    /// `fragment_pagination_root` had the correct ordering. This test
-    /// pins B's y-coordinate on the new page and would catch the
-    /// pre-fix value (gap≈20, was 26.6 in CSS px after Stylo's pt→px).
+    /// The nested counterpart of
+    /// `body_level_break_before_preserves_own_top_margin_on_new_page`: a
+    /// forced break taken inside `fragment_block_subtree` keeps the breaking
+    /// child's own block-start margin on the new page (css-break-3 §5.4,
+    /// paperworx repro 11), and applies it exactly once.
     ///
-    /// Setup: outer wrapper triggers recursion via
-    /// `has_forced_break_below`. Inside, A (h=100) at y=0 and B
-    /// (h=100) at y=120 with `break-before: page`. The `margin-top:
-    /// 20px` on B creates a 20px gap that the bug would leak through.
+    /// Setup: outer wrapper triggers recursion via `has_forced_break_below`.
+    /// Inside, A (h=100) at y=0 and B (h=100) at y=120 with `break-before:
+    /// page`. B's `margin-top: 20px` is the whole of the 20px inter-child
+    /// gap, so the expected y on the new page is **20**. Two neighbouring
+    /// wrong answers are what this pins:
+    ///
+    /// - **y=0** — the pre-repro-11 behaviour, which truncated the margin
+    ///   after the break as well as before it.
+    /// - **y=40** — Devin Review on PR #285 (fulgur-a36m Phase 3.1.5b):
+    ///   `break-before: page` fired BEFORE the inter-child gap was folded
+    ///   into `cursor_y`, so the gap was re-applied after the reset. With the
+    ///   margin now retained deliberately, double application shows up as
+    ///   twice the margin rather than as a leak from zero.
+    ///
+    /// Verified against WeasyPrint 69 on the equivalent A4 document, which
+    /// puts B's first baseline 5.29mm (= 20px = 15pt) below where it lands
+    /// with `margin-top: 0` — 28.81mm against 23.52mm from the page top.
     #[test]
-    fn fragment_block_subtree_break_before_after_gap_places_child_at_y_zero() {
+    fn fragment_block_subtree_break_before_keeps_the_childs_own_top_margin() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
               <div id="outer" style="margin: 0; padding: 0">
@@ -6847,9 +6905,8 @@ h2 { string-set: chapter-title content(text); }
 
         // Find every fragment with height ≈ 100 on page 1; B is the
         // only such fragment (outer's page-1 fragment height is the
-        // total parent strip, which equals 100 after the fix because
-        // only B sits on page 1; outer's page-0 fragment carries
-        // A + gap = 120; A is on page 0).
+        // total parent strip, which equals 120 = margin + B; outer's
+        // page-0 fragment carries A alone; A is on page 0).
         let b_on_page1: Vec<&Fragment> = geom
             .values()
             .flat_map(|g| g.fragments.iter())
@@ -6862,30 +6919,42 @@ h2 { string-set: chapter-title content(text); }
         for f in &b_on_page1 {
             let fy = f.y.to_f32();
             assert!(
-                fy.abs() < 0.5,
-                "B should land at y=0 on the new page (forced break discards \
-                 the inter-child gap), but got y={fy} (gap leaked through \
-                 break-before — see Devin Review on PR #285). frag={f:?}",
+                (fy - 20.0).abs() < 0.5,
+                "B keeps its own 20px top margin across the forced break \
+                 (css-break-3 §5.4 preserves margins after the break), but \
+                 got y={fy} — 0 means the margin was truncated, 40 means the \
+                 gap was applied twice (Devin Review on PR #285). frag={f:?}",
             );
         }
     }
 
+    /// A body-level forced break keeps the breaking child's own block-start
+    /// margin on the new page.
+    ///
+    /// The fixture is the one `25cac58a` shipped with, restored: `20f77475`
+    /// narrowed both it and the code to a `page_filling_break_child`
+    /// heuristic (child ≥ 90% of the page height, gap + child ≤ one page),
+    /// because retaining the whole inter-child *gap* over-preserved a
+    /// preceding sibling's `margin-bottom`. Repro 11 replaced the gap with
+    /// the child's own collapsed top margin, which never carried the
+    /// preceding margin in the first place, so the heuristic — and the
+    /// fixture shrunk to fit it — are gone.
     #[test]
     fn body_level_break_before_preserves_own_top_margin_on_new_page() {
         let html = r#"
             <html><body style="margin: 0; padding: 0">
-              <div style="height: 40px; margin: 0"></div>
-              <div style="height: 90px; margin-top: 10px; break-before: page"></div>
+              <div style="height: 100px; margin: 0"></div>
+              <div style="height: 100px; margin-top: 20px; break-before: page"></div>
             </body></html>
         "#;
         let mut doc = parse(html, 600.0);
         let table = blitz_adapter::extract_column_style_table(&doc);
-        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &table);
+        let geom = super::run_pass_with_break_styles(doc.deref_mut(), 800.0_f32.as_px(), &table);
 
         let second_on_page1: Vec<&Fragment> = geom
             .values()
             .flat_map(|g| g.fragments.iter())
-            .filter(|f| f.page_index == 1 && (f.height.to_f32() - 90.0).abs() < 0.5)
+            .filter(|f| f.page_index == 1 && (f.height.to_f32() - 100.0).abs() < 0.5)
             .collect();
         assert_eq!(
             second_on_page1.len(),
@@ -6893,7 +6962,7 @@ h2 { string-set: chapter-title content(text); }
             "expected only the second child on page 1, geom={geom:?}"
         );
         assert!(
-            (second_on_page1[0].y.to_f32() - 10.0).abs() < 0.5,
+            (second_on_page1[0].y.to_f32() - 20.0).abs() < 0.5,
             "body-level break-before should keep the element's own top margin on the new page; geom={geom:?}"
         );
     }
