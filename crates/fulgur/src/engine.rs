@@ -301,6 +301,15 @@ impl Engine {
         // See blitz_adapter::CaptionRestructurePass.
         passes.push(Box::new(crate::blitz_adapter::CaptionRestructurePass));
 
+        // Put a `<table>`'s sections in CSS box order (header group first,
+        // footer group last) before layout: Blitz builds the cell grid by
+        // walking the table's DOM children, so a `<tfoot>` written before
+        // `<tbody>` — as HTML4 required — otherwise renders at the *top* of
+        // the table. Runs after the caption pass, so the caption has already
+        // been lifted out of the table and cannot sit among the sections
+        // being ordered. See blitz_adapter::TableSectionOrderPass.
+        passes.push(Box::new(crate::blitz_adapter::TableSectionOrderPass));
+
         let ctx = crate::blitz_adapter::PassContext { font_data: fonts };
         crate::blitz_adapter::apply_passes(&mut doc, &passes, &ctx);
 

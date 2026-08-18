@@ -22,15 +22,15 @@ always differ. Statuses are ranked by how much they mean:
 | `SHIFT` | same content and pages, max Δy > 12pt | usually font metrics |
 | `AGREE` | same content, same pages, positions within tolerance | no |
 
-Summary: **1 MISSING**, **5 PACKING**, **2 SHIFT**, **6 AGREE**.
+Summary: **6 PACKING**, **2 SHIFT**, **6 AGREE**.
 
 | fixture | what it isolates | status | fulgur | weasy | detail |
 |---|---|---|---|---|---|
-| `table-tfoot-source-order` | tfoot written before tbody must still render last | `MISSING` | 3 | 3 | fulgur omits `Foot` (1 of 3), `Total` (1 of 3) |
 | `list-markers` | ordered list markers across a page break | `PACKING` | 2 | 2 | 6 runs cross a page boundary differently (reading order identical) |
 | `orphans-widows` | orphans and widows defaults at a page boundary | `PACKING` | 2 | 2 | 66 runs cross a page boundary differently (reading order identical) |
 | `table-caption` | caption placement across a page break | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
 | `table-tfoot-repeat` | tfoot repeats on continuation pages | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
+| `table-tfoot-source-order` | tfoot written before tbody must still render last | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
 | `table-thead-repeat` | thead repeats on continuation pages | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
 | `multicol-basic` | two-column flow | `SHIFT` | 1 | 1 | max Δy 109.2pt (`Mc66`) |
 | `table-cell-break-before` | break-before:page on a table cell | `SHIFT` | 1 | 1 | max Δy 42.8pt (`R0039`) |

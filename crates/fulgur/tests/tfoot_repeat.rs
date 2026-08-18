@@ -9,11 +9,12 @@
 //! header offsets where each page's strip *starts*, a repeated footer
 //! shrinks where it *ends*.
 //!
-//! Scope: these fixtures put `<tfoot>` after `<tbody>`. fulgur lays table
-//! sections out in source order, so a `<tfoot>` written *before* `<tbody>`
-//! renders at the top of the table — a separate, single-page layout defect
-//! tracked in `paperworx-repros/README.md`, not addressed here. The band
-//! helper bails on that shape rather than repeating a misplaced footer.
+//! Scope: these fixtures put `<tfoot>` after `<tbody>`. A `<tfoot>` written
+//! *before* `<tbody>` is put into CSS box order before layout by
+//! `blitz_adapter::TableSectionOrderPass`, so it reaches the fragmenter as
+//! the shape below and repeats the same way. `tests/table_section_order.rs`
+//! asserts that end to end, along with the property that the two source
+//! orderings render identically.
 //!
 //! Runs are matched by font size rather than content, since `inspect`
 //! returns raw glyph ids (lopdf does not read krilla's `ToUnicode` CMap),

@@ -1597,6 +1597,438 @@ fn caption_display_is_table_caption(doc: &HtmlDocument, caption_id: usize) -> bo
         .is_some_and(|s| s.clone_display() == Display::TableCaption)
 }
 
+/// Which of a `<table>`'s two promotable section groups a child is, by its
+/// *computed* display.
+///
+/// Keyed on the computed value rather than on the tag name because that is
+/// what decides placement: `<tfoot style="display:table-row-group">` is an
+/// ordinary row group and both reference engines leave it in source order
+/// (WeasyPrint 69 and Chrome 151 agree), while a tag-name test would wrongly
+/// demote it to the bottom. It is also the same predicate blitz-dom's own
+/// `collect_table_cells` dispatches on, so this pass and the code consuming
+/// its output classify a child identically.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableSectionGroup {
+    Header,
+    Footer,
+}
+
+/// Classify `node_id` as a table header / footer group, or `None` for
+/// anything else (row groups, `<caption>`, `<colgroup>`, `display: none`).
+fn table_section_group(doc: &HtmlDocument, node_id: usize) -> Option<TableSectionGroup> {
+    use ::style::values::specified::box_::DisplayInside;
+    let display = doc
+        .get_node(node_id)
+        .and_then(|n| n.primary_styles())
+        .map(|s| s.clone_display())?;
+    match display.inside() {
+        DisplayInside::TableHeaderGroup => Some(TableSectionGroup::Header),
+        DisplayInside::TableFooterGroup => Some(TableSectionGroup::Footer),
+        _ => None,
+    }
+}
+
+/// The element children of `node_id`, in document order.
+///
+/// Whitespace between `<thead>` and `<tbody>` survives html5ever's "in
+/// table" insertion mode as a text node, so "is this section first / last"
+/// has to be asked of the element children rather than of `children`.
+fn element_children(doc: &HtmlDocument, node_id: usize) -> Vec<usize> {
+    let Some(node) = doc.get_node(node_id) else {
+        return Vec::new();
+    };
+    node.children
+        .iter()
+        .copied()
+        .filter(|&child_id| {
+            doc.get_node(child_id)
+                .is_some_and(|c| c.element_data().is_some())
+        })
+        .collect()
+}
+
+/// Collect every `<table>` whose `<thead>` / `<tfoot>` children are not
+/// already written in visual order.
+///
+/// Deliberately a *tag-name* prefilter, run before any `resolve()`: it costs
+/// one DOM walk and lets the overwhelming majority of documents — every
+/// table already written header-first / footer-last — skip the pass's
+/// re-resolve entirely. Candidates are re-classified by computed display
+/// afterwards, so a candidate can still turn out to need no move.
+fn collect_misordered_section_tables(doc: &HtmlDocument) -> Vec<usize> {
+    let mut out = Vec::new();
+    collect_misordered_section_tables_recursive(doc, doc.root_element().id, 0, &mut out);
+    out
+}
+
+fn collect_misordered_section_tables_recursive(
+    doc: &HtmlDocument,
+    node_id: usize,
+    depth: usize,
+    out: &mut Vec<usize>,
+) {
+    if depth >= MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return;
+    };
+    let is_table = node
+        .element_data()
+        .is_some_and(|el| el.name.local.as_ref() == "table");
+    if is_table {
+        let children = element_children(doc, node_id);
+        let tagged = |id: usize, tag: &str| {
+            doc.get_node(id)
+                .and_then(|c| c.element_data())
+                .is_some_and(|el| el.name.local.as_ref() == tag)
+        };
+        let head_misplaced = children
+            .iter()
+            .position(|&id| tagged(id, "thead"))
+            .is_some_and(|i| i != 0);
+        let foot_misplaced = children
+            .iter()
+            .position(|&id| tagged(id, "tfoot"))
+            .is_some_and(|i| i + 1 != children.len());
+        if head_misplaced || foot_misplaced {
+            out.push(node_id);
+        }
+    }
+    let children = node.children.clone();
+    for child_id in children {
+        collect_misordered_section_tables_recursive(doc, child_id, depth + 1, out);
+    }
+}
+
+/// Move `node_id` so it becomes the last child of `parent_id`.
+///
+/// Removes before re-inserting because `Mutator::append_children` cannot
+/// move a node within its *own* parent: it appends the id and then runs
+/// `old_parent.children.retain(|id| *id != child_id)` on what is the same
+/// node, which strips the freshly appended copy along with the original and
+/// drops the child out of the tree. `remove_node` leaves the node in the
+/// slab (only `remove_and_drop_node` frees it), so this is the supported
+/// re-parenting path and keeps Blitz's restyle / damage marking intact.
+fn move_to_last_child(doc: &mut HtmlDocument, parent_id: usize, node_id: usize) {
+    let mut mutator = doc.mutate();
+    mutator.remove_node(node_id);
+    mutator.append_children(parent_id, &[node_id]);
+}
+
+/// Move `node_id` so it becomes the first child of `parent_id`. See
+/// [`move_to_last_child`] for why the node is removed first.
+fn move_to_first_child(doc: &mut HtmlDocument, parent_id: usize, node_id: usize) {
+    let anchor = doc
+        .get_node(parent_id)
+        .and_then(|n| n.children.iter().copied().find(|&id| id != node_id));
+    let mut mutator = doc.mutate();
+    mutator.remove_node(node_id);
+    match anchor {
+        Some(anchor_id) => mutator.insert_nodes_before(anchor_id, &[node_id]),
+        None => mutator.append_children(parent_id, &[node_id]),
+    }
+}
+
+/// Orders a `<table>`'s sections the way CSS puts them in the table box,
+/// whatever order they were written in.
+///
+/// CSS 2.1 §17.5.1 lays a table's boxes out header group → row groups →
+/// footer group regardless of source order, and HTML4 *required* `<tfoot>`
+/// to be written before `<tbody>`, so real documents carry the shape.
+/// blitz-dom builds the cell grid by walking the table's DOM children in
+/// order — `layout/table.rs::collect_table_cells` gives `TableHeaderGroup`
+/// and `TableFooterGroup` the same arm as `TableRowGroup`, assigning grid
+/// rows as it goes — so without this pass a `<tfoot>` written first renders
+/// at the *top* of the table.
+///
+/// Only the **first** header group and the **first** footer group are
+/// promoted; every other child, additional header / footer groups included,
+/// keeps its source position between them. That is CSS 2.1's model and both
+/// reference engines reproduce it exactly: on
+/// `<tfoot A><thead A><tbody><tfoot B><thead B>` WeasyPrint 69 and Chrome
+/// 151 both draw `HEAD A → rows → FOOT B → HEAD B → FOOT A`.
+///
+/// Runs before the engine's own `resolve()` and re-resolves internally,
+/// because the classification is a computed display; that cost is paid only
+/// by a document that actually contains a misordered section, and the
+/// tag-name prefilter in [`collect_misordered_section_tables`] is what keeps
+/// well-formed tables from paying it. Same shape as
+/// [`CaptionRestructurePass`].
+///
+/// Unlike that pass this one needs no `visibility: hidden` guard: a section
+/// stays inside the table it was written in, so no cascade that hid it can
+/// be escaped by the move. A `display: none` child is never classified as a
+/// section group in the first place (its `DisplayInside` is `None`), and a
+/// `display: none` *table* is skipped outright — it draws nothing, so the
+/// move would be pure restyle cost.
+///
+/// **Known limitation:** the pass moves DOM nodes, so a structural selector
+/// that depends on section position (`tbody:nth-child(3)`, `tfoot + tbody`)
+/// re-matches against the moved order, where a browser matches source order
+/// and reorders only boxes. It fires only on documents that are misordered
+/// to begin with — a table already written in visual order is never
+/// touched — and the alternative, reordering Blitz's generated boxes, is
+/// not reachable from the adapter.
+pub struct TableSectionOrderPass;
+
+impl DomPass for TableSectionOrderPass {
+    fn apply(&self, doc: &mut HtmlDocument, _ctx: &PassContext<'_>) {
+        let candidates = collect_misordered_section_tables(doc);
+        if candidates.is_empty() {
+            return;
+        }
+        // `table_section_group` reads a cascaded style, so resolve once. The
+        // engine re-resolves the reordered tree afterwards.
+        resolve(doc);
+        for table_id in candidates {
+            if display_is_none(doc, table_id) {
+                continue;
+            }
+            let children = element_children(doc, table_id);
+            let first_of = |group: TableSectionGroup| {
+                children
+                    .iter()
+                    .copied()
+                    .find(|&id| table_section_group(doc, id) == Some(group))
+            };
+            let head = first_of(TableSectionGroup::Header);
+            let foot = first_of(TableSectionGroup::Footer);
+
+            if let Some(head_id) = head {
+                if children.first() != Some(&head_id) {
+                    move_to_first_child(doc, table_id, head_id);
+                }
+            }
+            if let Some(foot_id) = foot {
+                // Re-read: promoting the header can change which element is
+                // last (`<tbody><tfoot><thead>` ends with the header until it
+                // moves), and appending a node that is already last would take
+                // the same remove / re-insert round trip for nothing.
+                let children = element_children(doc, table_id);
+                if children.last() != Some(&foot_id) {
+                    move_to_last_child(doc, table_id, foot_id);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_section_order_tests {
+    use super::*;
+
+    fn tags_of_children(doc: &HtmlDocument, parent_id: usize) -> Vec<String> {
+        element_children(doc, parent_id)
+            .into_iter()
+            .filter_map(|id| {
+                doc.get_node(id)
+                    .and_then(|n| n.element_data())
+                    .map(|el| el.name.local.as_ref().to_string())
+            })
+            .collect()
+    }
+
+    fn find_first_table(doc: &HtmlDocument, node_id: usize) -> Option<usize> {
+        let node = doc.get_node(node_id)?;
+        if node
+            .element_data()
+            .is_some_and(|el| el.name.local.as_ref() == "table")
+        {
+            return Some(node_id);
+        }
+        node.children
+            .clone()
+            .into_iter()
+            .find_map(|child| find_first_table(doc, child))
+    }
+
+    /// Run the pass the way the engine does, and report the table's element
+    /// children by tag afterwards.
+    fn section_order_after_pass(html: &str) -> Vec<String> {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = parse(html, 600.0, &fonts);
+        let ctx = PassContext { font_data: &fonts };
+        TableSectionOrderPass.apply(&mut doc, &ctx);
+        let table_id = find_first_table(&doc, doc.root_element().id).expect("table");
+        tags_of_children(&doc, table_id)
+    }
+
+    #[test]
+    fn a_tfoot_written_first_is_moved_to_the_end() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tfoot><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tbody", "tfoot"],
+        );
+    }
+
+    #[test]
+    fn a_thead_written_last_is_moved_to_the_front() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tbody><tr><td>a</td></tr></tbody>\
+                 <thead><tr><th>h</th></tr></thead></table></body></html>"
+            ),
+            vec!["thead", "tbody"],
+        );
+    }
+
+    /// Both promotions at once, from the worst source order. Exercises the
+    /// re-read between the two moves: until the header is promoted the
+    /// *header* is the last element child, so a stale snapshot would decide
+    /// the footer still needs moving after it already sits last.
+    #[test]
+    fn a_header_and_footer_written_backwards_are_both_promoted() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tbody><tr><td>a</td></tr></tbody>\
+                 <tfoot><tr><td>f</td></tr></tfoot>\
+                 <thead><tr><th>h</th></tr></thead></table></body></html>"
+            ),
+            vec!["thead", "tbody", "tfoot"],
+        );
+    }
+
+    /// Only the first group of each kind is promoted; the rest keep their
+    /// source position. Both reference engines agree — see
+    /// `tests/table_section_order.rs`.
+    #[test]
+    fn only_the_first_header_and_footer_group_move() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot id=\"fa\"><tr><td>fa</td></tr></tfoot>\
+                 <thead id=\"ha\"><tr><th>ha</th></tr></thead>\
+                 <tbody><tr><td>a</td></tr></tbody>\
+                 <tfoot id=\"fb\"><tr><td>fb</td></tr></tfoot>\
+                 <thead id=\"hb\"><tr><th>hb</th></tr></thead>\
+                 </table></body></html>"
+            ),
+            vec!["thead", "tbody", "tfoot", "thead", "tfoot"],
+        );
+    }
+
+    /// A table already in visual order must come out untouched — and, more
+    /// importantly, must never reach the pass's re-resolve at all.
+    #[test]
+    fn a_table_already_in_order_is_left_alone() {
+        let html = "<html><body><table><thead><tr><th>h</th></tr></thead>\
+                    <tbody><tr><td>a</td></tr></tbody>\
+                    <tfoot><tr><td>f</td></tr></tfoot></table></body></html>";
+        assert_eq!(
+            section_order_after_pass(html),
+            vec!["thead", "tbody", "tfoot"],
+        );
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let doc = parse(html, 600.0, &fonts);
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "a well-formed table must not be a candidate, so it never pays the re-resolve"
+        );
+    }
+
+    /// The prefilter is by tag, the decision by computed display: a
+    /// `<tfoot>` demoted to a row group is a candidate (its tag is out of
+    /// place) but must not be moved, since both references leave it in
+    /// source order.
+    #[test]
+    fn a_tfoot_demoted_to_a_row_group_is_not_moved() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot style=\"display:table-row-group\"><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tfoot", "tbody"],
+        );
+    }
+
+    /// `display: none` is not a section group (its `DisplayInside` is
+    /// `None`), so a hidden `<tfoot>` is never promoted — it draws nothing
+    /// either way, and moving it would be pure restyle cost.
+    #[test]
+    fn a_display_none_tfoot_is_not_moved() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot style=\"display:none\"><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tfoot", "tbody"],
+        );
+    }
+
+    /// Whitespace between the sections survives html5ever's "in table"
+    /// insertion mode as a text node, so "already last" has to be asked of
+    /// the *element* children. With the text node counted, a well-formed
+    /// table would look misordered and be needlessly moved.
+    #[test]
+    fn whitespace_between_sections_does_not_make_a_table_a_candidate() {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let doc = parse(
+            "<html><body><table>\n  <thead><tr><th>h</th></tr></thead>\n  \
+             <tbody><tr><td>a</td></tr></tbody>\n  \
+             <tfoot><tr><td>f</td></tr></tfoot>\n</table></body></html>",
+            600.0,
+            &fonts,
+        );
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "whitespace text nodes must not be mistaken for a misordered section"
+        );
+    }
+
+    /// A nested table is ordered on its own, and an outer table's sections
+    /// never absorb an inner one's.
+    #[test]
+    fn a_nested_table_is_ordered_independently() {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = parse(
+            "<html><body><table><tfoot><tr><td>outer-f</td></tr></tfoot>\
+             <tbody><tr><td><table><tfoot><tr><td>inner-f</td></tr></tfoot>\
+             <tbody><tr><td>inner-a</td></tr></tbody></table></td></tr></tbody>\
+             </table></body></html>",
+            600.0,
+            &fonts,
+        );
+        let ctx = PassContext { font_data: &fonts };
+        assert_eq!(
+            collect_misordered_section_tables(&doc).len(),
+            2,
+            "both the outer and the inner table are candidates"
+        );
+        TableSectionOrderPass.apply(&mut doc, &ctx);
+        let outer = find_first_table(&doc, doc.root_element().id).expect("outer table");
+        assert_eq!(tags_of_children(&doc, outer), vec!["tbody", "tfoot"]);
+        let inner_body = element_children(&doc, outer)[0];
+        let inner = find_first_table(&doc, inner_body).expect("inner table");
+        assert_eq!(tags_of_children(&doc, inner), vec!["tbody", "tfoot"]);
+    }
+
+    #[test]
+    fn collect_misordered_section_tables_respects_depth_limit() {
+        let mut html = String::from("<html><body>");
+        for _ in 0..(MAX_DOM_DEPTH + 5) {
+            html.push_str("<div>");
+        }
+        html.push_str(
+            "<table><tfoot><tr><td>f</td></tr></tfoot><tbody><tr><td>a</td></tr></tbody></table>",
+        );
+        for _ in 0..(MAX_DOM_DEPTH + 5) {
+            html.push_str("</div>");
+        }
+        html.push_str("</body></html>");
+        let doc = parse(&html, 600.0, &[]);
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "a table nested past MAX_DOM_DEPTH must not be collected"
+        );
+    }
+}
+
 #[cfg(test)]
 mod caption_restructure_tests {
     use super::*;

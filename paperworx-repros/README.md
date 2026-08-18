@@ -14,7 +14,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 3 | Silent blank text when no registered font matches | `03-font-miss-silent-blank.md` | **dangerous** | **fixed** |
 | 4 | Margin-box slots not anchored to their named position | `04-margin-box-anchor.html` | blocks NBB | **fixed** |
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **fixed** (one part deferred) |
-| 6 | `<tfoot>` before `<tbody>` renders at the top of the table | — | real, single-page | **open** — see below |
+| 6 | `<tfoot>` before `<tbody>` renders at the top of the table | `scripts/refdiff/fixtures/table-tfoot-source-order.html` | real, single-page | **fixed** |
 | 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
 
 ## 1 — misdiagnosed; the real fault was different
@@ -153,37 +153,145 @@ on page 7 rather than 36. Both total 300. That difference predates this change.
 - **Forced breaks inside a table do not repeat either band** — measured: `break-before:
   page` on a `<td>` is not honoured by fulgur at all, so those page-advance paths are
   unreachable for tables today and deliberately carry no reservation logic.
-- **A `<tfoot>` written before `<tbody>` is not repeated at all** — it is mis-placed to
-  begin with (defect 6), so `table_section_band` bails rather than repeating a footer
-  that is already in the wrong place.
+- ~~**A `<tfoot>` written before `<tbody>` is not repeated at all**~~ — fixed by
+  defect 6. The section is put into CSS box order before layout, so the shape that
+  reaches the fragmenter is the ordinary one and the footer repeats like any other.
+  `table_section_band`'s edge check still bails on a band that is genuinely
+  mid-table — see item 6.
 
-## 6 — `<tfoot>` before `<tbody>` renders at the top of the table
+## 6 — fixed; `<tfoot>` before `<tbody>` rendered at the top of the table
 
 Found while measuring defect 2's footer half. **Not a pagination defect** — it needs no
-multi-page document, and it lives in table layout rather than in the fragmenter.
+multi-page document, and it lived in table layout rather than in the fragmenter.
 
-fulgur lays table sections out in source order. CSS requires a `<tfoot>` at the bottom
-of the table regardless of where it appears in the source, and HTML4 *required* authors
-to write it before `<tbody>`, so real documents hit this.
+fulgur laid table sections out in source order. CSS 2.1 §17.5.1 puts a table's boxes in
+header group → row groups → footer group order regardless of the source, and HTML4
+*required* authors to write `<tfoot>` before `<tbody>`, so real documents hit this.
 
 Single page, 40 rows, `yMin` top-down (bigger = lower on the page):
 
 | fixture | engine | header | rows | footer | verdict |
 |---|---|---|---|---|---|
 | `<tfoot>` before `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | **657.8** | below rows |
-| `<tfoot>` before `<tbody>` | fulgur | 65.7 | 96-703 | **80.7** | **above rows** |
+| `<tfoot>` before `<tbody>` | fulgur (before) | 65.7 | 96-703 | **80.7** | **above rows** |
+| `<tfoot>` before `<tbody>` | fulgur (after) | 65.7 | 80-687 | **703.2** | below rows |
 | `<tfoot>` after `<tbody>` | WeasyPrint 69 | 64.7 | 79-643 | 657.8 | below rows |
 | `<tfoot>` after `<tbody>` | fulgur | 65.7 | 80-687 | 703.2 | below rows |
 
-WeasyPrint's output is identical for both orderings, as it should be. fulgur is correct
-only when the author already wrote the sections in visual order.
+WeasyPrint's output is identical for both orderings, as it should be, and fulgur's now
+is too. The residual gap to WeasyPrint (703.2 against 657.8) is row packing, unchanged
+by this work and present in the already-correct ordering before it — the fix makes the
+misordered document render *exactly* what the well-ordered one renders, which is the
+property that matters.
 
-Until it is fixed, defect 2's footer repetition deliberately bails on this shape
-(`table_section_band` requires the band to be the table's bottom strip), so a misplaced
-footer is never repeated onto every page. Pinned by
-`table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band`, which also asserts
-its own premise — if section ordering is ever fixed, that test fails loudly rather than
-passing for the wrong reason.
+### It was not only `<tfoot>`
+
+`<thead>` written *after* `<tbody>` — which the HTML parser also accepts — was wrong the
+same way and by the same root cause: fulgur drew the header at `yMin` 687.4, below every
+row, where both references keep it at 64.7. Fixing only the footer would have left the
+defect reachable and made "source order does not matter" false as a property. Measured
+on nine one-variable probes, fulgur now reproduces WeasyPrint's vertical ordering on
+every one.
+
+### Root cause
+
+Not fulgur's own layout: blitz-dom builds a table's cell grid by walking the table's DOM
+children in order (`layout/table.rs::collect_table_cells`), giving `TableHeaderGroup`
+and `TableFooterGroup` the same arm as `TableRowGroup` and assigning grid rows as it
+goes. Nothing downstream ever reordered them.
+
+### The fix
+
+`blitz_adapter::TableSectionOrderPass`, a `DomPass` registered in `engine.rs` right
+after `CaptionRestructurePass` and following its shape: it runs before the engine's own
+`resolve()` and re-resolves internally, because the classification is a *computed*
+display. A tag-name prefilter finds tables whose `<thead>` / `<tfoot>` are out of place
+before any restyle, so a document with no misordered table never pays that resolve —
+and by exhaustive scan, the only misordered table in this repo is the refdiff fixture.
+
+Two details are load-bearing:
+
+- **Keyed on computed display, not on the tag name.** `<tfoot style="display:
+  table-row-group">` is an ordinary row group that both references leave in source
+  order (WeasyPrint draws it at `yMin` 79.2, above the first row at 93.6; Chrome 151
+  agrees). A tag-name test would wrongly demote it. This is also the predicate
+  blitz-dom itself dispatches on.
+- **Only the *first* header group and the *first* footer group are promoted**; every
+  other child, additional header / footer groups included, keeps its source position.
+  That is CSS 2.1's model, and both references reproduce it exactly: on
+  `<tfoot A><thead A><tbody><tfoot B><thead B>` they both draw
+  `HEAD A → rows → FOOT B → HEAD B → FOOT A`.
+
+The `CaptionRestructurePass` hazards were checked and do not apply the same way. Blitz
+dropping a non-table-typed child of `<table>` is not reachable here — a section stays
+inside the same table rather than being lifted out — and for the same reason no
+`visibility: hidden` guard is needed, since no cascade that hid the section can be
+escaped by the move. A `display: none` child is never classified as a section group at
+all (its `DisplayInside` is `None`), and a `display: none` table is skipped outright.
+
+One Blitz sharp edge did bite: `Mutator::append_children` cannot move a node within its
+*own* parent. It appends the id, then runs `old_parent.children.retain(|id| *id !=
+child_id)` on what is the same node, stripping the copy it just appended and dropping
+the child out of the tree. The move goes through `remove_node` first, which leaves the
+node in the slab (only `remove_and_drop_node` frees it) and keeps the restyle / damage
+marking intact.
+
+### Defect 2's footer repetition now handles this shape — deliberately
+
+`table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band` was planted to fail
+when this was fixed, and it asserts its own premise so it could not pass for the wrong
+reason. It needed a decision rather than a patch, and the decision is **yes**: once the
+footer genuinely *is* the table's bottom band, repeating it is what WeasyPrint does —
+its two orderings are identical, footer on 7/7 pages either way. So the misordered
+fixture is now repeated too, asserted end-to-end by
+`a_tfoot_written_before_tbody_repeats_on_every_page_its_table_spans`.
+
+The test itself was rewritten rather than deleted, because the guard it covers is still
+load-bearing — just for a different shape. The pass keys on computed display while
+`is_in_table_section` keys on the tag name, so a `display: table-row-group` `<tfoot>`
+stays mid-table by design and its cells must not be repeated from there. That is the
+bail case now, and it still asserts its own premise.
+
+**It would not have gone red on its own.** The `parse` helper in `pagination_layout.rs`
+runs no DOM passes, so a pass-level fix leaves it green while it quietly asserts a tree
+the engine never produces — worse than a failure, since nothing would have prompted the
+decision. It now goes through `parse_with_section_order_pass`, and both it and the
+rewritten positive case were verified to fail with the pass disabled.
+
+### Known limitation: structural selectors re-match
+
+The pass moves DOM nodes, so a selector that depends on section position re-matches
+against the moved order, where a browser matches source order and reorders only boxes.
+Measured: with `<tfoot>` written first, `table > tbody:nth-child(3) td {padding-left:
+40pt}` applies in WeasyPrint (first cell at `xMin` 102.7) and no longer does in fulgur
+(65.7). It fires only on documents that are misordered to begin with — a table already
+written in visual order is never touched — and reordering Blitz's generated boxes
+instead of the DOM is not reachable from the adapter.
+
+Out of scope, and for the same reason as always — the references disagree with each
+other, so there is no reference to build against: a `<div style="display:
+table-footer-group">` child of a `<table>`. Chrome hoists it *above* the table,
+WeasyPrint drops its text entirely. fulgur matches WeasyPrint here both before and
+after this change.
+
+### Verification
+
+`scripts/refdiff` rated this fixture `MISSING` — the harness's strongest divergence
+class, fulgur omitting the footer on 2 of 3 pages — and now rates it `PACKING`, the
+font-metric class its two sibling table fixtures already sat in. That was the last
+`MISSING` row in the harness.
+
+Covered by `crates/fulgur/tests/table_section_order.rs` (7 tests; 6 verified to fail
+before the fix, the seventh being the control that must not regress) and ten unit tests
+on the pass itself. The sharpest is the property, not a coordinate:
+`source_order_of_the_sections_does_not_change_the_output` renders both orderings and
+requires every drawn run to match exactly — which is what WeasyPrint does, and the
+thing the defect actually broke.
+
+No golden or snapshot moved, and none could: a scan of every `.html` in the repo plus
+every table built in Rust test sources found exactly one misordered table, the refdiff
+fixture, which is not a VRT input. `fulgur-vrt` was therefore not regenerated — it
+cannot run on macOS anyway.
 
 ## 3 — fixed
 

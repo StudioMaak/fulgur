@@ -1706,11 +1706,14 @@ fn is_in_table_section(
 /// `<tfoot>` its bottom strip. Reserving for a band that sits elsewhere would
 /// displace content whose placement we have not measured.
 ///
-/// The `<tfoot>` check is load-bearing rather than theoretical: fulgur lays
-/// table sections out in source order, so a `<tfoot>` written before
-/// `<tbody>` (as HTML4 required) renders at the *top* of the table. That is a
-/// separate single-page layout defect; until it is fixed, this bail keeps the
-/// fragmenter from repeating an already-misplaced footer.
+/// The `<tfoot>` check is load-bearing rather than theoretical, though no
+/// longer for source order: `blitz_adapter::TableSectionOrderPass` now puts a
+/// `<tfoot>` written before `<tbody>` (as HTML4 required) at the table's
+/// bottom before layout, so that shape reaches the fragmenter already
+/// ordered and *is* repeated. The check still fires where the two disagree —
+/// the pass keys on computed display, [`is_in_table_section`] on the tag
+/// name, so a `display: table-row-group` `<tfoot>` stays mid-table by design
+/// and its cells must not be repeated from there.
 fn table_section_band(
     doc: &BaseDocument,
     parent_id: usize,
@@ -4362,6 +4365,22 @@ mod tests {
         doc
     }
 
+    /// Like [`parse`], but applies `TableSectionOrderPass` the way
+    /// `Engine::render` does.
+    ///
+    /// `parse` runs no DOM passes, so a table-section test built on it
+    /// asserts against a tree the engine never hands the fragmenter — a
+    /// `<tfoot>` written before `<tbody>` stays at the top there, and only
+    /// there.
+    fn parse_with_section_order_pass(html: &str, viewport_w: f32) -> blitz_html::HtmlDocument {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = blitz_adapter::parse(html, viewport_w, &fonts);
+        let ctx = blitz_adapter::PassContext { font_data: &fonts };
+        blitz_adapter::apply_single_pass(&blitz_adapter::TableSectionOrderPass, &mut doc, &ctx);
+        blitz_adapter::resolve(&mut doc);
+        doc
+    }
+
     #[test]
     fn empty_document_emits_only_body_fragment() {
         let mut doc = parse("<html><body></body></html>", 600.0);
@@ -4579,19 +4598,25 @@ mod tests {
         );
     }
 
-    /// A `<tfoot>` written *before* `<tbody>` — as HTML4 required — is laid
-    /// out by fulgur in source order, so it renders at the top of the table
-    /// rather than the bottom. That is a separate single-page layout defect;
-    /// until it is fixed the band must bail, so the fragmenter never repeats
-    /// an already-misplaced footer.
+    /// A `<tfoot>` written *before* `<tbody>` — as HTML4 required — used to
+    /// be laid out in source order, at the top of the table, and this band
+    /// helper bailed rather than repeat an already-misplaced footer.
+    /// `TableSectionOrderPass` now puts the section in CSS box order before
+    /// layout, so the shape reaching the fragmenter is the ordinary one and
+    /// the footer is repeated like any other. See
+    /// `tests/table_section_order.rs` for the end-to-end property.
+    ///
+    /// Uses [`parse_with_section_order_pass`]: the plain `parse` helper does
+    /// not run DOM passes, so without it this test would assert against a
+    /// tree the engine never produces.
     #[test]
-    fn table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band() {
+    fn table_section_band_finds_a_source_order_tfoot_after_the_reorder_pass() {
         let html = "<html><body><table>\
              <tfoot><tr><td style=\"height:15px;padding:0\">f</td></tr></tfoot>\
              <tbody><tr><td style=\"height:20px;padding:0\">a</td></tr>\
              <tr><td style=\"height:20px;padding:0\">b</td></tr></tbody>\
              </table></body></html>";
-        let doc = parse(html, 600.0);
+        let doc = parse_with_section_order_pass(html, 600.0);
         let d: &BaseDocument = &doc;
         let table_id = find_tag(d, d.root_element().id, "table").expect("table");
         let children: Vec<usize> = d
@@ -4602,9 +4627,62 @@ mod tests {
             .as_deref()
             .map(|v| v.to_vec())
             .unwrap_or_default();
-        // Guard the premise: if fulgur ever starts ordering `<tfoot>` last,
-        // this test's setup no longer reproduces the misplacement and the
-        // assertion below should be revisited rather than silently passing.
+        // Guard the premise, as the bail-on-misplacement version of this test
+        // did: the reorder must actually have happened, so a regression that
+        // reverted it fails here rather than passing for the wrong reason.
+        let first_top = d
+            .get_node(children[0])
+            .expect("first cell")
+            .final_layout
+            .location
+            .y;
+        assert!(
+            first_top < 1.0,
+            "premise: some cell is laid out at the table top, got {first_top}"
+        );
+        let band = super::table_section_band(d, table_id, &children, super::TableSection::Foot)
+            .expect("the reordered footer forms a bottom band");
+        assert!(
+            (band.top - 40.0).abs() < 0.5,
+            "premise: the footer now sits below both 20px body rows, got top {}",
+            band.top
+        );
+        assert!(
+            (band.height - 15.0).abs() < 0.5,
+            "band height tracks the 15px footer cell, got {}",
+            band.height
+        );
+    }
+
+    /// The band helper's edge check is still load-bearing after the reorder
+    /// pass, because the pass keys on computed display while
+    /// [`is_in_table_section`] keys on the tag name. A
+    /// `display: table-row-group` `<tfoot>` is an ordinary row group that
+    /// both WeasyPrint 69 and Chrome 151 leave in source order, so the pass
+    /// correctly does not move it — and its cells then form a "footer" band
+    /// in the middle of the table, which must not be repeated.
+    #[test]
+    fn table_section_band_bails_on_a_tfoot_that_is_not_the_bottom_band() {
+        let html = "<html><body><table>\
+             <tfoot style=\"display:table-row-group\">\
+             <tr><td style=\"height:15px;padding:0\">f</td></tr></tfoot>\
+             <tbody><tr><td style=\"height:20px;padding:0\">a</td></tr>\
+             <tr><td style=\"height:20px;padding:0\">b</td></tr></tbody>\
+             </table></body></html>";
+        let doc = parse_with_section_order_pass(html, 600.0);
+        let d: &BaseDocument = &doc;
+        let table_id = find_tag(d, d.root_element().id, "table").expect("table");
+        let children: Vec<usize> = d
+            .get_node(table_id)
+            .unwrap()
+            .layout_children
+            .borrow()
+            .as_deref()
+            .map(|v| v.to_vec())
+            .unwrap_or_default();
+        // Guard the premise: the demoted footer must still be laid out first,
+        // otherwise this setup no longer reproduces a misplaced band and the
+        // assertion below would pass for the wrong reason.
         let foot_top = d
             .get_node(children[0])
             .expect("first cell")
@@ -4613,7 +4691,7 @@ mod tests {
             .y;
         assert!(
             foot_top < 1.0,
-            "premise: the misordered footer is laid out first, got top {foot_top}"
+            "premise: the demoted footer is laid out first, got top {foot_top}"
         );
         assert!(
             super::table_section_band(d, table_id, &children, super::TableSection::Foot).is_none(),
