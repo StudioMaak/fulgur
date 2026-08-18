@@ -2343,7 +2343,8 @@ use crate::gcpm::running::{RunningElementStore, serialize_node};
 use crate::gcpm::string_set::{StringSetEntry, StringSetStore, extract_text_content};
 use crate::gcpm::{
     ContentCounterMapping, ContentItem, CounterMapping, CounterOp, ParsedSelector, PseudoElement,
-    RunningMapping, StaticContentMapping, StringSetMapping, StringSetValue, TargetUrl,
+    RunningMapping, SelectorPart, StaticContentMapping, StringSetMapping, StringSetValue,
+    TargetUrl,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -2367,13 +2368,86 @@ fn is_non_visual_tag(tag: &str) -> bool {
     )
 }
 
-/// Check whether a `ParsedSelector` (simple class/id/tag selector) matches the given element.
+/// Check whether a `ParsedSelector` matches the given element.
+///
+/// Every accepted selector is a single compound — a type selector plus
+/// qualifiers on the *same* element — so this needs no tree walk.
 fn selector_matches(selector: &ParsedSelector, elem: &blitz_dom::node::ElementData) -> bool {
     match selector {
-        ParsedSelector::Class(name) => get_attr(elem, "class")
-            .is_some_and(|cls| cls.split_whitespace().any(|c| c == name.as_str())),
+        ParsedSelector::Class(name) => has_class(elem, name),
         ParsedSelector::Id(name) => get_attr(elem, "id") == Some(name.as_str()),
         ParsedSelector::Tag(name) => elem.name.local.as_ref().eq_ignore_ascii_case(name),
+        ParsedSelector::Compound(c) => {
+            if let Some(tag) = &c.tag {
+                if !elem.name.local.as_ref().eq_ignore_ascii_case(tag) {
+                    return false;
+                }
+            }
+            c.parts.iter().all(|part| match part {
+                SelectorPart::Class(name) => has_class(elem, name),
+                SelectorPart::Id(name) => get_attr(elem, "id") == Some(name.as_str()),
+                SelectorPart::Attr { name, test } => match get_attr(elem, name.as_str()) {
+                    None => false,
+                    Some(actual) => match test {
+                        None => true,
+                        Some((op, value)) => op.matches(actual, value.as_str()),
+                    },
+                },
+            })
+        }
+    }
+}
+
+fn has_class(elem: &blitz_dom::node::ElementData, name: &str) -> bool {
+    get_attr(elem, "class").is_some_and(|cls| cls.split_whitespace().any(|c| c == name))
+}
+
+/// Rebuild a [`ParsedSelector`] as CSS text, for the stylesheets fulgur
+/// injects (`build_running_hide_css`, `build_static_content_css`).
+///
+/// Selector components come from the trusted author CSS via `gcpm::parser`
+/// (`Token::Ident` in cssparser), not from arbitrary HTML. Tag and attribute
+/// names are lowercased to match HTML's case-insensitive convention; id,
+/// class and attribute names are still escaped because a hostile author can
+/// craft a bare token containing metacharacters via CSS escapes — defense in
+/// depth on the trusted side, and required by `element_specificity_prefix`
+/// for the untrusted case (fulgur-ka6c). Attribute *values* are emitted as
+/// quoted strings through the same escaper the `content` property uses.
+fn selector_to_css(selector: &ParsedSelector) -> String {
+    use std::fmt::Write;
+    match selector {
+        ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
+        ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
+        ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
+        ParsedSelector::Compound(c) => {
+            let mut out = c.tag.as_deref().unwrap_or("").to_ascii_lowercase();
+            for part in &c.parts {
+                match part {
+                    SelectorPart::Class(name) => {
+                        let _ = write!(out, ".{}", css_escape_ident(name));
+                    }
+                    SelectorPart::Id(name) => {
+                        let _ = write!(out, "#{}", css_escape_ident(name));
+                    }
+                    SelectorPart::Attr { name, test: None } => {
+                        let _ = write!(out, "[{}]", css_escape_ident(name));
+                    }
+                    SelectorPart::Attr {
+                        name,
+                        test: Some((op, value)),
+                    } => {
+                        let _ = write!(
+                            out,
+                            "[{}{}\"{}\"]",
+                            css_escape_ident(name),
+                            op.as_css(),
+                            crate::gcpm::parser::css_escape_string(value)
+                        );
+                    }
+                }
+            }
+            out
+        }
     }
 }
 
@@ -3501,14 +3575,7 @@ pub(crate) fn build_running_hide_css(mappings: &[crate::gcpm::RunningMapping]) -
     use std::fmt::Write;
     let mut css = String::new();
     for m in mappings {
-        // Same escaping rationale as `build_static_content_css`: these come
-        // from trusted author CSS, but a bare token can still carry
-        // metacharacters via CSS escapes.
-        let selector = match &m.parsed {
-            ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
-            ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
-            ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
-        };
+        let selector = selector_to_css(&m.parsed);
         let _ = write!(css, "{selector}{{display:none}}");
     }
     css
@@ -3518,19 +3585,7 @@ pub(crate) fn build_static_content_css(mappings: &[StaticContentMapping]) -> Str
     use std::fmt::Write;
     let mut css = String::new();
     for m in mappings {
-        let selector = match &m.parsed {
-            // Selector components here come from the trusted author CSS via
-            // `gcpm::parser` (`Token::Ident` in cssparser), not from
-            // arbitrary HTML. Tag names are lowercased to match HTML's
-            // case-insensitive convention; id/class are still escaped
-            // because a hostile author can craft a bare token containing
-            // metacharacters via CSS escapes — defense in depth on the
-            // trusted side, and required by `element_specificity_prefix`
-            // for the untrusted case (fulgur-ka6c).
-            ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
-            ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
-            ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
-        };
+        let selector = selector_to_css(&m.parsed);
         let pseudo = match m.pseudo {
             PseudoElement::Before => "::before",
             PseudoElement::After => "::after",

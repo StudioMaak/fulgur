@@ -12,6 +12,13 @@ use bookmark::BookmarkMapping;
 use margin_box::MarginBoxPosition;
 
 /// A simple CSS selector parsed from a style rule.
+///
+/// The three bare forms are kept as their own variants so the common case
+/// stays allocation-free and readable; anything else that is still a single
+/// *compound* selector — a tag with qualifiers, or more than one qualifier —
+/// lands in [`ParsedSelector::Compound`]. Combinators (`a b`, `a > b`) and
+/// selector lists (`a, b`) remain unsupported, and the parser now says so
+/// out loud instead of dropping the rule silently.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedSelector {
     /// A class selector, e.g. `.header`
@@ -20,6 +27,93 @@ pub enum ParsedSelector {
     Id(String),
     /// A tag name selector, e.g. `header`
     Tag(String),
+    /// A compound selector, e.g. `section[data-section="hdr"]` or `p.note#x`.
+    Compound(CompoundSelector),
+}
+
+/// A compound CSS selector: an optional type selector followed by any number
+/// of qualifiers, all of which must match the same element.
+///
+/// This is the shape a themed document actually writes. `parts` is never
+/// empty for a selector the parser accepts — a bare tag reduces to
+/// [`ParsedSelector::Tag`] before a `Compound` is ever built.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompoundSelector {
+    /// The type selector, lowercased. `None` for a selector that starts with
+    /// a qualifier (`[data-role]`, `.note`).
+    pub tag: Option<String>,
+    /// The qualifiers, in source order.
+    pub parts: Vec<SelectorPart>,
+}
+
+/// One qualifier within a [`CompoundSelector`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorPart {
+    /// `.name`
+    Class(String),
+    /// `#name`
+    Id(String),
+    /// `[name]` or `[name <op> "value"]`
+    Attr {
+        /// The attribute's local name, lowercased.
+        name: String,
+        /// The match to apply. `None` is a bare presence test.
+        test: Option<(AttrOp, String)>,
+    },
+}
+
+/// The attribute matching operators CSS Selectors 4 §6 defines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttrOp {
+    /// `[a=v]` — exact match.
+    Equals,
+    /// `[a~=v]` — one of a whitespace-separated list.
+    Includes,
+    /// `[a|=v]` — equal to `v`, or starting with `v-`.
+    DashMatch,
+    /// `[a^=v]` — prefix.
+    Prefix,
+    /// `[a$=v]` — suffix.
+    Suffix,
+    /// `[a*=v]` — substring.
+    Substring,
+}
+
+impl AttrOp {
+    /// Apply the operator to an element's actual attribute value.
+    ///
+    /// An empty `value` never matches for the three substring operators,
+    /// per Selectors 4 §6.2 — the whole point of the rule is that
+    /// `[a^=""]` must not match everything.
+    pub fn matches(self, actual: &str, value: &str) -> bool {
+        match self {
+            AttrOp::Equals => actual == value,
+            AttrOp::Includes => {
+                !value.is_empty() && actual.split_ascii_whitespace().any(|t| t == value)
+            }
+            AttrOp::DashMatch => {
+                actual == value
+                    || (actual.len() > value.len()
+                        && actual.starts_with(value)
+                        && actual.as_bytes()[value.len()] == b'-')
+            }
+            AttrOp::Prefix => !value.is_empty() && actual.starts_with(value),
+            AttrOp::Suffix => !value.is_empty() && actual.ends_with(value),
+            AttrOp::Substring => !value.is_empty() && actual.contains(value),
+        }
+    }
+
+    /// The operator's CSS spelling, for rebuilding the selector as text.
+    pub fn as_css(self) -> &'static str {
+        match self {
+            AttrOp::Equals => "=",
+            AttrOp::Includes => "~=",
+            AttrOp::DashMatch => "|=",
+            AttrOp::Prefix => "^=",
+            AttrOp::Suffix => "$=",
+            AttrOp::Substring => "*=",
+        }
+    }
 }
 
 /// Maps a CSS selector to a running element name.

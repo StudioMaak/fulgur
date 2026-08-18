@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<!--
+  Repro 10 — `vertical-align` is inert on an inline-block.
+
+  Four rows, identical but for the height of the bordered inline-block in the
+  middle. `vertical-align: middle` should centre each box on the line's
+  midline; the taller the box, the further the row's text baseline moves from
+  where plain baseline alignment would put it.
+
+  fulgur produces byte-identical output for `middle`, `baseline` and `top`
+  (verified by rewriting the value with sed), so no value of the property does
+  anything. WeasyPrint 69 separates all three.
+
+  Measured page-1 baselines, mm from the page top:
+
+    box height | WeasyPrint | fulgur | fulgur - WeasyPrint
+    10   pt    |   33.49    | 33.49  |  0.00
+    15.7 pt    |   43.02    | 43.81  | +0.79
+    22   pt    |   54.61    | 56.78  | +2.17
+    30   pt    |   68.72    | 72.39  | +3.67
+
+  The error grows with the box, which is why the NBB filing's form rows —
+  15.7pt to 18.4pt boxes on `vertical-align: middle` — sit 1.8 to 3.4mm low.
+-->
+<html><head><meta charset="utf-8"><title>vertical-align on an inline-block</title><style>
+@page { size: A4; margin: 20mm; }
+body { margin: 0; font: 9pt/1.15 "Liberation Sans", Arimo, sans-serif; }
+section.row { margin: 0 0 14pt 0; }
+section.row > p { display: inline-block; vertical-align: middle; margin: 0; }
+section.row > section { display: inline-block; box-sizing: border-box; border: 0.5pt solid #000;
+                        text-align: center; vertical-align: middle; width: 112pt; margin: 0 5pt; }
+section.row > section p { margin: 0; }
+#h10 > section { height: 10pt }   #h10 > section p { line-height: 9pt }
+#h16 > section { height: 15.7pt } #h16 > section p { line-height: 14.5pt }
+#h22 > section { height: 22pt }   #h22 > section p { line-height: 20pt }
+#h30 > section { height: 30pt }   #h30 > section p { line-height: 28pt }
+</style></head><body>
+<p>BASE-A</p>
+<section class="row" id="h10"><p>LEFT10</p><section><p>BOX10</p></section><p>RIGHT10</p></section>
+<section class="row" id="h16"><p>LEFT16</p><section><p>BOX16</p></section><p>RIGHT16</p></section>
+<section class="row" id="h22"><p>LEFT22</p><section><p>BOX22</p></section><p>RIGHT22</p></section>
+<section class="row" id="h30"><p>LEFT30</p><section><p>BOX30</p></section><p>RIGHT30</p></section>
+<p>BASE-B</p>
+</body></html>

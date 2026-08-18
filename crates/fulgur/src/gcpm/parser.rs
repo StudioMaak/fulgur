@@ -6,10 +6,11 @@ use cssparser::{
 use super::bookmark::{BookmarkLevel, BookmarkMapping};
 use super::margin_box::MarginBoxPosition;
 use super::{
-    ContentCounterMapping, ContentItem, CounterMapping, CounterOp, CounterStyle, ElementPolicy,
-    GcpmContext, LeaderStyle, MarginBoxRule, PageSettingsRule, PageSizeDecl, ParsedSelector,
-    PartialMargin, PseudoElement, RunningMapping, StaticContentMapping, StringPolicy,
-    StringSetMapping, StringSetValue, TargetTextKind, TargetUrl,
+    AttrOp, CompoundSelector, ContentCounterMapping, ContentItem, CounterMapping, CounterOp,
+    CounterStyle, ElementPolicy, GcpmContext, LeaderStyle, MarginBoxRule, PageSettingsRule,
+    PageSizeDecl, ParsedSelector, PartialMargin, PseudoElement, RunningMapping, SelectorPart,
+    StaticContentMapping, StringPolicy, StringSetMapping, StringSetValue, TargetTextKind,
+    TargetUrl,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,14 @@ struct GcpmSheetParser<'a> {
     static_content_mappings: &'a mut Vec<StaticContentMapping>,
     page_settings: &'a mut Vec<PageSettingsRule>,
     bookmark_mappings: &'a mut Vec<BookmarkMapping>,
+    /// Source text of the last prelude the parser could not represent.
+    ///
+    /// Set by [`GcpmSheetParser::unsupported_prelude`] and read by
+    /// `parse_block`, which warns when the block those tokens introduce
+    /// carries a paged-media-only declaration. Without it the rule is dropped
+    /// silently — the failure mode that left a running element in the body
+    /// flow of every real filing (paperworx repro 9).
+    rejected_prelude: Option<String>,
 }
 
 /// Describes a region in the original CSS to edit when building `cleaned_css`.
@@ -120,6 +129,77 @@ struct QualifiedPrelude {
     pseudo: Option<PseudoElement>,
 }
 
+impl<'a> GcpmSheetParser<'a> {
+    /// Drain a prelude the parser cannot represent, remembering its source
+    /// text so `parse_block` can report it if the block turns out to carry a
+    /// paged-media-only declaration.
+    ///
+    /// Returns `None` — the `Prelude` value that makes `parse_block` skip the
+    /// rule without recording mappings or CSS edits.
+    fn unsupported_prelude<'i, 't>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+        start: cssparser::SourcePosition,
+    ) -> Option<QualifiedPrelude> {
+        while input.next_including_whitespace().is_ok() {}
+        let text = input.slice_from(start).trim();
+        // A prelude longer than a line is never a selector a theme meant to
+        // hand a GCPM construct; truncating keeps a hostile stylesheet from
+        // writing an unbounded string into the log.
+        self.rejected_prelude = Some(text.chars().take(120).collect());
+        None
+    }
+}
+
+/// Parse the inside of a `[...]` attribute selector.
+///
+/// Case-sensitivity flags (`[a=b i]`) and namespaces (`[ns|a]`) are rejected
+/// rather than ignored: matching more elements than the author wrote would
+/// hide the wrong ones.
+fn parse_attr_selector<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<SelectorPart, ParseError<'i, ()>> {
+    let name = input.expect_ident()?.to_ascii_lowercase();
+    if input.is_exhausted() {
+        return Ok(SelectorPart::Attr { name, test: None });
+    }
+    let op = match input.next()?.clone() {
+        Token::Delim('=') => AttrOp::Equals,
+        Token::IncludeMatch => AttrOp::Includes,
+        Token::DashMatch => AttrOp::DashMatch,
+        Token::PrefixMatch => AttrOp::Prefix,
+        Token::SuffixMatch => AttrOp::Suffix,
+        Token::SubstringMatch => AttrOp::Substring,
+        _ => return Err(input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    let value = match input.next()?.clone() {
+        Token::QuotedString(ref v) => v.to_string(),
+        Token::Ident(ref v) => v.to_string(),
+        _ => return Err(input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    // Anything left is a case flag or a namespace; both change what matches.
+    input.expect_exhausted()?;
+    Ok(SelectorPart::Attr {
+        name,
+        test: Some((op, value)),
+    })
+}
+
+/// Is this token part of a declaration that only means something in paged
+/// media? Those are the ones worth warning about when their rule is dropped:
+/// `content` and `counter-*` are ordinary CSS and appear in every stylesheet.
+fn is_paged_media_only_token(token: &Token<'_>) -> bool {
+    match token {
+        Token::Function(name) => name.eq_ignore_ascii_case("running"),
+        Token::Ident(name) => {
+            name.eq_ignore_ascii_case("string-set")
+                || name.eq_ignore_ascii_case("bookmark-level")
+                || name.eq_ignore_ascii_case("bookmark-label")
+        }
+        _ => false,
+    }
+}
+
 impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
     type Prelude = Option<QualifiedPrelude>;
     type QualifiedRule = TopLevelItem;
@@ -129,6 +209,7 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        let prelude_start = input.position();
         // Skip leading whitespace
         let first = loop {
             match input.next_including_whitespace()?.clone() {
@@ -137,17 +218,63 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
             }
         };
 
-        let selector = match first {
-            Token::Delim('.') => {
-                let name = input.expect_ident()?.clone();
-                ParsedSelector::Class(name.to_string())
+        // A compound selector: an optional type selector, then any number of
+        // `.class` / `#id` / `[attr]` qualifiers on the same element. Real
+        // themes write `section[data-section="hdr"]`, and dropping that shape
+        // is what left a running element in the body flow (paperworx repro 9).
+        let mut tag: Option<String> = None;
+        let mut parts: Vec<SelectorPart> = Vec::new();
+        let mut tok = first;
+        loop {
+            match tok {
+                Token::Delim('.') => {
+                    let name = input.expect_ident()?.clone();
+                    parts.push(SelectorPart::Class(name.to_string()));
+                }
+                Token::IDHash(ref name) => parts.push(SelectorPart::Id(name.to_string())),
+                Token::Ident(ref name) if tag.is_none() && parts.is_empty() => {
+                    tag = Some(name.to_ascii_lowercase());
+                }
+                Token::SquareBracketBlock => match input.parse_nested_block(parse_attr_selector) {
+                    Ok(part) => parts.push(part),
+                    // An attribute selector we cannot represent — an `i`/`s`
+                    // case flag, or a namespace. Bail rather than widen the
+                    // match: a selector matching *more* than the author wrote
+                    // would hide the wrong elements.
+                    Err(_) => return Ok(self.unsupported_prelude(input, prelude_start)),
+                },
+                _ => return Ok(self.unsupported_prelude(input, prelude_start)),
             }
-            Token::IDHash(ref name) => ParsedSelector::Id(name.to_string()),
-            Token::Ident(ref name) => ParsedSelector::Tag(name.to_string()),
-            _ => {
-                while input.next_including_whitespace().is_ok() {}
-                return Ok(None);
+            // Peek: a further qualifier must follow with no whitespace, or the
+            // compound ends here.
+            let state = input.state();
+            match input.next_including_whitespace() {
+                Ok(next) => match next {
+                    Token::Delim('.')
+                    | Token::IDHash(_)
+                    | Token::SquareBracketBlock
+                    | Token::Ident(_) => tok = next.clone(),
+                    _ => {
+                        input.reset(&state);
+                        break;
+                    }
+                },
+                Err(_) => break,
             }
+        }
+
+        let selector = match (tag, parts.len()) {
+            (Some(t), 0) => ParsedSelector::Tag(t),
+            (None, 1) => match parts.remove(0) {
+                SelectorPart::Class(name) => ParsedSelector::Class(name),
+                SelectorPart::Id(name) => ParsedSelector::Id(name),
+                attr => ParsedSelector::Compound(CompoundSelector {
+                    tag: None,
+                    parts: vec![attr],
+                }),
+            },
+            (None, 0) => return Ok(self.unsupported_prelude(input, prelude_start)),
+            (tag, _) => ParsedSelector::Compound(CompoundSelector { tag, parts }),
         };
 
         // Try to detect ::before / ::after pseudo-element
@@ -166,12 +293,13 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
             })
             .ok();
 
-        // Reject compound/group selectors — only simple selectors are supported.
-        // If any non-whitespace tokens remain, this is not a simple selector.
+        // Reject combinators and selector lists — only a single compound
+        // selector is supported. If any non-whitespace tokens remain, this
+        // prelude is one of those.
         while let Ok(tok) = input.next_including_whitespace() {
             match tok {
                 Token::WhiteSpace(_) => {}
-                _ => return Ok(None),
+                _ => return Ok(self.unsupported_prelude(input, prelude_start)),
             }
         }
         Ok(Some(QualifiedPrelude { selector, pseudo }))
@@ -187,9 +315,21 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
         // Otherwise, skip the block to avoid replacing declarations with
         // `display: none` for elements that won't be registered as running.
         let Some(qp) = prelude else {
-            while input.next().is_ok() {}
+            let selector = self.rejected_prelude.take();
+            let mut paged_media_only = false;
+            while let Ok(token) = input.next() {
+                paged_media_only |= is_paged_media_only_token(token);
+            }
+            if paged_media_only {
+                log::warn!(
+                    "GCPM declaration ignored: `{}` is not a single compound selector \
+                     (combinators and selector lists are unsupported), so the rule was dropped",
+                    selector.as_deref().unwrap_or("<selector>")
+                );
+            }
             return Ok(TopLevelItem::StyleRule);
         };
+        self.rejected_prelude = None;
 
         let selector = qp.selector;
         let pseudo = qp.pseudo;
@@ -1383,6 +1523,7 @@ pub fn parse_gcpm(css: &str) -> GcpmContext {
             static_content_mappings: &mut static_content_mappings,
             page_settings: &mut page_settings,
             bookmark_mappings: &mut bookmark_mappings,
+            rejected_prelude: None,
         };
 
         let iter = StyleSheetParser::new(&mut input, &mut parser);
@@ -3404,14 +3545,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compound_selector_block_is_drained() {
-        // `.foo.bar` is a compound selector — our parser only handles simple
-        // selectors. When the prelude returns None, the block must be drained
-        // and the rule ignored (lines 190-191).
-        // The follow-up valid rule must still register to prove the block was
-        // drained and parsing continued.
+    fn test_unsupported_selector_block_is_drained() {
+        // A descendant combinator is not a single compound selector, so the
+        // parser cannot represent it. When the prelude returns None the block
+        // must be drained and the rule ignored. The follow-up valid rule must
+        // still register, proving parsing continued from the right place.
+        //
+        // This test used to assert the same of `.foo.bar`, which was a real
+        // limitation and is now supported — verified against WeasyPrint 69,
+        // which puts the running element in the margin box for that selector
+        // and takes it out of the flow. See `test_compound_class_selector`.
         let ctx = parse_gcpm(
-            ".foo.bar { position: running(header); } .valid { position: running(footer); }",
+            ".foo .bar { position: running(header); } .valid { position: running(footer); }",
         );
         assert!(
             !ctx.running_mappings
@@ -3423,6 +3568,104 @@ mod tests {
                 .iter()
                 .any(|m| m.running_name == "footer")
         );
+    }
+
+    #[test]
+    fn test_selector_list_block_is_drained() {
+        let ctx = parse_gcpm(
+            ".foo, .bar { position: running(header); } .valid { position: running(footer); }",
+        );
+        assert!(
+            !ctx.running_mappings
+                .iter()
+                .any(|m| m.running_name == "header")
+        );
+        assert!(
+            ctx.running_mappings
+                .iter()
+                .any(|m| m.running_name == "footer")
+        );
+    }
+
+    /// The bare forms must keep reducing to the simple variants — a `.foo`
+    /// that started arriving as a one-part `Compound` would still match, but
+    /// every existing assertion on `ParsedSelector::Class` would break, and
+    /// the injected CSS would gain needless nesting.
+    #[test]
+    fn test_bare_selectors_still_reduce_to_simple_variants() {
+        for (css, expected) in [
+            (".foo", ParsedSelector::Class("foo".into())),
+            ("#foo", ParsedSelector::Id("foo".into())),
+            ("aside", ParsedSelector::Tag("aside".into())),
+        ] {
+            let ctx = parse_gcpm(&format!("{css} {{ position: running(h); }}"));
+            assert_eq!(ctx.running_mappings[0].parsed, expected, "for `{css}`");
+        }
+    }
+
+    #[test]
+    fn test_compound_class_selector() {
+        let ctx = parse_gcpm(".foo.bar { position: running(h); }");
+        assert_eq!(
+            ctx.running_mappings[0].parsed,
+            ParsedSelector::Compound(CompoundSelector {
+                tag: None,
+                parts: vec![
+                    SelectorPart::Class("foo".into()),
+                    SelectorPart::Class("bar".into())
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_attribute_selector_forms() {
+        let cases = [
+            ("[data-role]", None),
+            ("[data-role=hdr]", Some((AttrOp::Equals, "hdr"))),
+            ("[data-role=\"hdr\"]", Some((AttrOp::Equals, "hdr"))),
+            ("[data-role~=\"hdr\"]", Some((AttrOp::Includes, "hdr"))),
+            ("[data-role|=\"hdr\"]", Some((AttrOp::DashMatch, "hdr"))),
+            ("[data-role^=\"hdr\"]", Some((AttrOp::Prefix, "hdr"))),
+            ("[data-role$=\"hdr\"]", Some((AttrOp::Suffix, "hdr"))),
+            ("[data-role*=\"hdr\"]", Some((AttrOp::Substring, "hdr"))),
+        ];
+        for (css, test) in cases {
+            let ctx = parse_gcpm(&format!("section{css} {{ position: running(h); }}"));
+            assert_eq!(
+                ctx.running_mappings.len(),
+                1,
+                "`section{css}` should register a mapping"
+            );
+            assert_eq!(
+                ctx.running_mappings[0].parsed,
+                ParsedSelector::Compound(CompoundSelector {
+                    tag: Some("section".into()),
+                    parts: vec![SelectorPart::Attr {
+                        name: "data-role".into(),
+                        test: test.map(|(op, v)| (op, v.to_string())),
+                    }],
+                }),
+                "for `section{css}`"
+            );
+        }
+    }
+
+    /// A case-sensitivity flag changes *which* elements match, so an
+    /// attribute selector carrying one is rejected rather than matched
+    /// case-sensitively — hiding the wrong elements is worse than not
+    /// hiding at all.
+    #[test]
+    fn test_attribute_selector_with_case_flag_is_rejected() {
+        let ctx = parse_gcpm("section[data-role=\"hdr\" i] { position: running(h); }");
+        assert!(ctx.running_mappings.is_empty());
+    }
+
+    #[test]
+    fn test_tag_after_qualifier_is_rejected() {
+        // `.foo section` is a descendant combinator, not a compound.
+        let ctx = parse_gcpm(".foo section { position: running(h); }");
+        assert!(ctx.running_mappings.is_empty());
     }
 
     // --- page-size error paths (lines 336, 355-357, 363) ---

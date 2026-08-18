@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!--
+  Repro 9's control — identical to `09-gcpm-compound-selector.html` in every
+  respect but the selector that carries `position: running(rh)`, which here is
+  the bare class the parser always accepted.
+
+  The property under test is that the two files lay out identically. WeasyPrint
+  69 produces the same output for both; fulgur did not, and now does.
+-->
+<html><head><meta charset="utf-8"><title>GCPM on a bare class selector (control)</title><style>
+@page { size: A4; margin: 20mm; @top-center { content: element(rh); } }
+body { margin: 0; font: 10pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+.hdr { position: running(rh); height: 24pt; }
+p { margin: 0 0 6pt 0; }
+</style></head><body>
+<section class="hdr">RUNHEAD</section>
+<p>BODY-FIRST</p>
+<p>body b</p>
+<p>body c</p>
+</body></html>

@@ -1,7 +1,7 @@
 # paperworx repros
 
-Four defects found while evaluating fulgur as a PDF engine for
-[paperworx](https://github.com/StudioMaak/paperworx), 2026-08-16. Each was measured
+Defects found while evaluating fulgur as a PDF engine for
+[paperworx](https://github.com/StudioMaak/paperworx), 2026-08-16 onward. Each was measured
 against WeasyPrint 69 and Chrome 151 (headless-shell) on identical input; both of those
 agree with each other, so they are the reference.
 
@@ -17,6 +17,10 @@ Intent: fix here, then offer upstream as separate PRs.
 | 6 | `<tfoot>` before `<tbody>` renders at the top of the table | `scripts/refdiff/fixtures/table-tfoot-source-order.html` | real, single-page | **fixed** |
 | 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
 | 8 | `@font-face` with a `data:` URI is ignored; text silently falls back to a system font | `08-fontface-data-uri.html` | **dangerous** | **open** |
+| 9 | A GCPM construct on anything but a bare tag/class/id selector is dropped silently | `09-gcpm-compound-selector.html` | **blocks NBB** | **fixed** |
+| 10 | `vertical-align` is inert on an inline-block | `10-vertical-align-inline-block.html` | real | **open** |
+| 11 | `margin-top` after a *forced* break is truncated to zero | `11-margin-after-forced-break.html` | real | **open** |
+| 12 | `position: absolute` is ignored once the element is not a direct child of `<body>` | `12-absolute-bottom-nested.html` | real | **open** |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -541,3 +545,212 @@ failure there — a body-direct child would have to recurse on page 0 *and* have
 its internal break land within the body offset of the bottom — so it is
 deliberately left alone rather than changed speculatively without a failing
 test.
+
+## 9 — fixed; and the "cumulative vertical drift" was four defects, none of them cumulative
+
+Found while chasing the vertical disagreement between fulgur and production on a real
+NBB filing (VOL-kap, 66 pages, A4). The disagreement is real and it does grow down the
+page, but **it does not accumulate** — it is four independent defects whose errors happen
+to be positive in the upper half of page 1. Only this item is fixed here; 10, 11 and 12
+are each isolated to a one-variable repro and left open.
+
+### The measurement was reading the wrong number
+
+`pdftotext -bbox`'s `yMin` is *baseline − ascent*, and the two engines declare different
+ascents for the same font: Chrome writes hhea (Liberation Sans `1854/2048` = 0.905em),
+krilla writes OS/2 typo (`1491/2048` = 0.728em). At 9pt that is a **constant +0.56mm** on
+every fulgur `yMin`, present even where the two engines agree exactly.
+
+The originally reported page-1 progression — +0.50 / +0.88 / +2.33 / **+3.91mm** — is that
+constant plus the real error. Comparing true baselines instead (`mutool draw -F stext`
+reports the glyph origin and the font size directly) gives:
+
+| word y (Chrome) | reported Δ | true baseline Δ |
+|---|---|---|
+| 20.5mm | +0.50 | −0.09 |
+| 31.1mm | +0.88 | +0.18 |
+| 133.7mm | +2.33 | +1.76 |
+| 190.0mm | +3.91 | +3.35 |
+
+More usefully, the true-baseline series **is not monotonic**. Down page 1 it runs
++0.18 → +0.18 → **+2.56** → +0.18 → **+2.82** → +0.97 → **+3.35** → +0.71. It rises and
+returns. Nothing is accumulating; specific *structures* are misplaced and the flow
+re-syncs after each one. That is what killed the line-pitch hypothesis, and it is why
+zipping word lists produced a plausible-looking ramp: it averages localized errors of
+different sizes into a trend.
+
+**Use `mutool draw -F stext` for vertical comparisons, not `pdftotext -bbox`.** It reports
+the baseline (`y=`) and the font size, so nothing depends on what either writer put in the
+font descriptor. `pdftotext -bbox` stays fine for horizontal work, which is why the
+0.02–0.07mm horizontal agreement held up.
+
+### Root cause of item 9
+
+`GcpmSheetParser::parse_prelude` accepted exactly one bare simple selector — a tag, a
+class, or an id — and returned `Ok(None)` for everything else, which makes `parse_block`
+skip the rule without recording a mapping or a CSS edit. Silently.
+
+The filing declares its running header the way a themed document does:
+
+```css
+section[data-section="nbb-page-header"] { position: running(nbbrh); padding-bottom: 7.5pt }
+```
+
+That is an attribute selector, so `position: running(nbbrh)` was never seen. The
+consequences compound:
+
+- `@top-center { content: element(nbbrh) }` had nothing to draw, on any page.
+- The 52 source `<section>`s were never taken out of the flow. Each is 23.1pt tall
+  (`15.6pt` inline-block + `7.5pt` padding), so every one of them printed in the body and
+  pushed the rest of its page down by **8.11mm** — measured on page 2, against a header
+  height of 8.15mm.
+
+`.rh { position: running(rh) }` — the shape every fixture in this repo and every earlier
+repro used — worked perfectly, which is exactly why this survived to a real document.
+
+### Measured on the filing
+
+Both references were re-measured on the same generated HTML. WeasyPrint 69 agrees with
+Chrome + Paged.js to **0.2mm** on page-2 body text, so on this document the polyfill's
+body placement is not in question and the two references are as usual jointly the
+reference.
+
+| build | pages | pages carrying the running header | of which inside the top margin band |
+|---|---|---|---|
+| Chrome 151 + Paged.js | 66 | 65 | **65** |
+| WeasyPrint 69 | 68 | 68 | **68** |
+| fulgur before | 67 | 52 | **0** |
+| fulgur after | 70 | 69 | **69** |
+
+Before the fix the header appeared 52 times — once per source section, in the body,
+never in a margin band. After it, 69 of 70 pages carry it in the band, which is the shape
+both references produce.
+
+Page-2 body text moves from **+8.11mm** against Chrome to **−3.0mm**, and the residual
+is item 11 (`section[data-section="nbb-sectie-2-1"] section[data-section="nbb-titelbox"]
+{ margin-top: 8.6pt }` = 3.03mm, truncated at the forced break above it).
+
+**The page count got further from Chrome, and that is the fix working.** 67 was a
+coincidence: roughly 1.5 pages of running-header sections wrongly in the flow were
+cancelling pages fulgur was under-producing elsewhere. Removing the wrong content leaves
+70 against WeasyPrint's 68 — a real 2-page residual that items 10–12 have to account for
+before the count can be trusted.
+
+### The fix
+
+`ParsedSelector` gains a `Compound` variant: an optional type selector plus any number of
+`.class` / `#id` / `[attr]` qualifiers on the same element. That is the whole of what a
+selector can say about one element without a combinator, so it is the natural stopping
+point — and it needs no tree walk, which is what `selector_matches` and the injected
+`display:none` rule both rely on.
+
+Three details are load-bearing:
+
+- **The bare forms still reduce to `Tag` / `Class` / `Id`.** A `.foo` arriving as a
+  one-part `Compound` would still match, but every existing assertion on
+  `ParsedSelector::Class` would break and the injected CSS would gain needless nesting.
+  Pinned by `test_bare_selectors_still_reduce_to_simple_variants`.
+- **An attribute selector carrying a case-sensitivity flag (`[a=b i]`) is rejected, not
+  matched case-sensitively.** The flag changes *which* elements match, and this selector
+  is re-emitted as a `display:none` rule — matching more elements than the author wrote
+  would hide the wrong ones. Same reasoning for a namespace.
+- **Unsupported preludes are no longer silent.** Combinators and selector lists still
+  cannot be represented; when the block they introduce carries a paged-media-only
+  declaration (`position: running()`, `string-set`, `bookmark-*`) the parser now
+  `log::warn!`s with the offending selector text. `content` and `counter-*` are
+  deliberately excluded — they are ordinary CSS and would fire on every stylesheet.
+
+`selector_to_css` replaces the two hand-written match arms that rebuilt a selector for
+`build_running_hide_css` and `build_static_content_css`, so the injected rule and the
+matcher cannot drift apart.
+
+### A unit test had encoded the limitation
+
+`test_compound_selector_block_is_drained` asserted that `.foo.bar { position:
+running(header) }` registers *nothing*. That was the defect stated as expected behaviour —
+the fifth such case in this fork. It was not simply regenerated: `.foo.bar` was rendered
+through WeasyPrint 69 first, which puts the running element in the margin box and takes it
+out of the flow, and fulgur now matches it (RUNHEAD at 10.85mm against 11.40mm, the usual
+font-metric residual). The test was then rewritten as
+`test_unsupported_selector_block_is_drained` over a descendant combinator, which is
+genuinely still unsupported, so the drain-and-continue behaviour it covers stays pinned —
+plus `test_selector_list_block_is_drained` for the other unsupported shape.
+
+### Verification
+
+`crates/fulgur/tests/gcpm_compound_selector.rs` — four tests, three of which were verified
+to fail against the build before the fix. The sharpest is the property rather than a
+coordinate: `the_selector_shape_does_not_change_the_layout` renders the same document
+through six selector shapes and requires byte-identical page counts, margin-band counts
+and body y-positions against the `.hdr` control. That is what WeasyPrint does, and the
+thing the defect actually broke.
+
+Plus ten unit tests on the parser covering every attribute operator, the case-flag
+rejection, the compound reduction rule, and both unsupported shapes.
+
+**No golden moved, and that was checked rather than assumed.** Every GCPM construct in
+this repo — eight VRT fixtures, two examples, the refdiff fixture, repro 1 — is declared
+on a bare `.class`, `h1`, `h2` or `h3`, all of which still reduce to the same simple
+variant. `fulgur-vrt` was run in `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8 and passes
+byte-exact.
+
+## 10, 11, 12 — isolated, not fixed
+
+These three are what remains of the filing's vertical disagreement. Each has a
+one-variable repro measured against WeasyPrint 69; none is a pagination defect, and none
+of them is cumulative.
+
+**10 — `vertical-align` is inert on an inline-block.** fulgur produces byte-identical
+output for `middle`, `baseline` and `top`, so no value of the property does anything. The
+error grows with the box: 0.00mm at a 10pt box, +3.67mm at a 30pt one. This is what page 1
+of the filing measures — its form rows put 15.7–18.4pt bordered inline-blocks on
+`vertical-align: middle`, and they sit 1.8–3.4mm low. It is the one that fails the ±1%
+gate on page 1 by itself (2.97mm), and fixing item 9 does not touch it.
+
+Note fulgur does not agree with WeasyPrint's `baseline` either, so "implement the missing
+values" is likely not the whole story — the line box's own height model wants measuring
+first. CLAUDE.md already records that `display:table-cell` + `vertical-align:middle`
+silently does nothing, which is plausibly the same gap seen from the other side.
+
+**11 — `margin-top` after a forced break is truncated to zero.** css-break-3 §5.4
+truncates margins adjoining an *unforced* break; at a forced break they are retained, and
+both references retain them. Worth **−3.0mm** at every section opening in the filing, and
+the repro is font-independent (every length an explicit `pt`).
+
+**12 — `position: absolute` is ignored once the element is not a direct child of
+`<body>`.** One unstyled wrapping `<section>` is the whole difference between fulgur
+pinning the block correctly (282.22mm) and dropping it at its flow position (71.35mm).
+A static ancestor is not a containing block, so the wrapper cannot matter — WeasyPrint
+puts it in the same place either way. In the filing this puts the page-1 footnotes 28mm
+high, overlapping the signature table.
+
+### What is *not* a defect here
+
+The running **header**'s own placement. fulgur puts it at 19.05mm on page 2 against
+WeasyPrint's 17.74 and Paged.js's 17.46. That is the margin-box vertical box model
+recorded in CLAUDE.md, already verified against native Chrome and WeasyPrint across all
+sixteen slots, and it is a migration consideration rather than part of this work.
+
+The footer margin box is likewise fine — 284.27mm against Chrome's 283.99/283.73.
+
+### Reproducing the filing
+
+The corpus is paperworx template XML, not HTML; generate through paperworx's own harness.
+
+```bash
+cd .../paperworx/templates/nbb-jaarrekening/tools
+npx tsx local-render.mts /tmp/vol-kap.html vol-kap
+node printpdf.mjs /tmp/vol-kap.html /tmp/vol-kap-chrome.pdf
+```
+
+`local-render.mts` wants Liberation Sans at `/tmp/liberation-fonts-ttf-2.1.5/`. **Pass
+those fonts to fulgur explicitly** — without `-f` it ignores the HTML's `@font-face`
+`data:` URI and substitutes Helvetica (item 8), which invalidates every position measured.
+Confirm before trusting a number:
+
+```bash
+mutool clean -d out.pdf /tmp/c.pdf && grep -a -o "/BaseFont */[A-Za-z0-9+-]*" /tmp/c.pdf | sort -u
+```
+
+Both engines legitimately embed Helvetica *as well as* LiberationSans on this document, so
+the check is that LiberationSans is present, not that Helvetica is absent.

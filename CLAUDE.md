@@ -177,7 +177,8 @@ repeat theads. WeasyPrint's `layout/table.py` is the reference worth reading.
 
 `cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).
 The "~340 unit tests" figure in Common Commands above is long stale. `cargo test -p fulgur`
-adds ~30 integration binaries — 2468 passing in total.
+adds ~30 integration binaries — 2468 passing at the fork point, **2533 / 0 failed / 2
+ignored** as of repro 9.
 
 **`fulgur-vrt` needs `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8** — that is the only
 environment its byte-exact goldens reproduce in. Measured:
@@ -235,7 +236,24 @@ hypothesis, and corrected two confident-but-wrong claims.
 uvx --from weasyprint weasyprint in.html out-weasy.pdf     # reference A
 cargo run -p fulgur-cli -- render -o out-ful.pdf in.html   # subject
 pdftotext -bbox -f 1 -l 1 out.pdf -                        # xMin/yMin in pt; × 25.4/72 = mm
+mutool draw -F stext -o - -i out.pdf 1                     # baselines — use this for vertical
 ```
+
+**Compare baselines, not `pdftotext -bbox`, for anything vertical.** `yMin` is
+*baseline − ascent*, and the writers disagree about the ascent: Chrome declares hhea
+(Liberation Sans 0.905em), krilla declares OS/2 typo (0.728em). That is a **constant
++0.56mm on every fulgur `yMin` at 9pt**, present where the engines agree exactly, and it
+inflated a reported page-1 error series from −0.09/+0.18/+1.76/+3.35mm to
++0.50/+0.88/+2.33/+3.91 — enough to look like a ±1% failure that was not there. `mutool
+draw -F stext` reports the glyph origin (`y=`) and the font size directly, so nothing
+depends on either font descriptor. `-bbox` is still right for horizontal work.
+
+**A monotonic-looking ramp built by zipping two word lists is not evidence of
+accumulation.** Zipping misaligns as soon as pagination diverges, and averages localized
+errors of different sizes into a trend. Match like for like — same page, same word — and
+check whether the series *returns*: paperworx repro 9's did, on every third line, which
+is what disproved a per-line-advance hypothesis and turned one "cumulative drift" into
+four independent defects.
 
 Chrome 151: `~/.cache/puppeteer/chrome-headless-shell/mac_arm-151.0.7922.71/` via
 `puppeteer-core`, `headless: 'shell'`, viewport 1920×1080. The driver script must sit in a
