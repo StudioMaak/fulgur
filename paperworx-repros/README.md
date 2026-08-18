@@ -258,15 +258,39 @@ the engine never produces — worse than a failure, since nothing would have pro
 decision. It now goes through `parse_with_section_order_pass`, and both it and the
 rewritten positive case were verified to fail with the pass disabled.
 
-### Known limitation: structural selectors re-match
+### Structural selectors still match source order
 
-The pass moves DOM nodes, so a selector that depends on section position re-matches
-against the moved order, where a browser matches source order and reorders only boxes.
-Measured: with `<tfoot>` written first, `table > tbody:nth-child(3) td {padding-left:
-40pt}` applies in WeasyPrint (first cell at `xMin` 102.7) and no longer does in fulgur
-(65.7). It fires only on documents that are misordered to begin with — a table already
-written in visual order is never touched — and reordering Blitz's generated boxes
-instead of the DOM is not reachable from the adapter.
+A browser reorders *boxes* and leaves the DOM alone, so `:nth-child` keeps counting
+source positions. Moving DOM nodes through `DocumentMutator` does not: it marks the
+parent `RestyleHint::restyle_subtree()`, so the next resolve re-matches against the
+moved order. Measured on `table > tbody:nth-child(3) td {padding-left: 40pt}` with
+`<tfoot>` written first — the rule applies in WeasyPrint (first cell at `xMin` 102.7)
+and, in the first cut of this fix, no longer did in fulgur (65.7).
+
+Fixed by separating the two things the mutator conflates. The pass resolves the cascade
+first, then reorders by rewriting `Node::children` directly — no restyle marking — so
+box construction walks the new order while the styles keep the ones matched against the
+old one. fulgur now puts that cell at 102.4, the usual font-metric residual from
+WeasyPrint's 102.7, with the footer still at the bottom.
+
+Two consequences worth knowing:
+
+- **The pass runs last**, immediately before the engine's `resolve()`. Anything that
+  injects CSS after it — the GCPM hide rule, `counter_css`, static pseudo content —
+  would dirty the stylist and re-cascade against the moved order. Its own internal
+  resolve flushes those stylesheets *before* the reorder, leaving the engine's resolve
+  with nothing to restyle. Pinned by
+  `injected_css_does_not_re_cascade_against_the_moved_order`, measured on a document
+  carrying counters, `::before` content and a margin box at once.
+- **It depends on blitz-dom rebuilding the box tree on every resolve**, which
+  `resolve_layout_children` does under `NON_INCREMENTAL` — blitz-dom 0.2.4's default,
+  since its `incremental` feature is off and fulgur does not enable it. The damage
+  constants that would let the pass request a rebuild explicitly live in a private
+  module and cannot be named from outside the crate. If that ever changes the reorder is
+  simply ignored and the footer returns to the top, which the tests fail loudly on.
+
+Running the pass last also means counters and bookmarks are harvested in source order,
+which is what CSS specifies — they traverse the element tree, not the box tree.
 
 Out of scope, and for the same reason as always — the references disagree with each
 other, so there is no reference to build against: a `<div style="display:
@@ -281,9 +305,9 @@ class, fulgur omitting the footer on 2 of 3 pages — and now rates it `PACKING`
 font-metric class its two sibling table fixtures already sat in. That was the last
 `MISSING` row in the harness.
 
-Covered by `crates/fulgur/tests/table_section_order.rs` (7 tests; 6 verified to fail
-before the fix, the seventh being the control that must not regress) and ten unit tests
-on the pass itself. The sharpest is the property, not a coordinate:
+Covered by `crates/fulgur/tests/table_section_order.rs` (10 tests, each verified to
+fail against the build before it, bar the two controls that must not regress) and ten
+unit tests on the pass itself. The sharpest is the property, not a coordinate:
 `source_order_of_the_sections_does_not_change_the_output` renders both orderings and
 requires every drawn run to match exactly — which is what WeasyPrint does, and the
 thing the defect actually broke.

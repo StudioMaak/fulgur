@@ -104,6 +104,21 @@ fn pages_of(runs: &[(u32, f32)]) -> std::collections::BTreeSet<u32> {
     runs.iter().map(|&(p, _)| p).collect()
 }
 
+/// Leftmost x of any run drawn at `size`. `x` is sound in `inspect` output —
+/// it is `width` that is a fake estimate.
+fn min_x_at_size(pdf: &[u8], size: f32) -> f32 {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("out.pdf");
+    std::fs::write(&path, pdf).expect("write pdf");
+    inspect(&path)
+        .expect("inspect must succeed")
+        .text_items
+        .iter()
+        .filter(|t| (t.font_size - size).abs() < 0.01)
+        .map(|t| t.x)
+        .fold(f32::INFINITY, f32::min)
+}
+
 /// The property, stated as WeasyPrint satisfies it: the two source
 /// orderings must render identically — not merely "the footer ends up low
 /// enough". This is the assertion the whole change exists to make true.
@@ -282,4 +297,120 @@ fn only_the_first_header_and_footer_group_are_promoted() {
         hb > fa,
         "the first `<tfoot>` is demoted to the very bottom of the table"
     );
+}
+
+/// The reorder must not be visible to selectors. A browser reorders *boxes*
+/// and leaves the DOM alone, so `:nth-child` keeps counting source
+/// positions — with `<tfoot>` written first the `<tbody>` is child 3, and
+/// stays child 3 no matter where its rows are drawn.
+///
+/// Measured on this exact document: WeasyPrint 69 applies the
+/// `:nth-child(3)` rule (first body cell at `xMin` 102.69) and fulgur now
+/// does too (102.44, the usual font-metric residual). Before the pass
+/// separated cascade from box order it did not (65.69) — the reorder had
+/// shifted the `<tbody>` to child 2.
+///
+/// Asserted from both sides, since only the pair rules out the trivial
+/// explanations: `:nth-child(3)` must apply, and `:nth-child(2)` — the
+/// position the `<tbody>` would occupy if selectors saw the moved order —
+/// must not.
+#[test]
+fn the_reorder_is_invisible_to_structural_selectors() {
+    let sections = format!("{HEAD}{FOOT}<tbody>{}</tbody>", rows(6));
+    let indented = |nth: usize| {
+        let html = table(&sections).replace(
+            "</style>",
+            &format!("table > tbody:nth-child({nth}) td {{ padding-left: 40pt }}</style>"),
+        );
+        min_x_at_size(&render(&html), BODY_PT)
+    };
+    let plain = min_x_at_size(&render(&table(&sections)), BODY_PT);
+
+    let source_position = indented(3);
+    assert!(
+        source_position > plain + 30.0,
+        "`tbody:nth-child(3)` matches the source position and must apply: \
+         indented body starts at {source_position}, unstyled at {plain}"
+    );
+
+    let moved_position = indented(2);
+    assert!(
+        (moved_position - plain).abs() < 0.01,
+        "`tbody:nth-child(2)` is the position the reorder would move the \
+         `<tbody>` to; selectors must not see it. Got {moved_position} \
+         against the unstyled {plain}"
+    );
+}
+
+/// The companion property: reordering must not disturb the cascade of a
+/// table that was *already* in visual order, where the `<tbody>` is child 2
+/// in both source and box order.
+#[test]
+fn a_table_already_in_order_keeps_its_structural_matching() {
+    let sections = format!("{HEAD}<tbody>{}</tbody>{FOOT}", rows(6));
+    let html = table(&sections).replace(
+        "</style>",
+        "table > tbody:nth-child(2) td { padding-left: 40pt }</style>",
+    );
+    let plain = min_x_at_size(&render(&table(&sections)), BODY_PT);
+    let indented = min_x_at_size(&render(&html), BODY_PT);
+    assert!(
+        indented > plain + 30.0,
+        "`tbody:nth-child(2)` must still apply to a well-formed table: \
+         indented body starts at {indented}, unstyled at {plain}"
+    );
+}
+
+/// The same, for a document that also injects CSS.
+///
+/// This is the case that fixes the pass's position in the pipeline. GCPM
+/// counters, static pseudo content and the running-element hide rule are all
+/// delivered by `InjectCssPass`, which dirties the stylist — so a resolve
+/// after them re-cascades, and if the reorder had already happened it would
+/// re-cascade against the *moved* order. The pass runs last and resolves
+/// internally, which flushes those stylesheets before it reorders and leaves
+/// the engine's own resolve with nothing to restyle.
+///
+/// Measured on this document: WeasyPrint 69 puts the first body cell at
+/// `xMin` 102.69 with the footer below the last row; fulgur puts it at
+/// 102.44 with the same ordering.
+#[test]
+fn injected_css_does_not_re_cascade_against_the_moved_order() {
+    let sections = format!("{HEAD}{FOOT}<tbody>{}</tbody>", rows(6));
+    let with_gcpm = |extra: &str| {
+        table(&sections)
+            .replace(
+                "@page { size: A4; margin: 20mm }",
+                "@page { size: A4; margin: 20mm; @bottom-center { content: counter(page) } }\
+                 body { counter-reset: sec } h2 { counter-increment: sec }\
+                 h2::before { content: \"S\" counter(sec) \" \" }",
+            )
+            .replace("</style>", &format!("{extra}</style>"))
+            .replace("<body>", "<body><h2>Heading</h2>")
+    };
+    let plain = min_x_at_size(&render(&with_gcpm("")), BODY_PT);
+    let indented = min_x_at_size(
+        &render(&with_gcpm(
+            "table > tbody:nth-child(3) td { padding-left: 40pt }",
+        )),
+        BODY_PT,
+    );
+    assert!(
+        indented > plain + 30.0,
+        "`tbody:nth-child(3)` must still match the source position when GCPM \
+         CSS is injected: indented body starts at {indented}, unstyled at {plain}"
+    );
+
+    // ...and the reorder itself must still have happened.
+    let pdf = render(&with_gcpm(""));
+    let foot = runs_at_size(&pdf, FOOT_PT);
+    let body = runs_at_size(&pdf, BODY_PT);
+    let lowest_body = body.iter().map(|&(_, y)| y).fold(f32::INFINITY, f32::min);
+    assert!(!foot.is_empty(), "the footer must be drawn");
+    for &(_, y) in &foot {
+        assert!(
+            y < lowest_body,
+            "footer at y={y} must still sit below the lowest body row at y={lowest_body}"
+        );
+    }
 }

@@ -1701,32 +1701,53 @@ fn collect_misordered_section_tables_recursive(
     }
 }
 
-/// Move `node_id` so it becomes the last child of `parent_id`.
+/// Reorder `table_id`'s children so `head` is first and `foot` is last,
+/// leaving every other child — text nodes included — in relative order.
 ///
-/// Removes before re-inserting because `Mutator::append_children` cannot
-/// move a node within its *own* parent: it appends the id and then runs
-/// `old_parent.children.retain(|id| *id != child_id)` on what is the same
-/// node, which strips the freshly appended copy along with the original and
-/// drops the child out of the tree. `remove_node` leaves the node in the
-/// slab (only `remove_and_drop_node` frees it), so this is the supported
-/// re-parenting path and keeps Blitz's restyle / damage marking intact.
-fn move_to_last_child(doc: &mut HtmlDocument, parent_id: usize, node_id: usize) {
-    let mut mutator = doc.mutate();
-    mutator.remove_node(node_id);
-    mutator.append_children(parent_id, &[node_id]);
-}
-
-/// Move `node_id` so it becomes the first child of `parent_id`. See
-/// [`move_to_last_child`] for why the node is removed first.
-fn move_to_first_child(doc: &mut HtmlDocument, parent_id: usize, node_id: usize) {
-    let anchor = doc
-        .get_node(parent_id)
-        .and_then(|n| n.children.iter().copied().find(|&id| id != node_id));
-    let mut mutator = doc.mutate();
-    mutator.remove_node(node_id);
-    match anchor {
-        Some(anchor_id) => mutator.insert_nodes_before(anchor_id, &[node_id]),
-        None => mutator.append_children(parent_id, &[node_id]),
+/// Writes `Node::children` directly instead of going through
+/// `DocumentMutator`, and that is the whole point: a mutator move marks the
+/// parent `RestyleHint::restyle_subtree()`, so the next `resolve()`
+/// re-matches selectors against the *moved* order, where a browser matches
+/// source order and reorders only boxes. Rewriting the vec in place changes
+/// what box construction walks without telling Stylo anything, so the
+/// cascade this pass just computed — in source order — is the one that
+/// survives. See [`TableSectionOrderPass`] for the ordering rules and for
+/// what this buys.
+///
+/// Safe because `children` is the tree's only record of child order:
+/// `Node` caches no child index (`index_of_child` searches the vec), and the
+/// reorder adds and removes nothing, so every parent pointer, id-map entry
+/// and computed style stays valid.
+///
+/// **Depends on blitz-dom rebuilding the box tree on every resolve.**
+/// `resolve_layout_children` rebuilds unconditionally under
+/// `NON_INCREMENTAL`, which is blitz-dom 0.2.4's default (its `incremental`
+/// feature is off, and fulgur does not enable it); the damage constants that
+/// would let this pass ask for a rebuild explicitly live in a private module
+/// and cannot be named from here. If that ever changes, the reorder is
+/// ignored and the footer renders at the top again — which
+/// `tests/table_section_order.rs` fails loudly on rather than letting it
+/// pass silently.
+fn reorder_table_children(
+    doc: &mut HtmlDocument,
+    table_id: usize,
+    head: Option<usize>,
+    foot: Option<usize>,
+) {
+    let Some(table) = doc.get_node_mut(table_id) else {
+        return;
+    };
+    if let Some(head_id) = head {
+        if let Some(pos) = table.children.iter().position(|&id| id == head_id) {
+            let id = table.children.remove(pos);
+            table.children.insert(0, id);
+        }
+    }
+    if let Some(foot_id) = foot {
+        if let Some(pos) = table.children.iter().position(|&id| id == foot_id) {
+            let id = table.children.remove(pos);
+            table.children.push(id);
+        }
     }
 }
 
@@ -1763,13 +1784,17 @@ fn move_to_first_child(doc: &mut HtmlDocument, parent_id: usize, node_id: usize)
 /// `display: none` *table* is skipped outright — it draws nothing, so the
 /// move would be pure restyle cost.
 ///
-/// **Known limitation:** the pass moves DOM nodes, so a structural selector
-/// that depends on section position (`tbody:nth-child(3)`, `tfoot + tbody`)
-/// re-matches against the moved order, where a browser matches source order
-/// and reorders only boxes. It fires only on documents that are misordered
-/// to begin with — a table already written in visual order is never
-/// touched — and the alternative, reordering Blitz's generated boxes, is
-/// not reachable from the adapter.
+/// A browser reorders *boxes* and leaves the DOM alone, so a structural
+/// selector still matches source order: with `<tfoot>` written first,
+/// `table > tbody:nth-child(3)` matches the `<tbody>` in both references.
+/// This pass reproduces that by separating the two — it resolves the cascade
+/// *before* touching anything, and then reorders via
+/// [`reorder_table_children`], which rewrites `Node::children` without
+/// marking a restyle, so box construction walks the new order while the
+/// styles keep the ones matched against the old one. That split is also why
+/// the pass runs last in `engine.rs`, immediately before the engine's own
+/// `resolve()`: anything that injects CSS afterwards would dirty the stylist
+/// and re-cascade against the moved order.
 pub struct TableSectionOrderPass;
 
 impl DomPass for TableSectionOrderPass {
@@ -1792,24 +1817,14 @@ impl DomPass for TableSectionOrderPass {
                     .copied()
                     .find(|&id| table_section_group(doc, id) == Some(group))
             };
-            let head = first_of(TableSectionGroup::Header);
-            let foot = first_of(TableSectionGroup::Footer);
-
-            if let Some(head_id) = head {
-                if children.first() != Some(&head_id) {
-                    move_to_first_child(doc, table_id, head_id);
-                }
-            }
-            if let Some(foot_id) = foot {
-                // Re-read: promoting the header can change which element is
-                // last (`<tbody><tfoot><thead>` ends with the header until it
-                // moves), and appending a node that is already last would take
-                // the same remove / re-insert round trip for nothing.
-                let children = element_children(doc, table_id);
-                if children.last() != Some(&foot_id) {
-                    move_to_last_child(doc, table_id, foot_id);
-                }
-            }
+            // Only pass along a section that is not already at its edge, so
+            // a table that needs just one of the two moves keeps the other
+            // child exactly where it is.
+            let head = first_of(TableSectionGroup::Header)
+                .filter(|head_id| children.first() != Some(head_id));
+            let foot = first_of(TableSectionGroup::Footer)
+                .filter(|foot_id| children.last() != Some(foot_id));
+            reorder_table_children(doc, table_id, head, foot);
         }
     }
 }
