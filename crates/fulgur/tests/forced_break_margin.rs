@@ -203,3 +203,163 @@ fn a_margin_before_a_break_inside_avoid_relocation_is_still_truncated() {
          moved by {shift}pt"
     );
 }
+
+// ── `break-after: page` — the margin belongs to the *next* box ─────────────
+//
+// Under `break-before` the retained margin sits on the box carrying the
+// property. Under `break-after` it sits on a **different** box: the one that
+// starts the new page. The fragmenter therefore has to carry the decision to
+// the next iteration rather than read it at the break. Body level had this by
+// accident — its next iteration folds the inter-child gap, which equals the
+// next box's margin whenever the breaking box has no `margin-bottom` — but
+// the nested path rebased the page origin onto the child's own top and lost
+// it. The filing's shape is `a_display_none_sibling_is_not_the_box_after_the_break`,
+// and it was worth −3.0mm on every section opening.
+
+/// A zero-height `.pagebreak` div carrying `break-after: page`, inside a
+/// wrapper `<section>` so the break is taken by `fragment_block_subtree`.
+/// The margin is on the section that follows it.
+#[test]
+fn a_nested_break_after_retains_the_next_boxes_margin() {
+    let html = doc(
+        ".pagebreak { break-after: page; height: 0 } .gap { margin-top: MARGIN }",
+        "<p>PAGE1</p><section><div class=pagebreak></div>\
+         <section class=gap><p>PAGE2</p></section></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        (shift - MARGIN_PT).abs() < 0.5,
+        "the box after a nested forced `break-after` keeps its own \
+         block-start margin: page 2 must move down by {MARGIN_PT}pt, moved \
+         by {shift}pt"
+    );
+}
+
+/// The filing's exact shape. A `display: none` sibling sits between the break
+/// and the margined section, and generates no box — so it is not "the box
+/// after the break" whose margin §5.4 preserves. It still reaches the
+/// fragmenter as a zero-height child, which is why the retained margin is
+/// claimed past the zero-height branch rather than computed at the break.
+#[test]
+fn a_display_none_sibling_is_not_the_box_after_the_break() {
+    let html = doc(
+        ".pagebreak { break-after: page; height: 0 } \
+         .hidden { display: none } .gap { margin-top: MARGIN }",
+        "<p>PAGE1</p><section><div class=pagebreak></div>\
+         <section class=hidden><p>H</p></section>\
+         <section class=gap><p>PAGE2</p></section></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        (shift - MARGIN_PT).abs() < 0.5,
+        "a `display: none` sibling generates no box and must not absorb the \
+         retained margin: page 2 must move down by {MARGIN_PT}pt, moved by \
+         {shift}pt"
+    );
+}
+
+/// The same nested break with the margin on a bare `<p>` rather than a
+/// `<section>` — pins that the element type is not the variable.
+#[test]
+fn a_nested_break_after_retains_a_bare_paragraphs_margin() {
+    let html = doc(
+        ".pagebreak { break-after: page; height: 0 } .gap { margin-top: MARGIN }",
+        "<p>PAGE1</p><section><div class=pagebreak></div>\
+         <p class=gap>PAGE2</p></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        (shift - MARGIN_PT).abs() < 0.5,
+        "page 2 must move down by {MARGIN_PT}pt, moved by {shift}pt"
+    );
+}
+
+/// Control — the body-level shape, which was already correct. It is the only
+/// one of the four variants that was, and it is what made the nested defect
+/// look fixed.
+#[test]
+fn a_body_level_break_after_retains_the_next_boxes_margin() {
+    let html = doc(
+        ".pagebreak { break-after: page; height: 0 } .gap { margin-top: MARGIN }",
+        "<p>PAGE1</p><div class=pagebreak></div>\
+         <section class=gap><p>PAGE2</p></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        (shift - MARGIN_PT).abs() < 0.5,
+        "page 2 must move down by {MARGIN_PT}pt, moved by {shift}pt"
+    );
+}
+
+/// The mirror half of §5.4 for `break-after`: a `margin-bottom` on the box
+/// *carrying* the break adjoins it on the before side and is truncated.
+/// Folding the inter-child gap retained it instead, over-shifting page 2 by
+/// the full margin. WeasyPrint 69 leaves the page-2 baseline at 23.52mm
+/// whether or not that margin is present.
+#[test]
+fn a_margin_bottom_on_the_box_carrying_break_after_is_truncated() {
+    let html = doc(
+        ".pre { break-after: page; margin-bottom: MARGIN }",
+        "<p class=pre>PAGE1</p><section><p>PAGE2</p></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        shift.abs() < 0.5,
+        "a margin *before* a forced break is truncated: page 2 must not \
+         move, moved by {shift}pt"
+    );
+}
+
+/// The same, nested one level down.
+#[test]
+fn a_nested_margin_bottom_before_break_after_is_truncated() {
+    let html = doc(
+        ".pre { break-after: page; margin-bottom: MARGIN }",
+        "<p>PAGE1</p><section><p class=pre>MID</p>\
+         <section><p>PAGE2</p></section></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        shift.abs() < 0.5,
+        "page 2 must not move, moved by {shift}pt"
+    );
+}
+
+/// Control — the nested counterpart of
+/// `a_margin_at_an_unforced_break_is_still_truncated`. The block below is
+/// pushed to page 2 by overflow alone, inside a wrapper, so the relocation is
+/// decided by `fragment_block_subtree`. No break property appears anywhere.
+#[test]
+fn a_nested_margin_at_an_unforced_break_is_still_truncated() {
+    let html = doc(
+        ".gap { margin-top: MARGIN; height: 80mm }",
+        "<p>PAGE1</p><section><div style='height:200mm'></div>\
+         <section class=gap><p>PAGE2</p></section></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        shift.abs() < 0.5,
+        "a margin adjoining a nested unforced break is truncated to zero: \
+         page 2 must not move, moved by {shift}pt"
+    );
+}
+
+/// Control — the nested counterpart of
+/// `a_margin_before_a_break_inside_avoid_relocation_is_still_truncated`.
+/// `break-inside: avoid` is not a forced break (§4.3), so relocating the box
+/// truncates its margin even though the relocation happens inside the same
+/// function the `break-after` fix touches.
+#[test]
+fn a_nested_break_inside_avoid_relocation_is_still_truncated() {
+    let html = doc(
+        ".keep { break-inside: avoid; margin-top: MARGIN; height: 80mm }",
+        "<p>PAGE1</p><section><div style='height:200mm'></div>\
+         <section class=keep><p>PAGE2</p></section></section>",
+    );
+    let shift = page_two_shift(&html);
+    assert!(
+        shift.abs() < 0.5,
+        "`break-inside: avoid` is not a forced break: page 2 must not move, \
+         moved by {shift}pt"
+    );
+}

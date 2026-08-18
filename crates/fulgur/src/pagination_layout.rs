@@ -526,6 +526,14 @@ impl<'a> PaginationLayoutTree<'a> {
         // used page-name differs, we induce a forced break before it
         // (CSS Page 3 §5.3, "Using Named Pages").
         let mut prev_used_page: Option<Option<String>> = None;
+        // Set by every `break-after: page` advance below, consumed by the
+        // next in-flow child that generates a box. css-break-3 §5.4 keeps
+        // the margins *after* a forced break and truncates the ones before
+        // it, so that child takes its own collapsed block-start margin
+        // instead of the inter-child gap — the gap also carries the
+        // breaking box's `margin-bottom`, which is a margin before the
+        // break. See `retained_margin_after_forced_break`.
+        let mut margin_after_forced_break = false;
 
         for child_id in children {
             let Some(child) = self.doc.get_node(child_id) else {
@@ -681,6 +689,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 ) {
                     page_index += 1;
                     cursor_y = 0.0;
+                    margin_after_forced_break = true;
                 }
                 continue;
             }
@@ -691,7 +700,16 @@ impl<'a> PaginationLayoutTree<'a> {
             // Blitz's flow positions. `max(0.0)` guards against negative
             // gaps from sibling overlap (rare with default UA styles).
             let this_top_in_body = layout.location.y;
-            let gap = (this_top_in_body - prev_bottom_y_in_body).max(0.0);
+            // After a forced `break-after`, `gap` is entirely a margin
+            // adjoining that break: partly the breaking box's
+            // `margin-bottom` (truncated by §5.4) and partly this child's
+            // own `margin-top` (preserved). Only the second half survives,
+            // and Taffy reports it directly.
+            let gap = if std::mem::take(&mut margin_after_forced_break) {
+                retained_margin_after_forced_break(&layout)
+            } else {
+                (this_top_in_body - prev_bottom_y_in_body).max(0.0)
+            };
             cursor_y += gap;
 
             // fulgur-k0g0: read break-before / break-after / break-inside
@@ -806,6 +824,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 ) {
                     page_index += 1;
                     cursor_y = 0.0;
+                    margin_after_forced_break = true;
                 }
                 continue;
             }
@@ -910,6 +929,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 ) {
                     page_index += 1;
                     cursor_y = 0.0;
+                    margin_after_forced_break = true;
                 }
                 continue;
             }
@@ -1093,6 +1113,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 ) {
                     page_index += 1;
                     cursor_y = 0.0;
+                    margin_after_forced_break = true;
                 }
                 continue;
             }
@@ -1152,6 +1173,7 @@ impl<'a> PaginationLayoutTree<'a> {
             ) {
                 page_index += 1;
                 cursor_y = 0.0;
+                margin_after_forced_break = true;
             }
         }
 
@@ -2125,6 +2147,16 @@ fn fragment_block_subtree(
     let mut page_taffy_origin: f32 = 0.0;
     let mut origin_pending_target_y: Option<f32> = None;
     let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
+    // Set by every `break-after: page` advance below, consumed by the next
+    // child that generates a box on the new strip. It is deliberately NOT
+    // folded into `origin_pending_target_y`: that value is computed at the
+    // break, where the box whose margin §5.4 preserves is not yet known,
+    // and it is consumed by zero-height children — a `display: none`
+    // sibling generates no box, so it is not "the box after the break".
+    // This one is consumed past the `child_h <= 0.0` branch instead, which
+    // mirrors `fragment_pagination_root`, whose zero-height children
+    // `continue` before the gap fold for the same reason.
+    let mut margin_after_forced_break = false;
     // fulgur-uebl: tracks the previous in-flow sibling's used page-name
     // for implicit forced-break detection; see `fragment_pagination_root`
     // for the rationale and the outer-Option semantics.
@@ -2415,6 +2447,7 @@ fn fragment_block_subtree(
                 // Zero-height break-after: NEXT child is the first
                 // on the new page — defer origin rebase.
                 (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                margin_after_forced_break = true;
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -2431,6 +2464,18 @@ fn fragment_block_subtree(
         // this places them at the same page-local y; for sequential
         // block flow, it matches Taffy's stacked positions exactly.
         let mut child_page_y = page_start_y + (this_top_in_parent - page_taffy_origin);
+        // This child is the first box after a forced `break-after`, so it
+        // keeps its own collapsed block-start margin (css-break-3 §5.4).
+        // Taffy folds a margin that collapsed through into its parent, so
+        // `location.y` can be 0 here while `margin.top` still names the
+        // retained value — which is why the margin is read rather than
+        // derived from the sibling gap. `page_taffy_origin` moves with it
+        // so the following siblings keep their spacing.
+        if std::mem::take(&mut margin_after_forced_break) {
+            let retained = retained_margin_after_forced_break(&layout);
+            page_taffy_origin -= retained;
+            child_page_y += retained;
+        }
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
         // `gap + child_h`; for grid parallel siblings the cursor
@@ -2659,6 +2704,7 @@ fn fragment_block_subtree(
                 cursor_y = 0.0;
                 page_start_y = 0.0;
                 (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                margin_after_forced_break = true;
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -2793,6 +2839,7 @@ fn fragment_block_subtree(
             cursor_y = 0.0;
             page_start_y = 0.0;
             (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+            margin_after_forced_break = true;
         }
         if !is_float {
             prev_used_page = Some(used_end.clone());
