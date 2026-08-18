@@ -34,8 +34,10 @@ fn synthetic() -> String {
     let body: String = (0..400)
         .map(|i| format!("<p>Paragraph {i}: the quick brown fox jumps over the lazy dog, repeatedly and at length.</p>"))
         .collect();
-    format!("<!doctype html><html><head><style>@page{{size:A4;margin:20mm}}\
-             body{{font-family:'Liberation Sans';font-size:10pt}}</style></head><body>{body}</body></html>")
+    format!(
+        "<!doctype html><html><head><style>@page{{size:A4;margin:20mm}}\
+             body{{font-family:'Liberation Sans';font-size:10pt}}</style></head><body>{body}</body></html>"
+    )
 }
 
 fn stats(mut v: Vec<Duration>) -> (Duration, Duration, Duration) {
@@ -50,7 +52,10 @@ fn per_request_cost() {
         Ok(p) => std::fs::read_to_string(&p).expect("read bench html"),
         Err(_) => synthetic(),
     };
-    let n: usize = std::env::var("FULGUR_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+    let n: usize = std::env::var("FULGUR_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
 
     // Shared engine: fonts parsed once, as a Worker would at module scope.
     let engine = Engine::builder().assets(assets()).build();
@@ -75,10 +80,18 @@ fn per_request_cost() {
 
     let (s50, s95, smax) = stats(shared);
     let (f50, _, _) = stats(fresh);
-    println!("\ninput {:.0} KB -> pdf {:.0} KB, {n} iterations, single-threaded",
-        html.len() as f64 / 1024.0, pdf.len() as f64 / 1024.0);
+    println!(
+        "\ninput {:.0} KB -> pdf {:.0} KB, {n} iterations, single-threaded",
+        html.len() as f64 / 1024.0,
+        pdf.len() as f64 / 1024.0
+    );
     println!("  shared engine : p50 {s50:?}  p95 {s95:?}  max {smax:?}");
-    println!("  fresh engine  : p50 {f50:?}   (setup delta {:?})", f50.saturating_sub(s50));
-    println!("  => {:.1} requests/sec per single-threaded worker (p50, shared)",
-        1.0 / s50.as_secs_f64());
+    println!(
+        "  fresh engine  : p50 {f50:?}   (setup delta {:?})",
+        f50.saturating_sub(s50)
+    );
+    println!(
+        "  => {:.1} requests/sec per single-threaded worker (p50, shared)",
+        1.0 / s50.as_secs_f64()
+    );
 }

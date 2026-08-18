@@ -177,8 +177,8 @@ repeat theads. WeasyPrint's `layout/table.py` is the reference worth reading.
 
 `cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).
 The "~340 unit tests" figure in Common Commands above is long stale. `cargo test -p fulgur`
-adds ~30 integration binaries — 2468 passing at the fork point, **2533 / 0 failed / 2
-ignored** as of repro 9.
+adds ~30 integration binaries — 2468 passing at the fork point, **2585 / 0 failed / 4
+ignored** as of repros 10-12.
 
 **`fulgur-vrt` needs `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8** — that is the only
 environment its byte-exact goldens reproduce in. Measured:
@@ -225,6 +225,12 @@ Docker's 8 GB VM.
 
 **Do not gate on VRT from macOS.** It cannot see your change — 17 of its 29 local failures
 are font noise, and real regressions hide behind them.
+
+**Enumerate the goldens a change moves without running VRT**, by rendering every manifest
+fixture through the CLI with and without the change and diffing bytes. That works on
+macOS, it costs one build, and it is what lets parallel work report its blast radius
+before anyone regenerates anything. Repros 10-12 predicted 17 moving fixtures this way and
+the container named exactly those 17.
 
 ### Never trust a README over a measurement
 

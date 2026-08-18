@@ -13,7 +13,16 @@
 
     shape                       | WeasyPrint | fulgur
     direct child of <body>      |   282.70   | 282.22
-    wrapped in a static section |   282.70   |  71.35   <- its flow position
+    wrapped in a static section |   282.70   |  71.35   <- the wrapper's bottom
+
+  71.35mm is NOT the block's flow position, which an earlier version of this
+  note claimed. Measured with both insets `auto`, the static position is
+  75.58mm (WeasyPrint 76.19). 71.35 is the wrapper's bottom edge — Taffy
+  resolving `bottom: 0` against the immediate parent's box. So the inset was
+  mis-resolved, not dropped, and the two readings differ by only 4.2mm in this
+  fixture, which is what made them easy to conflate. `bottom: 50pt` on the same
+  element moves fulgur's output by exactly 50pt, which a dropped inset could
+  not do.
 
   On the NBB filing this is `section[data-section="s1-voetnoten"] { position:
   absolute; bottom: 0 }`, nested inside the section it belongs to: the

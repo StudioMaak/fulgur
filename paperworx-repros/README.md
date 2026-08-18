@@ -18,9 +18,12 @@ Intent: fix here, then offer upstream as separate PRs.
 | 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
 | 8 | `@font-face` is never loaded from an inline `<style>`; text silently falls back to a system font | `08-fontface-data-uri.html` | **dangerous** | **open** |
 | 9 | A GCPM construct on anything but a bare tag/class/id selector is dropped silently | `09-gcpm-compound-selector.html` | **blocks NBB** | **fixed** |
-| 10 | `vertical-align` is inert on an inline-block | `10-vertical-align-inline-block.html` | real | **open** |
-| 11 | `margin-top` after a *forced* break is truncated to zero | `11-margin-after-forced-break.html` | real | **open** |
-| 12 | `position: absolute` is ignored once the element is not a direct child of `<body>` | `12-absolute-bottom-nested.html` | real | **open** |
+| 10 | A margin on an atomic inline is invisible, and `vertical-align` is inert | `10-vertical-align-inline-block.html` | real | **fixed** |
+| 11 | A margin adjoining a *forced* break is truncated on the wrong side | `11-margin-after-forced-break.html` | real | **fixed** |
+| 12 | An ICB-anchored `position: absolute` resolves against its parent instead | `12-absolute-bottom-nested.html` | real | **fixed** |
+| 13 | A table's `min-height` surplus is apportioned to rows differently than Chrome | `13-table-min-height-distribution.html` | real | **open** |
+| 14 | A block taller than the page does not break for the line that follows it | — | real | **open** |
+| 15 | No first-baseline synthesis for a text-less `inline-grid` / `inline-flex` | `crates/fulgur-vrt/fixtures/layout/inline-grid-smoke.html` | real | **open** |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -718,44 +721,216 @@ on a bare `.class`, `h1`, `h2` or `h3`, all of which still reduce to the same si
 variant. `fulgur-vrt` was run in `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8 and passes
 byte-exact.
 
-## 10, 11, 12 — isolated, not fixed
+## 10, 11, 12 — fixed
 
-These three are what remains of the filing's vertical disagreement. Each has a
-one-variable repro measured against WeasyPrint 69; none is a pagination defect, and none
-of them is cumulative.
+All three were fixed in parallel, each in its own worktree, then integrated and
+re-verified together. They are independent in *code* — different subsystems, no merge
+conflict even where two of them edit `pagination_layout.rs` — but not in *verification*:
+all three move vertical positions, so the goldens and the filing's page count could only
+be judged on the merged tree. Golden regeneration was held until every fix had landed and
+happened once.
 
-**10 — `vertical-align` is inert on an inline-block.** fulgur produces byte-identical
-output for `middle`, `baseline` and `top`, so no value of the property does anything. The
-error grows with the box: 0.00mm at a 10pt box, +3.67mm at a 30pt one. This is what page 1
-of the filing measures — its form rows put 15.7–18.4pt bordered inline-blocks on
-`vertical-align: middle`, and they sit 1.8–3.4mm low. It is the one that fails the ±1%
-gate on page 1 by itself (2.97mm), and fixing item 9 does not touch it.
+### Measured on the filing, all three together
 
-Note fulgur does not agree with WeasyPrint's `baseline` either, so "implement the missing
-values" is likely not the whole story — the line box's own height model wants measuring
-first. CLAUDE.md already records that `display:table-cell` + `vertical-align:middle`
-silently does nothing, which is plausibly the same gap seen from the other side.
+Worst |Δbaseline| on the pages whose content both engines still agree on, and how many of
+the matched lines exceed the ±1% budget (2.97mm of A4 height):
 
-**11 — `margin-top` after a forced break is truncated to zero.** css-break-3 §5.4
-truncates margins adjoining an *unforced* break; at a forced break they are retained, and
-both references retain them. Worth **−3.0mm** at every section opening in the filing, and
-the repro is font-independent (every length an explicit `pt`).
+| | page 1 before | page 1 after | page 2 before | page 2 after |
+|---|---|---|---|---|
+| vs Chrome + Paged.js | **−28.13mm**, 13 of 47 over | **+0.97mm, 0 over** | **+9.70mm**, 19 of 19 over | **+0.30mm, 0 over** |
+| vs WeasyPrint 69 | **−28.10mm**, 9 of 45 over | **+0.64mm, 0 over** | **+8.41mm**, 16 of 16 over | **+0.33mm, 0 over** |
 
-**12 — `position: absolute` is ignored once the element is not a direct child of
-`<body>`.** One unstyled wrapping `<section>` is the whole difference between fulgur
-pinning the block correctly (282.22mm) and dropping it at its flow position (71.35mm).
-A static ancestor is not a containing block, so the wrapper cannot matter — WeasyPrint
-puts it in the same place either way. In the filing this puts the page-1 footnotes 28mm
-high, overlapping the signature table.
+Every matched line on the first two pages is now inside the budget against both
+references, several of them closer to Chrome than WeasyPrint is.
 
-### What is *not* a defect here
+**The page count is still 70 against Chrome's 66, and items 13–15 own that**, not these
+three. See below — the largest single contributor is item 13, and it is a case where the
+references disagree.
 
-The running **header**'s own placement. fulgur puts it at 19.05mm on page 2 against
-WeasyPrint's 17.74 and Paged.js's 17.46. That is the margin-box vertical box model
-recorded in CLAUDE.md, already verified against native Chrome and WeasyPrint across all
-sixteen slots, and it is a migration consideration rather than part of this work.
+### 10 — a margin on an atomic inline was invisible; `vertical-align` was inert
 
-The footer margin box is likewise fine — 284.27mm against Chrome's 283.99/283.73.
+Two mechanisms, and the second is the one that made the first visible.
+
+**Parley has no strut and no `vertical-align`.** `parley-0.6.0` folds an inline box's whole
+height into the line's ascent and emits `y = baseline − height`, so the box's bottom edge
+is always on the baseline. A line whose only content is inline boxes gets `ascent = max(box
+heights)`, `descent = 0` — measured directly on this repro's 30pt row: `line0 h=40.000
+baseline=40.000 asc=40.000 desc=0.000`, the baseline sitting at the *bottom* of the box.
+fulgur consumed that verbatim: it read no `vertical-align` at all, so all five keywords
+produced identical bytes, and the line's baseline sat about half a box-height too low —
+which is why the error grew with the box.
+
+The fix synthesises the CSS strut (`extract_strut_style` / `resolve_strut`, mirroring
+blitz-dom's `normal → 1.2 ×`) and places each box from its `vertical-align`
+(`paragraph::align_inline_boxes`), using the same two-phase shape the image path already
+used for `top`/`bottom`. The line box *height* was never wrong — CSS gives 13.902 / 20.934
+/ 29.334 / 40.0px against Parley's 13.8 / 20.933 / 29.333 / 40.0 — so nothing below the
+line box moves.
+
+**Then the box model.** `blitz-dom` builds Parley's inline box from the element's *margin*
+box, while every position fulgur records for the node is its *border* box. Before this
+work the two cancelled arithmetically (`(baseline − height) + (height − offset)` drops
+`height`), so the margin was invisible but harmless. `align_inline_boxes` does real
+arithmetic with both, and the mismatch became a visible shift — it regressed
+`review_card_inline_block`, whose chip carries `margin-top: 6pt`. Both axes now resolve
+through one accessor, `extract_inline_box_margins`.
+
+The inline axis was fixed in the same change, and it was found by the block axis moving a
+*sixth* VRT fixture: `svg/shapes`, whose `<svg style="margin:40px">` is an inline box too.
+Its paint origin was 56.693pt — the page margin alone, the SVG's own 40px = 30pt dropped —
+and is now **86.693pt on both axes, against WeasyPrint's 86.69292**. Fixing only the
+vertical would have handed us a golden correct on one axis and 30pt short on the other.
+
+**`vertical-align: bottom` is a references-disagree case.** On a probe where a
+`bottom`-aligned box grows 24pt → 48pt, Chrome 151 shifts the line's baseline by 24.000pt
+and WeasyPrint 69 by 0.000. fulgur follows Chrome. This is not academic: the filing's
+running header is `display: inline-block; vertical-align: bottom`, and production is
+Chrome. Do not "correct" it toward WeasyPrint. (The shape matters — on a line where every
+box carries the same `vertical-align`, the strut sets the line's bottom edge and both
+engines agree at 24.000. The disagreement needs a baseline-aligned item on the same line.)
+
+### 11 — a margin adjoining a forced break was truncated on the wrong side
+
+css-break-3 §5.4 is asymmetric: at a **forced** break the margins *before* it truncate and
+the margins *after* it are preserved. fulgur truncated both.
+
+**It had worked, and `git log` found the removal.** `25cac58a` shipped
+`cursor_y = if explicit_break_before { gap } else { 0.0 }`; 24 minutes later, in the same
+PR, `20f77475` narrowed it to a `page_filling_break_child` heuristic and shrank the
+covering test's fixture to fit — with a comment citing §5.4 as truncating both sides. The
+narrowing was defensible, because retaining `gap` over-preserves: the gap also carries the
+previous sibling's `margin-bottom`, which §5.4 *does* truncate.
+
+The right quantity was never the gap. `taffy::Layout::margin.top` holds exactly the "after"
+half — the box's own `margin-top` collapsed with whatever collapsed up out of its first
+in-flow children, and never the previous sibling's `margin-bottom`, which the parent
+applies separately. That handles the repro's collapse-through shape with no
+re-implementation of margin collapsing.
+
+**The first fix passed the repro and did not reach the filing.** It restored the margin
+where the retained value sits on the box *carrying* the break property. Under
+`break-after` it sits on a *different* box — the one that starts the new page — which the
+fragmenter does not know at the break. Body level survived on an accident:
+`fragment_pagination_root` folds the inter-child gap on the next iteration, and that gap
+equals the next box's own margin whenever the breaking box has no `margin-bottom`, which
+is true of a `.pagebreak { height: 0 }` div. `fragment_block_subtree` has no gap fold and
+discarded the margin outright. Four one-variable probes separated it:
+
+| shape | WeasyPrint | before | after |
+|---|---|---|---|
+| `break-after` at **body level** | 31.99 | 31.38 | 31.38 |
+| `break-after` **inside a wrapper** | 31.99 | **22.91** | **31.38** |
+| …plus a `display:none` sibling (the filing's shape) | 31.99 | **22.91** | **31.38** |
+| …margin on a bare `<p>` instead | 31.99 | **22.91** | **31.38** |
+| `margin-bottom` on the box carrying `break-after` | 23.52 | **31.38** | **22.91** |
+
+The last row is the mirror half, fixed by the same change: replacing the gap fold means a
+margin *before* the break stops being retained.
+
+Two details are load-bearing. A `display: none` sibling reaches the fragmenter as a
+zero-height child; it generates no box, so it is not "the box after the break", and the
+retained margin is claimed past the zero-height branch — otherwise three of the four
+probes pass and the filing's exact shape stays broken. And the breaking box reports
+`location.y == 0` while `margin.top == 32`, because the margin collapsed through its
+wrapper — anything derived from sibling positions reads zero there.
+
+Unforced breaks still truncate, pinned by nested controls for both an overflow relocation
+and a `break-inside: avoid` relocation, each green before and after.
+
+### 12 — an ICB-anchored absolute resolved against its parent
+
+**Mis-resolved, not dropped** — and distinguishing those two took measurement, because in
+this fixture they land 4.2mm apart. Taffy resolves an absolute child's insets against its
+*immediate parent's* box, which is the CSS answer only when that parent is the nearest
+positioned ancestor. Three independent lines settled it: the geometry dump shows
+`taffy_loc.y = 176.00 = 192 − 16`, i.e. `bottom: 0` against the 192px wrapper; the true
+static position (both insets `auto`) is 75.58mm, not the 71.35mm the block was drawn at;
+and `bottom: 50pt` moves the output by exactly 50pt, which a dropped inset could not do.
+
+`append_position_absolute_body_direct_fragments` already re-resolved against the initial
+containing block, but iterated `body.children` only, so anything deeper kept Taffy's
+number. It now collects every absolute with no positioned ancestor at any depth, skipping
+`fixed` subtrees (their own pass owns them) and `relative`/`sticky` subtrees (a real
+containing block, where Taffy is already right). An absolute with *both* axes `auto` is
+left alone — its used position is its static position, which the in-flow fragmenter
+already computes correctly.
+
+| shape | WeasyPrint | before | after |
+|---|---|---|---|
+| direct child of `<body>` (control) | 282.70 | 282.49 | 282.49 |
+| wrapped in a static `<section>` | 282.70 | **71.61** | **282.49** |
+
+Also fixed, all measured: `bottom: 50pt`, `top: 0` under an offset wrapper, `left: 0` under
+an indented wrapper, `top: 50%` (whose basis was the wrapper), and two levels of nesting.
+
+It repaired an undeclared WPT regression as a side effect: `css/css-page/
+page-name-propagated-003-print.html` goes FAIL → PASS, and it is declared PASS in
+`expectations/css-page.txt`.
+
+### Verification
+
+`cargo test -p fulgur`: **2585 passed / 0 failed / 4 ignored**, from a 2533 baseline — 52
+new tests across four files, every one of the positive cases verified to fail against the
+build before its fix, and the controls green on both sides. `cargo clippy -p fulgur
+--all-targets`: 0 warnings.
+
+**Seventeen VRT goldens moved, and every one was checked against a reference before it was
+regenerated** — eleven `gcpm/` fixtures from item 11, five `layout/` and one `svg/` from
+item 10. Nothing was blessed on the strength of "the tests still pass".
+
+The eleven `gcpm/` fixtures each declare `page-break-before: always` on a heading carrying
+an explicit `margin-top: 18pt` or the UA default; every one moves toward WeasyPrint by
+exactly the declared margin, taking the error from −5.3…−7.4mm to −1.1…+1.1mm. Three were
+re-measured independently here: −7.24 / −5.27 / −5.27mm → **−0.89 / +1.08 / +1.08**.
+
+The `layout/` fixtures were measured with `ANCHORABOVE` / `ANCHORBELOW` paragraphs and an
+explicit `@page` margin, taking each line's baseline relative to the anchor so the host's
+font substitution cancels. Against Chrome 151:
+
+| fixture | Chrome | before | after |
+|---|---|---|---|
+| `inline-block-basic` | 51.75 | 63.00 | **52.50** |
+| `inline-block-nested` | 60.00 | 81.75 | **60.75** |
+| `inline-flex-smoke` | 52.50 | 65.25 | **53.25** |
+| `inline-grid-smoke` | 59.25 | 88.50 | 90.00 |
+| `review_card_inline_block` (body→chip gap) | 15.75 | 19.50 | **17.25** |
+
+Four of the five land within 1.5pt of Chrome. `inline-grid-smoke` does not, and that
+golden has always encoded a defect — see item 15. It was regenerated because the fix
+applies faithfully on top of an already-wrong input, not because the new number is right.
+
+`fulgur-vrt` was run in `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8, which is the only
+environment its byte-exact goldens reproduce in. It named exactly those 17 and nothing
+else, matching both agents' predictions, and passes clean after regeneration.
+
+## 13, 14, 15 — what still stands between this and the ±1% gate
+
+The filing renders 70 pages against Chrome's 66. These three own that gap; items 10–12 do
+not.
+
+**13 — a table's `min-height` surplus is apportioned differently than Chrome's.** The
+references disagree, so read the repro's header before measuring: Chrome distributes the
+surplus over the rows, WeasyPrint ignores `min-height` on a table entirely, and fulgur
+distributes. fulgur is therefore on Chrome's side, and an earlier draft of this file said
+the opposite because it was measured against WeasyPrint alone. What is still wrong is the
+apportionment: on the filing's `s22-tabel` fulgur puts the first data row at 135.64mm
+against Chrome's 125.41 and uses a 27.25mm row pitch against Chrome's 32.01. Total table
+height is close (BELOW at 104.40 against 103.72 on the repro). This is the largest
+remaining contributor to the page count.
+
+**14 — a block taller than the page does not break for the line that follows it.** A 254mm
+block followed by a 12pt line on a 257mm band: WeasyPrint produces 2 pages, fulgur
+produces 1 and draws the line 1.2mm past the content bottom. Not margin-related — it
+reproduces with no margin anywhere — and untouched by item 11. This is the `fragment_
+block_subtree` capacity question item 7 left open, seen at the bottom of a full page
+rather than at page 0's top.
+
+**15 — no first-baseline synthesis for a text-less `inline-grid` / `inline-flex`.**
+`pageable_last_baseline_from_drawables` walks children in reverse for a `ParagraphEntry`
+and, finding none, falls back to the bottom margin edge. CSS Grid §10.8 and Flexbox §8.5
+synthesise a *first*-row baseline instead. `inline-flex-smoke` passes only by luck — it has
+one line of text, so first == last. The references disagree by 10.17pt on
+`inline-grid-smoke` (Chrome 59.25, WeasyPrint 49.08), so this one needs Chrome to decide.
 
 ### Reproducing the filing
 

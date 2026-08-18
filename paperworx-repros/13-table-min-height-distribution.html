@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<!--
+  Repro 13 — a table's `min-height` is distributed across its rows, but not by
+  the same amounts Chrome uses.
+
+  READ THIS BEFORE MEASURING: the two references disagree, so "they agree,
+  therefore reference" does not settle it here. Chrome 151 distributes the
+  surplus height over the rows (CSS 2.1 §17.5.3); WeasyPrint 69 ignores
+  `min-height` on a table entirely and packs the rows tight. fulgur
+  distributes, i.e. it is on Chrome's side — an earlier note in this file
+  claimed the opposite because it was measured against WeasyPrint alone.
+
+  Render with `min-height` and without (the control), three engines. Page-1
+  baselines in mm:
+
+    min-height  engine       ROW-ONE   ROW-TWO   gap    BELOW
+    (none)      Chrome 151     34.40     39.95   5.56   45.77
+    (none)      WeasyPrint     34.49     40.24   5.75   45.82
+    (none)      fulgur         32.96     37.99   5.03   43.28
+    218pt       Chrome 151     34.40     69.06  34.66  103.72
+    218pt       WeasyPrint     34.49     40.24   5.75   45.82   <- ignores it
+    218pt       fulgur         53.34     79.00  25.66  104.40
+
+  So the total table height is right (fulgur's BELOW at 104.40 against Chrome's
+  103.72) and the surplus reaches the rows, but it is apportioned differently:
+  fulgur pushes the first data row 19mm down where Chrome pushes it 0mm, and
+  then uses a tighter row pitch.
+
+  On the NBB filing this is `section[data-section="s22-tabel"] table {
+  min-height: 218pt }`, and it puts the first data row 10.2mm below Chrome's
+  (135.64 against 125.41) with a 27.25mm row pitch against Chrome's 32.01mm.
+
+  The control below has no `min-height`; delete the declaration to produce it.
+-->
+<html><head><meta charset="utf-8"><title>table min-height row distribution</title><style>
+@page { size: A4; margin: 20mm; }
+body { margin: 0; font: 9pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+p { margin: 0 }
+table { width: 160mm; border: 1.5pt solid #000; min-height: 218pt; }
+td, th { border: none; padding: 2pt 4pt; font-size: 9pt; vertical-align: top; text-align: left; }
+</style></head><body>
+<p>ABOVE</p>
+<table>
+  <thead><tr><th><p>H1</p></th><th><p>H2</p></th></tr></thead>
+  <tbody>
+    <tr><td><p>ROW-ONE</p></td><td><p>A</p></td></tr>
+    <tr><td><p>ROW-TWO</p></td><td><p>B</p></td></tr>
+  </tbody>
+</table>
+<p>BELOW</p>
+</body></html>

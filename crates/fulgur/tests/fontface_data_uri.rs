@@ -24,12 +24,24 @@ fn fixture_with_data_uri_font() -> String {
     const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut b64 = String::new();
     for c in bytes.chunks(3) {
-        let (b0, b1, b2) = (c[0] as u32, *c.get(1).unwrap_or(&0) as u32, *c.get(2).unwrap_or(&0) as u32);
+        let (b0, b1, b2) = (
+            c[0] as u32,
+            *c.get(1).unwrap_or(&0) as u32,
+            *c.get(2).unwrap_or(&0) as u32,
+        );
         let n = (b0 << 16) | (b1 << 8) | b2;
         b64.push(T[(n >> 18 & 63) as usize] as char);
         b64.push(T[(n >> 12 & 63) as usize] as char);
-        b64.push(if c.len() > 1 { T[(n >> 6 & 63) as usize] as char } else { '=' });
-        b64.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        b64.push(if c.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        b64.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     format!(
         "<!doctype html><html><head><style>\
