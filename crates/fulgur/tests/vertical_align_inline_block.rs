@@ -27,10 +27,20 @@
 //! | `bottom`    | the full growth (24 pt)     | box hangs from the line's bottom edge |
 //! | `baseline`  | the full growth (24 pt)     | empty box has no baseline, so its bottom margin edge sits on the baseline |
 //!
-//! Measured on WeasyPrint 69: 12.000 / 0.000 / 0.000 / 24.000 / 24.000 pt,
-//! which fulgur now reproduces exactly. Before the fix every row read
-//! 24.000 pt — the "no value of the property does anything" symptom stated
-//! as a number.
+//! Measured on **this document**, WeasyPrint 69 gives 12.000 / 0.000 / 0.000
+//! / 24.000 / 24.000 pt and fulgur reproduces it exactly. Before the fix
+//! every row read 24.000 pt — the "no value of the property does anything"
+//! symptom stated as a number.
+//!
+//! `bottom` is the one row not to generalise from. Both boxes on the line
+//! carry the same `vertical-align`, so with `bottom` there is no flow-aligned
+//! box to set the line's bottom edge and the strut sets it instead; the tall
+//! box then grows the line box *upwards* and drags the row down with it. On
+//! other shapes the two references part company here — Chrome 151 reports the
+//! full growth where WeasyPrint reports none — so `bottom` is a
+//! references-disagree case in the sense CLAUDE.md uses for the margin-box
+//! box model. fulgur follows Chrome; do not "correct" it toward WeasyPrint on
+//! the strength of this file alone.
 
 use fulgur::Engine;
 use fulgur::inspect::inspect;
@@ -162,5 +172,131 @@ fn the_property_value_changes_the_layout() {
         (middle - top).abs() > 1.0 && (bottom - middle).abs() > 1.0,
         "middle/top/bottom must place a tall inline-block differently; \
          got {middle:.3} / {top:.3} / {bottom:.3}"
+    );
+}
+
+// ── `margin-top` on an atomic inline box ──────────────────────────────────
+//
+// Parley's inline box is the box's *margin* box — `blitz-dom-0.2.4
+// layout/inline.rs:57` builds its height as `margin.top + margin.bottom +
+// content` — but every position fulgur records for the node itself is its
+// *border* box. Reading a border-box baseline offset against a margin-box
+// height slides a margined inline-block by its own `margin-top`.
+//
+// The shape is `crates/fulgur-vrt/fixtures/layout/review_card_inline_block.html`:
+// a small-font inline-block chip carrying `margin-top`, alone on its line
+// inside a larger-font card. Measured there against both references, which
+// agree with each other to 0.8pt.
+
+/// A chip with `margin-top: {margin_top_pt}` alone on its line. Sizes are
+/// chosen so the chip's *margin* box is taller than the card's strut at both
+/// margins under test — otherwise the strut, not the box, would set the line
+/// box's top edge and the relations below would not hold.
+fn margined_chip_doc(margin_top_pt: f32) -> String {
+    format!(
+        "<!doctype html><html><head><style>\
+         @page {{ size: A4; margin: 20mm }}\
+         body {{ margin: 0; font: 10pt/1.2 sans-serif }}\
+         p, div {{ margin: 0 }}\
+         #card > span {{ display: inline-block; padding: 1pt 7pt; \
+         font-size: 7.5pt; line-height: 9pt; margin-top: {margin_top_pt}pt }}\
+         </style></head><body>\
+         <div id=\"card\"><div>BODY</div><span>CHIP</span></div>\
+         <p>AFTER</p>\
+         </body></html>"
+    )
+}
+
+/// `(chip baseline, following block's baseline)`, pt from the page top.
+fn chip_and_after(margin_top_pt: f32) -> (f32, f32) {
+    let pdf = Engine::builder()
+        .build()
+        .render(&margined_chip_doc(margin_top_pt))
+        .expect("render must succeed");
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("out.pdf");
+    std::fs::write(&path, &pdf).expect("write pdf");
+    let r = inspect(&path).expect("inspect must succeed");
+    let mut ys: Vec<f32> = r
+        .text_items
+        .iter()
+        .filter(|t| t.page == 1)
+        .map(|t| PAGE_H_PT - t.y)
+        .collect();
+    ys.sort_by(|a, b| a.partial_cmp(b).expect("finite coordinates"));
+    assert_eq!(ys.len(), 3, "expected BODY, CHIP and AFTER on page 1");
+    (ys[1], ys[2])
+}
+
+/// `margin-top` sits entirely *above* the chip, so growing it must push the
+/// chip down by exactly that much — no more, no less.
+#[test]
+fn margin_top_on_an_inline_block_moves_the_chip_by_its_own_growth() {
+    let (chip_small, _) = chip_and_after(6.0);
+    let (chip_large, _) = chip_and_after(18.0);
+    let moved = chip_large - chip_small;
+    assert!(
+        (moved - 12.0).abs() < 0.05,
+        "expected the chip to move by the full 12pt margin growth, moved by {moved:.3}"
+    );
+}
+
+/// The other half of the same statement, and the half that survives any font:
+/// nothing about `margin-top` belongs *below* the chip, so the distance from
+/// the chip's baseline to the next block must not depend on it at all.
+#[test]
+fn margin_top_on_an_inline_block_leaves_the_space_below_it_alone() {
+    let (chip_small, after_small) = chip_and_after(6.0);
+    let (chip_large, after_large) = chip_and_after(18.0);
+    let gap_small = after_small - chip_small;
+    let gap_large = after_large - chip_large;
+    assert!(
+        (gap_large - gap_small).abs() < 0.05,
+        "the gap below the chip must not move with margin-top; \
+         got {gap_small:.3} at 6pt and {gap_large:.3} at 18pt"
+    );
+}
+
+/// The inline-axis half of the same margin-box confusion, which only became
+/// visible once the block axis was fixed: `crates/fulgur-vrt/fixtures/svg/
+/// shapes.html` puts `margin: 40px` on an inline `<svg>`, and fulgur drew it
+/// hard against the content edge on both axes. WeasyPrint 69 puts that box's
+/// origin at (86.693, 86.693)pt on an A4/20mm page; fulgur now agrees to
+/// 1e-5pt on both.
+fn margin_left_chip_x(margin_left_pt: f32) -> f32 {
+    let html = format!(
+        "<!doctype html><html><head><style>\
+         @page {{ size: A4; margin: 20mm }}\
+         body {{ margin: 0; font: 10pt/1.2 sans-serif }}\
+         div {{ margin: 0 }}\
+         span {{ display: inline-block; margin-left: {margin_left_pt}pt }}\
+         </style></head><body>\
+         <div><span>CHIP</span></div>\
+         </body></html>"
+    );
+    let pdf = Engine::builder()
+        .build()
+        .render(&html)
+        .expect("render must succeed");
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let path = dir.path().join("out.pdf");
+    std::fs::write(&path, &pdf).expect("write pdf");
+    let r = inspect(&path).expect("inspect must succeed");
+    let xs: Vec<f32> = r
+        .text_items
+        .iter()
+        .filter(|t| t.page == 1)
+        .map(|t| t.x)
+        .collect();
+    assert_eq!(xs.len(), 1, "expected exactly one text run");
+    xs[0]
+}
+
+#[test]
+fn margin_left_on_an_inline_block_moves_the_box_by_its_own_growth() {
+    let moved = margin_left_chip_x(30.0) - margin_left_chip_x(0.0);
+    assert!(
+        (moved - 30.0).abs() < 0.05,
+        "expected the chip to move right by the full 30pt margin, moved by {moved:.3}"
     );
 }

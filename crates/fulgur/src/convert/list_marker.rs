@@ -697,6 +697,7 @@ mod tests {
             visible: true,
             vertical_align: crate::paragraph::VerticalAlign::Baseline,
             baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         });
         let line = ShapedLine {
             height: 12.0_f32.as_pt(),
