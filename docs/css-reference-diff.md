@@ -34,7 +34,7 @@ Summary: **6 PACKING**, **2 SHIFT**, **6 AGREE**.
 | `table-thead-repeat` | thead repeats on continuation pages | `PACKING` | 3 | 3 | 20 runs cross a page boundary differently (reading order identical) |
 | `multicol-basic` | two-column flow | `SHIFT` | 1 | 1 | max Δy 109.2pt (`Mc66`) |
 | `table-cell-break-before` | break-before:page on a table cell | `SHIFT` | 1 | 1 | max Δy 42.8pt (`R0039`) |
-| `break-before-page` | break-before:page forces a new page | `AGREE` | 3 | 3 | max Δy 10.3pt |
+| `break-before-page` | break-before:page forces a new page | `AGREE` | 3 | 3 | max Δy 1.0pt |
 | `break-inside-avoid` | break-inside:avoid keeps a block whole | `AGREE` | 3 | 3 | max Δy 1.3pt |
 | `counter-page` | counter(page) in a margin box | `AGREE` | 2 | 2 | max Δy 0.8pt |
 | `page-margin-boxes` | @page margin boxes on every page | `AGREE` | 2 | 2 | max Δy 0.8pt |
