@@ -4725,6 +4725,8 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
         };
         let line = make_shaped_line(vec![crate::paragraph::LineItem::InlineBox(item)]);
         let para = make_para(vec![line]);
@@ -4742,6 +4744,8 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
         };
         make_para(vec![make_shaped_line(vec![
             crate::paragraph::LineItem::InlineBox(item),
@@ -4998,6 +5002,8 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
         };
         let line = make_shaped_line(vec![
             crate::paragraph::LineItem::Image(img),
@@ -5765,6 +5771,8 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 20.0_f32.as_pt(),
         };
         let line = crate::paragraph::ShapedLine {
             height: 16.0_f32.as_pt(),

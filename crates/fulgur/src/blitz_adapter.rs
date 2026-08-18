@@ -1307,6 +1307,44 @@ pub fn extract_vertical_align(node: &blitz_dom::Node) -> crate::paragraph::Verti
     }
 }
 
+/// The computed geometry of an inline formatting context's *strut*
+/// (CSS 2.1 §10.8): the zero-width inline box that every line box inherits
+/// from its block container's own `font` and `line-height`.
+///
+/// Parley has no strut concept — a line whose only content is an inline box
+/// gets `ascent = box height`, `descent = 0` — so fulgur has to synthesise it
+/// to place `vertical-align` correctly. Both fields are CSS px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrutStyle {
+    /// Computed `font-size`.
+    pub font_size: crate::units::Px,
+    /// Used `line-height`.
+    pub line_height: crate::units::Px,
+}
+
+/// Extract the [`StrutStyle`] of an inline formatting context root.
+///
+/// The `line-height: normal` → `1.2 × font-size` mapping mirrors
+/// `blitz-dom-0.2.4 stylo_to_parley.rs:115`, which is what actually fed the
+/// Parley layout we are correcting; using a different factor here would make
+/// the synthesised strut disagree with the line heights Parley produced.
+pub fn extract_strut_style(node: &blitz_dom::Node) -> Option<StrutStyle> {
+    use crate::units::F32Units;
+    use style::values::computed::font::LineHeight;
+
+    let styles = node.primary_styles()?;
+    let font_size = styles.clone_font_size().used_size().px();
+    let line_height = match styles.clone_line_height() {
+        LineHeight::Normal => font_size * 1.2,
+        LineHeight::Number(num) => font_size * num.0,
+        LineHeight::Length(len) => len.0.px(),
+    };
+    Some(StrutStyle {
+        font_size: font_size.as_px(),
+        line_height: line_height.as_px(),
+    })
+}
+
 /// Resolved multicol container properties.
 ///
 /// Only populated when at least one of `column-count` or `column-width` is
@@ -6320,6 +6358,26 @@ mod tests {
         walk(doc.deref(), doc.root_element().id, name)
     }
 
+    fn find_element_by_id(doc: &HtmlDocument, id_attr: &str) -> Option<usize> {
+        fn walk(doc: &blitz_dom::BaseDocument, id: usize, id_attr: &str) -> Option<usize> {
+            let node = doc.get_node(id)?;
+            if node.attrs().is_some_and(|a| {
+                a.iter()
+                    .any(|at| at.name.local.as_ref() == "id" && at.value == id_attr)
+            }) {
+                return Some(id);
+            }
+            for &c in &node.children {
+                if let Some(v) = walk(doc, c, id_attr) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        use std::ops::Deref;
+        walk(doc.deref(), doc.root_element().id, id_attr)
+    }
+
     #[test]
     fn test_extract_content_image_url_simple() {
         let html = r#"<!doctype html><html><head><style>
@@ -6841,6 +6899,36 @@ mod tests {
                 );
             }
             other => panic!("expected VerticalAlign::Length(6.0), got {other:?}"),
+        }
+    }
+
+    /// All three Stylo `line-height` shapes have to resolve, and `normal`
+    /// must use the same 1.2 factor `blitz-dom` fed Parley — a different one
+    /// would make fulgur's synthesised strut disagree with the line heights
+    /// it is correcting.
+    #[test]
+    fn strut_style_resolves_every_line_height_shape() {
+        let html = r#"<html><body>
+            <p id="a" style="font-size: 20px">normal</p>
+            <p id="b" style="font-size: 20px; line-height: 1.5">number</p>
+            <p id="c" style="font-size: 20px; line-height: 40px">length</p>
+        </body></html>"#;
+        let doc = parse_and_layout(html, 400.0_f32.as_px(), 2000.0_f32.as_px(), &[], true);
+        let expected = [("a", 24.0), ("b", 30.0), ("c", 40.0)];
+        for (id, line_height_px) in expected {
+            let node_id = find_element_by_id(&doc, id).unwrap_or_else(|| panic!("<p id={id}>"));
+            let strut =
+                extract_strut_style(doc.get_node(node_id).expect("node")).expect("styled element");
+            assert!(
+                (strut.font_size.to_f32() - 20.0).abs() < 0.01,
+                "{id}: font-size {:?}",
+                strut.font_size
+            );
+            assert!(
+                (strut.line_height.to_f32() - line_height_px).abs() < 0.01,
+                "{id}: expected {line_height_px}px, got {:?}",
+                strut.line_height
+            );
         }
     }
 
