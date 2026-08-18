@@ -16,6 +16,7 @@ Intent: fix here, then offer upstream as separate PRs.
 | 5 | Margin-box background does not fill the box's band | — | cosmetic | **fixed** (one part deferred) |
 | 6 | `<tfoot>` before `<tbody>` renders at the top of the table | `scripts/refdiff/fixtures/table-tfoot-source-order.html` | real, single-page | **fixed** |
 | 7 | Page 0 over-filled by the body offset; content spills past the page bottom | `scripts/refdiff/fixtures/break-inside-avoid.html` | real | **fixed** |
+| 8 | `@font-face` with a `data:` URI is ignored; text silently falls back to a system font | `08-fontface-data-uri.html` | **dangerous** | **open** |
 
 ## 1 — misdiagnosed; the real fault was different
 
@@ -420,6 +421,39 @@ to fail before the fix) plus the alignment table in `gcpm/margin_box.rs`. The re
 puts `MARK` at 176.34mm / 282.85mm against the references' 176.50 / 282.90 — the residual
 is font-metric difference, the same order as Chrome's own 0.15mm disagreement with
 WeasyPrint.
+
+## 8 — `@font-face` with a `data:` URI is ignored
+
+Found while measuring fulgur against production on a real NBB filing, and it invalidated
+the first run of that measurement.
+
+A theme delivers its fonts as `@font-face` rules with base64 `data:` URIs — that is how the
+rendered HTML is self-contained. fulgur ignores them and falls back to a system font,
+reporting success. Chrome and WeasyPrint both honour the rule.
+
+```bash
+fulgur render -o out.pdf 08-fontface-data-uri.html
+mutool clean -d out.pdf - | grep -o "/BaseFont */[A-Za-z0-9+-]*" | sort -u
+```
+
+| engine | embedded font |
+|---|---|
+| WeasyPrint 69 | `ZRPRAM+Probe-Sans` |
+| fulgur | `XUZQRR+Helvetica` |
+
+Same on the real filing: Chrome embedded `LiberationSans`, fulgur embedded only
+`Helvetica`. Passing `--font` / `AssetBundle` is the workaround, and the integration plan
+already required it — but nothing says so at the point of failure, and the document still
+renders, so the substitution is invisible until you inspect the embedded fonts.
+
+**This is the measurement trap of this whole exercise.** Every position taken against a
+substituted font is measuring the wrong document. A first pass here reported a
+`fi`-ligature corruption in the text layer (`financiële` extracting as `fnanciële`, x35)
+as a separate defect; it was entirely a symptom of this one. With the font registered,
+fulgur extracts `financiële` x35 — identical to Chrome. There is no ligature defect.
+
+Relation to item 3: that fix is what keeps this from being a blank page. The fallback is
+working as designed; the gap is that a declared, *available* font is never loaded.
 
 ## How they were measured
 
