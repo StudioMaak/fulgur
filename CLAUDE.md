@@ -167,6 +167,26 @@ the v2 authors recording a removal, not an absence. `git log --all -S <symbol>` 
 seconds and turned the change from an invention into a port — with the original algorithm,
 its example, and a review-fixed bug (`4d44c483`) to inherit.
 
+**And check whether upstream is already doing it.** On 2026-08-24 that same defect 2
+turned out to be under way upstream in PR #710, with two review rounds stacked on it
+(#721, #728). Our port and theirs rendered the 300-row repro **byte-for-byte the
+same**, but ours failed five of their reviewed edge-case probes — including
+whitespace text nodes defeating the orphan check, which every pretty-printed table
+hits. We dropped ours and took theirs; only `<tfoot>` repetition, which they decline
+to implement, stayed ours. Cost of finding out late: a full implementation thrown
+away. `gh pr list --repo fulgur-rs/fulgur` before starting a feature, not after.
+
+### Tracking upstream
+
+`upstream/main` is mostly coverage and dependency traffic and merges clean. The one
+to watch is **PR #719** (`fulgur-pgbrk page-fragmentation overhaul`): +9818/−6038 in
+`pagination_layout.rs`, a converged walker replacing the two recursive ones, and a
+new invariant that **panics in test builds** when a fragment escapes the content
+strip. Most of this fork's pagination diff lands in that file. Measured 2026-08-24:
+it does not fix repros 10, 11 or 12, so those fixes survive the rebase as work, not
+as merge conflicts. `paperworx-repros/README.md` has the per-commit portability
+table. Decision on record: wait for it to land, then re-port.
+
 Paged.js is not a design reference for pagination features: 0.4.3's only table-aware code
 propagates `break-inside: avoid` from `<tbody>`/`<thead>`, and it has no repeat concept at
 all. Because it replaces Chrome's own pagination with DOM chunking, Chrome's native header
@@ -177,8 +197,9 @@ repeat theads. WeasyPrint's `layout/table.py` is the reference worth reading.
 
 `cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).
 The "~340 unit tests" figure in Common Commands above is long stale. `cargo test -p fulgur`
-adds ~30 integration binaries — 2468 passing at the fork point, **2585 / 0 failed / 4
-ignored** as of repros 10-12.
+adds ~30 integration binaries — 2468 passing at the fork point, 2585 as of repros
+10-12, and **2618 / 0 failed / 7 ignored** after adopting upstream's repeating-header
+stack (its probe suites come with it).
 
 **`fulgur-vrt` needs `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8** — that is the only
 environment its byte-exact goldens reproduce in. Measured:

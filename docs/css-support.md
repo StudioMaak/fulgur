@@ -97,6 +97,17 @@ Supported:
 - A table does not start on a page that has room for the repeated band
   but not for the first body row — an orphaned header carries no
   information and the same header is redrawn on the next page anyway.
+- Multi-page tables also repeat the first computed `table-footer-group`
+  at the bottom of every page the table spans (StudioMaak fork). The
+  band lands directly under the last body row on each page — where both
+  WeasyPrint 69 and Chrome 151 put it — rather than flush to the page
+  box, and the same `display: table-row-group` opt-out applies.
+- A `<thead>` or `<tfoot>` written out of CSS box order (as HTML4
+  required for `<tfoot>`) is put into box order before layout by
+  `blitz_adapter::TableSectionOrderPass`, so it renders at the table's
+  top or bottom and repeats like any other band. The reorder is
+  invisible to structural selectors (`:first-child` and friends still
+  match source order).
 
 Not supported:
 
@@ -106,14 +117,15 @@ Not supported:
   `DioxusLabs/blitz#386`. The VRT fixture below uses `border-collapse`,
   so its golden bakes in the current behaviour and will need regenerating
   when upstream lands it.
-- Hoisting a header group to the top of its table. CSS 2.1 §17.5.1
-  requires a `table-header-group` to be rendered before all other rows
-  regardless of source position. That reordering belongs to layout, and
-  the engine fulgur builds on does not perform it, so a header group
-  written after a `tbody` keeps its in-flow position. fulgur declines to
-  repeat such a group rather than reserve a band spanning the rows above
-  it. WPT `css/CSS2/tables/table-header-group-005.xht` fails for this
-  reason (tracked as `fulgur-naj7.13`).
+- Hoisting a *computed* header group to the top of its table. CSS 2.1
+  §17.5.1 requires a `table-header-group` to be rendered before all
+  other rows regardless of source position. `TableSectionOrderPass`
+  covers the `<thead>` / `<tfoot>` tag spelling of this, but a group
+  that gets `display: table-header-group` from CSS alone keeps its
+  in-flow position, and fulgur declines to repeat such a group rather
+  than reserve a band spanning the rows above it. WPT
+  `css/CSS2/tables/table-header-group-005.xht` fails for this reason
+  (tracked as `fulgur-naj7.13`).
 - Fragmenting nested tables. A table inside a cell of another table does
   not split: both keep a single fragment and the content overflows the
   page. Taffy has no table layout algorithm — `taffy::compute` provides
@@ -126,7 +138,7 @@ Not supported:
 - `repeat-on-break` (CSS Repeated Headers and Footers). Stylo 0.8 does
   not parse the property, so the `display: table-row-group` opt-out above
   is the only way to suppress repetition — at the cost of discarding the
-  header semantics along with the repetition.
+  header or footer semantics along with the repetition.
 
 Note that CSS Tables Level 3 §6 (Fragmentation) has no web-platform-tests
 coverage, and `css/CSS2/tables/table-header-group-004.xht` is flagged

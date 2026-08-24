@@ -81,6 +81,44 @@ survives of v1's classification.
 
 Offer this upstream as *restoring* behaviour lost in the Drawables migration.
 
+### Superseded, 2026-08-24: upstream restored it first, and better
+
+While this fork was working on it, upstream did the same restoration in
+[PR #710](https://github.com/fulgur-rs/fulgur/pull/710) (vsevolod, opened
+2026-08-12) and then reviewed it twice —
+[#721](https://github.com/fulgur-rs/fulgur/pull/721) (mitsuru) and
+[#728](https://github.com/fulgur-rs/fulgur/pull/728). Same architecture as ours:
+repeat geometry emitted by the fragmenter, no `TableEntry` payload. Both sides
+even rewrote the same `drawables.rs` doc comment.
+
+Measured head to head on `02-thead-repeat.html`, the two implementations produce
+**byte-identical PDFs**. They diverge only at the edges, and there theirs wins:
+ours failed five of their reviewed probes —
+
+| upstream probe | ours |
+|---|---|
+| whitespace text nodes must not defeat the orphan check | FAIL |
+| a trailing `break-after` must not manufacture a header-only page | FAIL |
+| a text-only single-child first row measured at full height | FAIL |
+| a multicol inside a repeated header repeats | FAIL |
+| a nested oversized inner table paints no zero-height frame | FAIL |
+
+— while their build passed all five of our `thead_repeat.rs` tests and three of
+our four `tfoot_repeat.rs` tests, failing only the one asserting `<tfoot>`
+repetition, which they deliberately do not implement.
+
+The whitespace one is not exotic: any pretty-printed table hits it.
+
+So this fork **dropped its own `<thead>` port and took theirs** (`ee0bc36b`), then
+re-ported `<tfoot>` repetition onto their coordinator (`944b6ddd`). Our header
+output is now byte-identical to a build of upstream's branch, on both
+`02-thead-repeat.html` and their VRT fixture, and the swap moves **no VRT
+goldens** — the only manifest fixture whose bytes change is upstream's own
+`layout/repeating-table-header.html`, which arrives with their golden.
+
+What remains ours to offer upstream is the `<tfoot>` band and the section
+reorder (repro 6), not the header.
+
 ### The fixture was broken
 
 `02-thead-repeat.html` had lost its `<html><head><style>` opening tags — the file
@@ -953,3 +991,55 @@ mutool clean -d out.pdf /tmp/c.pdf && grep -a -o "/BaseFont */[A-Za-z0-9+-]*" /t
 
 Both engines legitimately embed Helvetica *as well as* LiberationSans on this document, so
 the check is that LiberationSans is present, not that Helvetica is absent.
+
+## Upstream sync, measured 2026-08-24
+
+Checked against `upstream/main` at `dbf4dc62` and every open PR. Everything
+merged upstream since our fork point (`cfa8f4d2`) is test-coverage and
+dependency bumps — **none of these items was fixed there**. The action is all in
+open PRs.
+
+`upstream/main` merges into this branch with **zero conflicts**.
+
+### Adopted: the repeating-header stack (#710 + #721 + #728)
+
+See item 2 above. Swapped in wholesale; `<tfoot>` re-ported on top.
+
+### Pending, and the one that will hurt: [#719](https://github.com/fulgur-rs/fulgur/pull/719)
+
+`fulgur-pgbrk page-fragmentation overhaul — converged walker`. **+9818/−6038 in
+`pagination_layout.rs` alone**, plus a WPT css-break ledger. Opened from a
+downstream bug (upstream issue #720, content silently discarded past the page
+bottom) and currently CHANGES_REQUESTED.
+
+It does **not** fix our items — measured, not assumed:
+
+| item | ours | #719 | WeasyPrint 69 | Chrome 151 |
+|---|---|---|---|---|
+| 11 — margin after forced break | 31.38mm (Δ8.47 = 24pt) | 22.91mm (Δ0) | 31.99 (Δ8.47) | 31.75 (Δ8.47) |
+| 12 — ICB-anchored absolute | 282.22mm | 71.35mm | 282.70 | 282.31 |
+| 10 — `vertical-align` atomic inline | tracks Chrome ≤0.4mm | drifts to 4.4mm by `BOX30` | — | reference |
+
+So all three fixes are still needed after it lands. Their portability onto it,
+by cherry-pick (ignoring conflicts that are only in docs, snapshots or goldens):
+
+- **clean:** repro 12 (`73a58c87`), repro 10's first half (`c6dcef77`)
+- **conflicts in `pagination_layout.rs`:** repros 7, 11, 11b
+- **GCPM work:** conflicts only in snapshots and VRT goldens, which #719 moves anyway
+
+Also note #719 makes "a fragment escaping the content strip" a **panic in all
+test builds**. Our pagination fixes get judged against that invariant on rebase.
+
+Decision (2026-08-24): wait for it to land, then re-port. Do not offer 11/12
+upstream ahead of it.
+
+### Untouched upstream
+
+Items 8 (`@font-face` in an inline `<style>`), 13 (table `min-height`
+apportionment) and 15 (inline-grid first baseline) have no upstream issue or PR.
+
+**Item 14 could not be reproduced.** Rebuilt from this file's own parameters — a
+254mm block followed by a 12pt line on a 257mm band — it gives 2 pages on this
+branch, on #719, and on both references. Either repro 7/11 fixed it incidentally
+or the minimal description is not the shape that fails. It needs the original
+filing fixture to settle; treat the item as unverified rather than fixed.
