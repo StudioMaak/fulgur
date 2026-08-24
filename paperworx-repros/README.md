@@ -992,6 +992,43 @@ mutool clean -d out.pdf /tmp/c.pdf && grep -a -o "/BaseFont */[A-Za-z0-9+-]*" /t
 Both engines legitimately embed Helvetica *as well as* LiberationSans on this document, so
 the check is that LiberationSans is present, not that Helvetica is absent.
 
+## 16, 17 — table-row fragmentation, found in upstream's merged probe suite
+
+Adopting upstream's header stack (item 2) brought their geometry probes with it.
+Two of them are `#[ignore]`d executable repros for defects neither side had
+written up here, and both still fail on this branch:
+
+**16 — a table row never fragments.** `break-inside: auto` on a `<tr>` — the CSS
+default — behaves as `avoid`. Measured on `16-row-break-inside-auto.html`, twelve
+eight-line rows on an A4 band:
+
+| engine | `break-inside: auto` | `break-inside: avoid` |
+|---|---|---|
+| WeasyPrint 69 | row 04 splits | row 04 moves whole |
+| Chrome 151 | row 04 splits | row 04 moves whole |
+| fulgur | row 04 moves whole | row 04 moves whole |
+
+Benign for paperworx today: the NBB themes ask for
+`tbody tr { break-inside: avoid }`, which is what fulgur does regardless. Worth
+knowing anyway — our documents get the right result for the wrong reason, and
+dropping the declaration would silently change nothing.
+
+**17 — a forced break on a table row or row group is ignored entirely.**
+`probe_forced_break_on_body_row_is_honoured` and its no-`<thead>` sibling: a
+`break-before: page` on a `<tr>` leaves both rows on page 0
+(`a1 = [(0, 30, 30)]`, `a2 = [(0, 60, 30)]`), with and without a header. Upstream
+filed it as an executable repro rather than a fix, and #728's own commit message
+(`test(pagination): show row-level forced breaks are ignored table-wide`) says
+the same. Not currently used by our templates — worth a check before any of them
+starts relying on it.
+
+Also inherited, and already upstream's known limits rather than ours:
+`fulgur-naj7.14` (nested tables do not paginate at all — Taffy has no table
+layout algorithm, so a table inside a cell keeps one fragment and overflows the
+page) and `fulgur-naj7.13` (a group that gets `display: table-header-group` from
+CSS rather than the `<thead>` tag is not hoisted, and therefore not repeated —
+our `TableSectionOrderPass` covers the tag spelling only).
+
 ## Upstream sync, measured 2026-08-24
 
 Checked against `upstream/main` at `dbf4dc62` and every open PR. Everything
