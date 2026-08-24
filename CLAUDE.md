@@ -176,6 +176,20 @@ hits. We dropped ours and took theirs; only `<tfoot>` repetition, which they dec
 to implement, stayed ours. Cost of finding out late: a full implementation thrown
 away. `gh pr list --repo fulgur-rs/fulgur` before starting a feature, not after.
 
+### `children.len()` lies on any formatted document
+
+Blitz keeps whitespace-only text nodes between elements, so indented markup gives
+a node `[ws, div, ws, div, ws]`. Any code that reasons about "does this box have
+one child or several", or measures "the leading child", is wrong on every
+pretty-printed document and right on every minified one — which is exactly the
+way round that makes it survive testing.
+
+This is what made our `<thead>` port fail upstream's orphan probe: the leading
+unit of the first body row measured a 0-height whitespace node, so the check that
+stops a page carrying nothing but a repeated header never fired. Filter children
+by `text_data()`-is-not-all-whitespace **and** `size.height > 0.0` before counting
+them. Upstream's `repeating_table_header` has the reference version.
+
 ### Tracking upstream
 
 `upstream/main` is mostly coverage and dependency traffic and merges clean. The one
