@@ -1499,7 +1499,7 @@ fn retained_margin_after_forced_break(layout: &taffy::Layout) -> f32 {
 /// True when the header band can be recorded once and cloned onto every
 /// continuation page.
 ///
-/// [`record_header_template`] snapshots the band's coordinates directly rather
+/// [`record_band_template`] snapshots the band's coordinates directly rather
 /// than running it through the fragmenter, so a forced break or a page-name
 /// change inside a header cell has nothing to act on and is silently dropped
 /// (fulgur-naj7.7: `break-after: page` on a `<div>` inside a `<th>` rendered
@@ -1674,15 +1674,6 @@ fn has_page_name_change_below(
     false
 }
 
-
-
-
-
-
-
-
-
-
 /// Row-level state for grid/flex parallel-sibling co-split (fulgur-ysms).
 ///
 /// Saved once at the first cell of each row; subsequent cells in the same
@@ -1716,6 +1707,10 @@ struct RowState {
 struct RepeatingTableHeader {
     table_id: usize,
     header_cell_ids: Vec<usize>,
+    /// StudioMaak fork: cells of the first `table-footer-group`, repeated at
+    /// the bottom of every page the table spans. Empty when the table has no
+    /// footer, or has one the fragmenter declines to repeat.
+    footer_cell_ids: Vec<usize>,
     body_cell_ids: Vec<usize>,
     body_origin_px: f32,
     band_height_px: f32,
@@ -1723,15 +1718,38 @@ struct RepeatingTableHeader {
     /// alone fitting is not enough to start the table on a page — if not even
     /// this clears the band, the page carries only a repeated header.
     first_body_lead_px: f32,
+    /// StudioMaak fork: height of the footer band, reserved at the bottom of
+    /// every page the table spans. `0.0` when nothing repeats there.
+    footer_band_height_px: f32,
+    /// StudioMaak fork: Taffy top of the footer band, so its template can be
+    /// recorded band-relative and then placed at any y on any page.
+    footer_top_px: f32,
 }
 
+/// Which repeating band the walk is currently inside.
+///
+/// StudioMaak fork: upstream tracks a single `in_header: bool` here, since it
+/// repeats `<thead>` only. `<tfoot>` repetition is the mirror of the header's
+/// — a header offsets where each page's strip *starts*, a footer shrinks where
+/// it *ends* — so the same walk collects both bands and everything else stays
+/// body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableBand {
+    Body,
+    Head,
+    Foot,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_repeating_table_cells(
     doc: &BaseDocument,
     node_id: usize,
-    in_header: bool,
+    band: TableBand,
     depth: usize,
     header_claimed: &mut bool,
+    footer_claimed: &mut bool,
     header_cell_ids: &mut Vec<usize>,
+    footer_cell_ids: &mut Vec<usize>,
     body_cell_ids: &mut Vec<usize>,
 ) {
     if depth >= crate::MAX_DOM_DEPTH {
@@ -1743,7 +1761,7 @@ fn collect_repeating_table_cells(
     let Some(display) = node.primary_styles().map(|s| s.clone_display().inside()) else {
         return;
     };
-    let next_in_header = match display {
+    let next_band = match display {
         // css-tables-3: "If a table owns multiple `display: table-header-group`
         // boxes, only the first is treated as a header; the others are treated
         // as if they had `display: table-row-group`."
@@ -1754,22 +1772,30 @@ fn collect_repeating_table_cells(
         // (fulgur-naj7.5). Children are visited in document order, so the first
         // group to reach this arm is the one the spec designates.
         DisplayInside::TableHeaderGroup => {
-            if *header_claimed {
-                false
+            if band != TableBand::Body || *header_claimed {
+                band
             } else {
                 *header_claimed = true;
-                true
+                TableBand::Head
             }
         }
-        DisplayInside::TableRowGroup
-        | DisplayInside::TableFooterGroup
-        | DisplayInside::TableRow
-        | DisplayInside::Contents => in_header,
-        DisplayInside::TableCell => {
-            if in_header {
-                header_cell_ids.push(node_id);
+        // The footer mirrors the header exactly, including the css-tables-3
+        // "only the first group counts" rule: a second `table-footer-group`
+        // is treated as an ordinary row group rather than extending the band.
+        DisplayInside::TableFooterGroup => {
+            if band != TableBand::Body || *footer_claimed {
+                band
             } else {
-                body_cell_ids.push(node_id);
+                *footer_claimed = true;
+                TableBand::Foot
+            }
+        }
+        DisplayInside::TableRowGroup | DisplayInside::TableRow | DisplayInside::Contents => band,
+        DisplayInside::TableCell => {
+            match band {
+                TableBand::Head => header_cell_ids.push(node_id),
+                TableBand::Foot => footer_cell_ids.push(node_id),
+                TableBand::Body => body_cell_ids.push(node_id),
             }
             return;
         }
@@ -1780,10 +1806,12 @@ fn collect_repeating_table_cells(
         collect_repeating_table_cells(
             doc,
             child_id,
-            next_in_header,
+            next_band,
             depth + 1,
             header_claimed,
+            footer_claimed,
             header_cell_ids,
+            footer_cell_ids,
             body_cell_ids,
         );
     }
@@ -1804,36 +1832,49 @@ fn repeating_table_header(
     }
 
     let mut header_cell_ids = Vec::new();
+    let mut footer_cell_ids: Vec<usize> = Vec::new();
     let mut body_cell_ids = Vec::new();
     // Threaded across siblings so only the first `table-header-group` in
     // document order becomes the header — see `collect_repeating_table_cells`.
     let mut header_claimed = false;
+    let mut footer_claimed = false;
     for &child_id in &table.children {
         collect_repeating_table_cells(
             doc,
             child_id,
-            false,
+            TableBand::Body,
             child_depth,
             &mut header_claimed,
+            &mut footer_claimed,
             &mut header_cell_ids,
+            &mut footer_cell_ids,
             &mut body_cell_ids,
         );
     }
-    if header_cell_ids.is_empty() || body_cell_ids.is_empty() {
+    // StudioMaak fork: a table with only a `<tfoot>` repeats too, so the
+    // header alone no longer gates the whole coordinator.
+    if (header_cell_ids.is_empty() && footer_cell_ids.is_empty()) || body_cell_ids.is_empty() {
         return None;
     }
 
-    let header_top_px = header_cell_ids
-        .iter()
-        .filter_map(|&id| doc.get_node(id).map(|n| n.final_layout.location.y))
-        .reduce(f32::min)?;
-    let header_bottom_px = header_cell_ids
-        .iter()
-        .filter_map(|&id| {
-            doc.get_node(id)
-                .map(|n| n.final_layout.location.y + n.final_layout.size.height)
-        })
-        .reduce(f32::max)?;
+    // StudioMaak fork: `(0.0, 0.0)` for a footer-only table, so the header
+    // band contributes nothing and every guard below reads as "no header".
+    let (header_top_px, header_bottom_px) = if header_cell_ids.is_empty() {
+        (0.0, 0.0)
+    } else {
+        let top = header_cell_ids
+            .iter()
+            .filter_map(|&id| doc.get_node(id).map(|n| n.final_layout.location.y))
+            .reduce(f32::min)?;
+        let bottom = header_cell_ids
+            .iter()
+            .filter_map(|&id| {
+                doc.get_node(id)
+                    .map(|n| n.final_layout.location.y + n.final_layout.size.height)
+            })
+            .reduce(f32::max)?;
+        (top, bottom)
+    };
     let body_origin_px = body_cell_ids
         .iter()
         .filter_map(|&id| doc.get_node(id).map(|n| n.final_layout.location.y))
@@ -1861,8 +1902,54 @@ fn repeating_table_header(
         return None;
     }
 
-    let band_height_px = header_bottom_px.max(body_origin_px);
-    if band_height_px <= 0.0 {
+    let band_height_px = if header_cell_ids.is_empty() {
+        0.0
+    } else {
+        header_bottom_px.max(body_origin_px)
+    };
+    if !header_cell_ids.is_empty() && band_height_px <= 0.0 {
+        return None;
+    }
+
+    // StudioMaak fork: the footer band, measured the same way and subject to
+    // the mirrored guard. A `table-footer-group` that does not sit below the
+    // body keeps its in-flow offset (a `display: table-row-group` `<tfoot>`,
+    // or a source-order one the reorder pass left alone), and repeating it
+    // from mid-table would draw it over rows the walk already placed.
+    let body_bottom_px = body_cell_ids
+        .iter()
+        .filter_map(|&id| {
+            doc.get_node(id)
+                .map(|n| n.final_layout.location.y + n.final_layout.size.height)
+        })
+        .reduce(f32::max)
+        .unwrap_or(0.0);
+    let footer_span = footer_cell_ids
+        .iter()
+        .filter_map(|&id| doc.get_node(id))
+        .map(|n| {
+            (
+                n.final_layout.location.y,
+                n.final_layout.location.y + n.final_layout.size.height,
+            )
+        })
+        .reduce(|(t1, b1), (t2, b2)| (t1.min(t2), b1.max(b2)));
+    let footer_top_px = footer_span.map(|(top, _)| top).unwrap_or(0.0);
+    let footer_band_height_px = match footer_span {
+        Some((top, bottom))
+            if top.is_finite() && bottom.is_finite() && top + 0.5 >= body_bottom_px =>
+        {
+            bottom - top
+        }
+        _ => {
+            footer_cell_ids.clear();
+            0.0
+        }
+    };
+    if footer_band_height_px <= 0.0 {
+        footer_cell_ids.clear();
+    }
+    if header_cell_ids.is_empty() && footer_cell_ids.is_empty() {
         return None;
     }
 
@@ -1916,10 +2003,13 @@ fn repeating_table_header(
     Some(RepeatingTableHeader {
         table_id,
         header_cell_ids,
+        footer_cell_ids,
         body_cell_ids,
         body_origin_px,
         band_height_px,
         first_body_lead_px,
+        footer_band_height_px,
+        footer_top_px,
     })
 }
 
@@ -2019,16 +2109,21 @@ fn fragmented_descendant_page_extent(
     })
 }
 
-fn record_header_template(
+/// Records one band's cells (and their subtrees) at `table_y`, as the template
+/// every later page clones.
+///
+/// StudioMaak fork: takes a cell slice rather than the whole
+/// `RepeatingTableHeader`, so the footer band records through the same code.
+fn record_band_template(
     geometry: &mut PaginationGeometryTable,
     doc: &BaseDocument,
-    header: &RepeatingTableHeader,
+    cell_ids: &[usize],
     page_index: u32,
     table_x: f32,
     table_y: f32,
     depth: usize,
 ) {
-    for &cell_id in &header.header_cell_ids {
+    for &cell_id in cell_ids {
         let Some(cell) = doc.get_node(cell_id) else {
             continue;
         };
@@ -2114,9 +2209,13 @@ fn fragment_repeating_table(
     initial_page_occupied: bool,
     remaining_repeat_budget: &mut usize,
 ) -> (u32, f32) {
-    if header.band_height_px >= page_height_px {
+    // StudioMaak fork: the two bands share the page, so the fallback tests
+    // their sum — a header and footer that together leave no strip would
+    // otherwise reserve the whole page and starve every body row.
+    let footer_band_px = header.footer_band_height_px;
+    if header.band_height_px + footer_band_px >= page_height_px {
         log::warn!(
-            "repeating table header band ({:.2}px) is not smaller than the page ({page_height_px:.2}px); using whole-table fallback",
+            "repeating table bands (header {:.2}px + footer {footer_band_px:.2}px) are not smaller than the page ({page_height_px:.2}px); using whole-table fallback",
             header.band_height_px
         );
         return fragment_block_subtree_inner(
@@ -2146,8 +2245,8 @@ fn fragment_repeating_table(
     // both rows on page 1). An orphaned header row is never useful output, and
     // css-tables-3 likewise bounds repetition to cases where it does not eat
     // the page.
-    let first_row_reserve = header.band_height_px + header.first_body_lead_px;
-    let band_overflows = cursor_in + header.band_height_px > page_height_px;
+    let first_row_reserve = header.band_height_px + footer_band_px + header.first_body_lead_px;
+    let band_overflows = cursor_in + header.band_height_px + footer_band_px > page_height_px;
     // The band fits but its first body row does not: starting here would emit
     // a header with nothing under it. Only worth moving if the pair actually
     // fits on an empty page — an oversized first row has to start somewhere,
@@ -2161,17 +2260,30 @@ fn fragment_repeating_table(
         (page_in, cursor_in)
     };
     let mut header_template = PaginationGeometryTable::new();
-    record_header_template(
+    record_band_template(
         &mut header_template,
         doc,
-        header,
+        &header.header_cell_ids,
         first_page,
         parent_x_in_body,
         first_table_top,
         depth,
     );
 
-    let body_page_height = page_height_px - header.band_height_px;
+    // Recorded band-relative (its own top at y = 0), so it can be placed at
+    // whatever y each page's last body row leaves free.
+    let mut footer_template = PaginationGeometryTable::new();
+    record_band_template(
+        &mut footer_template,
+        doc,
+        &header.footer_cell_ids,
+        first_page,
+        parent_x_in_body,
+        -header.footer_top_px,
+        depth,
+    );
+
+    let body_page_height = page_height_px - header.band_height_px - footer_band_px;
     let mut body_geometry = PaginationGeometryTable::new();
     let (body_end_page, body_end_cursor) = fragment_block_subtree_inner(
         &mut body_geometry,
@@ -2209,6 +2321,12 @@ fn fragment_repeating_table(
         .collect();
 
     let mut table_pages = BTreeMap::<u32, f32>::new();
+    // StudioMaak fork: lowest body content on each page, so a repeated footer
+    // lands immediately under the last row placed there rather than flush to
+    // the page bottom — where both references put it (WeasyPrint's
+    // `layout/table.py::all_groups_layout` translates the footer to
+    // `end_position_y`).
+    let mut page_body_bottom = BTreeMap::<u32, f32>::new();
     for (node_id, mut source) in body_geometry {
         source.fragments.sort_by_key(|fragment| fragment.page_index);
         if node_id == header.table_id {
@@ -2230,6 +2348,11 @@ fn fragment_repeating_table(
         } else {
             for fragment in &mut source.fragments {
                 fragment.y = (fragment.y.to_f32() + header.band_height_px).as_px();
+                let bottom = fragment.y.to_f32() + fragment.height.to_f32();
+                page_body_bottom
+                    .entry(fragment.page_index)
+                    .and_modify(|current| *current = current.max(bottom))
+                    .or_insert(bottom);
             }
         }
         let target = geometry.entry(node_id).or_default();
@@ -2262,8 +2385,98 @@ fn fragment_repeating_table(
         first_table_top,
         remaining_repeat_budget,
     );
+    append_repeated_footer_fragments(
+        geometry,
+        &footer_template,
+        &table_pages,
+        &page_body_bottom,
+        header.table_id,
+        header.band_height_px,
+        footer_band_px,
+        page_height_px,
+        remaining_repeat_budget,
+    );
 
-    (body_end_page, body_end_cursor + header.band_height_px)
+    (
+        body_end_page,
+        body_end_cursor + header.band_height_px + footer_band_px,
+    )
+}
+
+/// Places the repeated `<tfoot>` band on every page the table spans.
+///
+/// StudioMaak fork; the mirror of [`append_repeated_header_fragments`]. Three
+/// things differ from the header's replay:
+///
+/// - the template is band-relative, so each page picks its own `y` rather than
+///   inheriting the table top;
+/// - that `y` is the bottom of the last body content on the page, clamped so
+///   the band still ends inside the page box — the strip was reserved for it
+///   by `body_page_height`, so a full page puts it flush and a short last page
+///   puts it directly under the final row;
+/// - the table's own fragment is grown to cover the band, so its background
+///   and border span the footer the way they span the header.
+#[allow(clippy::too_many_arguments)]
+fn append_repeated_footer_fragments(
+    geometry: &mut PaginationGeometryTable,
+    template: &PaginationGeometryTable,
+    table_pages: &[(u32, f32)],
+    page_body_bottom: &BTreeMap<u32, f32>,
+    table_id: usize,
+    band_height_px: f32,
+    footer_band_px: f32,
+    page_height_px: f32,
+    remaining_repeat_budget: &mut usize,
+) {
+    if template.is_empty() || footer_band_px <= 0.0 {
+        return;
+    }
+    let repeats = table_pages.len() > 1;
+    let fragments_per_footer = template.values().map(|g| g.fragments.len()).sum::<usize>();
+
+    for &(page_index, table_top) in table_pages {
+        if *remaining_repeat_budget < fragments_per_footer {
+            log::warn!(
+                "repeating table footer fragment budget exhausted; skipping remaining pages"
+            );
+            return;
+        }
+        let band_top = page_body_bottom
+            .get(&page_index)
+            .copied()
+            .unwrap_or(table_top + band_height_px)
+            .min(page_height_px - footer_band_px)
+            .max(table_top);
+
+        for (&node_id, source) in template {
+            let target = geometry.entry(node_id).or_default();
+            target.is_repeat |= source.is_repeat || repeats;
+            target
+                .fragments
+                .extend(source.fragments.iter().map(|fragment| {
+                    let mut placed = fragment.clone();
+                    placed.page_index = page_index;
+                    placed.y = (band_top + fragment.y.to_f32()).as_px();
+                    placed
+                }));
+        }
+        *remaining_repeat_budget -= fragments_per_footer;
+
+        // Grow the table's own slice on this page so its background and
+        // border reach the bottom of the band.
+        if let Some(geom) = geometry.get_mut(&table_id) {
+            for fragment in geom
+                .fragments
+                .iter_mut()
+                .filter(|fragment| fragment.page_index == page_index)
+            {
+                let wanted = band_top + footer_band_px - fragment.y.to_f32();
+                if wanted > fragment.height.to_f32() {
+                    fragment.height = wanted.as_px();
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4819,7 +5032,6 @@ mod tests {
         doc
     }
 
-
     #[test]
     fn empty_document_emits_only_body_fragment() {
         let mut doc = parse("<html><body></body></html>", 600.0);
@@ -4893,16 +5105,6 @@ mod tests {
     // Restores behaviour fulgur shipped in the v1 `Pageable`
     // architecture (`TablePageable`, PR #14) and lost in the Phase 4
     // migration to geometry-driven `Drawables`.
-
-
-
-
-
-
-
-
-
-
 
     /// fulgur-2map.5: directly exercise `fragment_block_subtree`'s
     /// `depth >= MAX_DOM_DEPTH` guard (pagination_layout.rs ~1539-1557).
@@ -5148,7 +5350,11 @@ mod tests {
         assert_eq!(metadata.header_cell_ids, vec![h1, h1b]);
         assert!(metadata.body_cell_ids.contains(&h2));
         assert!(metadata.body_cell_ids.contains(&b1));
-        assert!(metadata.body_cell_ids.contains(&foot));
+        // StudioMaak fork: upstream leaves `<tfoot>` in the body, since it
+        // repeats headers only. Here the footer is its own repeating band, so
+        // the cell is collected there instead.
+        assert!(metadata.footer_cell_ids.contains(&foot));
+        assert!(!metadata.body_cell_ids.contains(&foot));
         assert!((metadata.body_origin_px - body_y).abs() < 0.5);
         assert!((metadata.band_height_px - body_y).abs() < 0.5);
     }
