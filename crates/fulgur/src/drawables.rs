@@ -213,11 +213,7 @@ pub struct SvgEntry {
 /// `BlockEntry` / `ParagraphEntry` keyed by the cell's own NodeId
 /// and paints through the standard per-NodeId dispatch.
 ///
-/// Multi-page header repetition (`<thead>` repeated on continuation
-/// pages) needs no payload here: the fragmenter emits per-page repeat
-/// geometry for the header cells themselves
-/// (`pagination_layout::reserve_repeated_header`), and each cell then
-/// paints through the standard per-NodeId dispatch like any other.
+/// Multi-page header repetition is represented by pagination geometry.
 #[derive(Debug, Clone)]
 pub struct TableEntry {
     pub style: crate::draw_primitives::BlockStyle,
