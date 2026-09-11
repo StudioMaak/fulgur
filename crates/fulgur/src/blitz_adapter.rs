@@ -2572,20 +2572,33 @@ fn has_class(elem: &blitz_dom::node::ElementData, name: &str) -> bool {
 ///
 /// Selector components come from the trusted author CSS via `gcpm::parser`
 /// (`Token::Ident` in cssparser), not from arbitrary HTML. Tag and attribute
-/// names are lowercased to match HTML's case-insensitive convention; id,
-/// class and attribute names are still escaped because a hostile author can
-/// craft a bare token containing metacharacters via CSS escapes — defense in
-/// depth on the trusted side, and required by `element_specificity_prefix`
-/// for the untrusted case (fulgur-ka6c). Attribute *values* are emitted as
-/// quoted strings through the same escaper the `content` property uses.
+/// names are lowercased to match HTML's case-insensitive convention.
+///
+/// **Every** ident is escaped — tag names included — because cssparser hands
+/// back the *unescaped* token value: author CSS
+/// `p\7b x { position: running(h) }` parses to `Tag("p{x")`, so an unescaped
+/// tag arm emitted `p{x{display:none}` and the stray `{` swallowed every
+/// following rule in the generated sheet as that rule's body, silently
+/// dropping the suppression for every later running element (upstream
+/// PR #755, CodeRabbit review on PR #719). Escaping keeps each generated rule
+/// well-formed and self-delimiting, so one hostile selector can no longer
+/// disable the others. It is also what `element_specificity_prefix` relies on
+/// for the untrusted case (fulgur-ka6c), and a no-op for ordinary tag names
+/// (`div`, `h1`, `my-widget`), so no existing selector shifts.
+///
+/// Attribute *values* are emitted as quoted strings through the same escaper
+/// the `content` property uses.
 fn selector_text(selector: &ParsedSelector) -> String {
     use std::fmt::Write;
     match selector {
-        ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
+        ParsedSelector::Tag(name) => css_escape_ident(&name.to_ascii_lowercase()),
         ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
         ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
         ParsedSelector::Compound(c) => {
-            let mut out = c.tag.as_deref().unwrap_or("").to_ascii_lowercase();
+            // The compound spelling needs the same tag escaping as the bare
+            // `Tag` arm above — upstream has no `Compound` variant, so its
+            // fix does not reach here.
+            let mut out = css_escape_ident(&c.tag.as_deref().unwrap_or("").to_ascii_lowercase());
             for part in &c.parts {
                 match part {
                     SelectorPart::Class(name) => {
@@ -4448,6 +4461,105 @@ mod tests {
     #[test]
     fn build_running_display_none_css_empty_for_no_mappings() {
         assert!(build_running_display_none_css(&[]).is_empty());
+    }
+
+    /// Upstream PR #755 (CodeRabbit review on PR #719): cssparser stores
+    /// `Token::Ident` *unescaped*, so author CSS `p\7b x { … }` reaches us
+    /// as `Tag("p{x")`. Emitting that tag verbatim produced
+    /// `p{x{display:none}.keep{display:none}` — the stray `{` opens a
+    /// declaration block, so a CSS parser reads every following rule as
+    /// this rule's body and `.keep` never gets its `display: none`. One
+    /// crafted tag selector could therefore un-suppress every other
+    /// running element in the document. Escaping the tag keeps each rule
+    /// self-delimiting.
+    #[test]
+    fn build_running_display_none_css_escapes_tag_metacharacters() {
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag("p{x".into()),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("keep".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r"p\{x{display:none}.keep{display:none}",
+            "the tag's `{{` must be escaped so the following rule survives"
+        );
+    }
+
+    /// The same hole in the *compound* spelling, which is this fork's own
+    /// (`ParsedSelector::Compound`, from the `section[data-section="hdr"]`
+    /// support upstream does not have — so upstream's fix does not cover
+    /// it). `section\7b x[data-role="hdr"]` must escape its tag exactly as
+    /// the bare `Tag` arm does, or the following rule is swallowed the same
+    /// way.
+    #[test]
+    fn build_running_display_none_css_escapes_compound_tag_metacharacters() {
+        use crate::gcpm::{AttrOp, CompoundSelector, SelectorPart};
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Compound(CompoundSelector {
+                    tag: Some("section{x".into()),
+                    parts: vec![SelectorPart::Attr {
+                        name: "data-role".into(),
+                        test: Some((AttrOp::Equals, "hdr".into())),
+                    }],
+                }),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("keep".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r#"section\{x[data-role="hdr"]{display:none}.keep{display:none}"#,
+            "the compound tag's `{{` must be escaped so the following rule survives"
+        );
+    }
+
+    /// The escaping must be a no-op for ordinary tag names, including
+    /// ones ending in a digit (`h1`) and custom elements (`my-widget`) —
+    /// otherwise every existing running-element selector would change.
+    #[test]
+    fn build_running_display_none_css_leaves_ordinary_tags_untouched() {
+        for tag in ["div", "h1", "my-widget", "HEADER"] {
+            let mappings = vec![crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag(tag.into()),
+                running_name: "top".into(),
+            }];
+            assert_eq!(
+                build_running_display_none_css(&mappings),
+                format!("{}{{display:none}}", tag.to_ascii_lowercase()),
+                "escaping must not alter the ordinary tag name {tag}"
+            );
+        }
+    }
+
+    /// Same no-op guarantee for the compound spelling: an ordinary tag
+    /// with an attribute qualifier must serialize unchanged.
+    #[test]
+    fn build_running_display_none_css_leaves_ordinary_compound_tags_untouched() {
+        use crate::gcpm::{AttrOp, CompoundSelector, SelectorPart};
+        let mappings = vec![crate::gcpm::RunningMapping {
+            parsed: ParsedSelector::Compound(CompoundSelector {
+                tag: Some("section".into()),
+                parts: vec![SelectorPart::Attr {
+                    name: "data-section".into(),
+                    test: Some((AttrOp::Equals, "hdr".into())),
+                }],
+            }),
+            running_name: "top".into(),
+        }];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r#"section[data-section="hdr"]{display:none}"#
+        );
     }
 
     /// `relayout_position_fixed` must reshape every `position: fixed`
