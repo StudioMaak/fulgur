@@ -1019,7 +1019,8 @@ dropping the declaration would silently change nothing.
 (`a1 = [(0, 30, 30)]`, `a2 = [(0, 60, 30)]`), with and without a header. Upstream
 filed it as an executable repro rather than a fix, and #728's own commit message
 (`test(pagination): show row-level forced breaks are ignored table-wide`) says
-the same. Not currently used by our templates — worth a check before any of them
+the same. Re-confirmed at `upstream/main` `2632efc3` on 2026-09-11: both probes
+still carry `#[ignore]`, so this is upstream's acknowledged limitation. Not currently used by our templates — worth a check before any of them
 starts relying on it.
 
 Also inherited, and already upstream's known limits rather than ours:
@@ -1028,6 +1029,87 @@ layout algorithm, so a table inside a cell keeps one fragment and overflows the
 page) and `fulgur-naj7.13` (a group that gets `display: table-header-group` from
 CSS rather than the `<thead>` tag is not hoisted, and therefore not repeated —
 our `TableSectionOrderPass` covers the tag spelling only).
+
+## Upstream sync, measured 2026-09-11
+
+Checked against `upstream/main` at `2632efc3` — 77 commits since `dbf4dc62`, of
+which **15 change library source**; the other 40 are coverage, CI, dependency
+bumps and two example-PDF regenerations.
+
+**None of items 8, 13, 14, 15, 16 or 17 is fixed upstream.** Item 17 is now
+confirmed as upstream's *own* limitation, not a gap only we see: both
+`probe_forced_break_on_body_row_is_honoured` and its no-`<thead>` sibling still
+carry `#[ignore]` on `main`.
+
+### Taken: the sync merge
+
+Three things worth having, none of which reads as important from its commit title:
+
+- **PR #741** (`efa0bee7` plus five non-optional follow-ups) — a nested multi-line
+  `<p>` overflowing the remaining strip was emitted as one oversized fragment and
+  **truncated at the page edge**. `fragment_block_subtree_inner` had no
+  line-splitting path; only the body-direct walker did. Silent content loss on any
+  document that nests paragraphs inside theme wrappers, which is all of ours.
+  `efa0bee7` alone regresses grid/flex rows — take the stack whole.
+- **Six fixes hardening the repeating-header stack** we adopted wholesale at
+  `ee0bc36b` (`1b571692`, `f9d35b7c`, `9afbac3d`, `b552dcba`, `d2375cb2`,
+  `214f6222`): headers stranded on page 0 by whitespace and out-of-flow lead nodes,
+  descendant continuations painted under a header that no longer existed, a cursor
+  counting a band the end page never drew. Our `<tfoot>` re-port lives in these
+  exact functions and had none of them.
+- `75add415` + `53e8623b` — `break-inside: avoid` honoured on block containers,
+  including via an external stylesheet. NBB themes declare it.
+
+Our two earlier cherry-picks (`fc5d7b31`, `eb1f9ba1`) are byte-identical to
+upstream's `1ea93faa` / `581f2a62`; they were never revised after we took them.
+
+Post-merge: `cargo test -p fulgur` **2743 passed / 0 failed / 10 ignored** against
+a 2618/0/7 baseline, clippy and fmt clean.
+
+### #719 is being dismantled, not landed
+
+Still draft, still `CHANGES_REQUESTED`. Substantive fragmentation work stopped
+**2026-08-27**; the growth to +19783/−6699 is a WPT ledger and ~1900 lines of
+design docs. #754, #755 and #757 each open with *"Extracted from #719, which is
+blocked on a larger reconciliation with `main`."* The mapping is direct: #719's
+`b8447d27` → #755 commit 1, `c7a10571` → #755 commit 4, `70131441` → #757's second
+defect.
+
+**So the 2026-08-24 decision is superseded.** Take extractions as they appear;
+offer repros 11 and 12 upstream as standalone PRs rather than holding them.
+
+### #755 collided with our GCPM work — the `<thead>` situation again
+
+Upstream arrived independently at our `3118e933`, three weeks later, down to the
+identical `link_integration.rs` assertion change. Resolved by taking theirs (it
+fixes two cases ours missed — running elements under a
+`position:absolute; visibility:hidden` wrapper rendering an *empty* margin box,
+and media-correct scoping) and keeping our `ParsedSelector::Compound`, a variant
+that #755 does not touch and that is item 9. Offer that one upstream standalone.
+
+That review also found a live bug of ours: `selector_to_css`'s tag arms did not
+escape. cssparser stores `Token::Ident` unescaped, so `p\7b x { position:
+running(h) }` emitted `p{x{display:none}…` — the stray `{` opens a declaration
+block and swallows every following generated rule, un-suppressing **every other
+running element in the document**. Fixed in both spellings; upstream's fix
+reaches only the plain-tag one, since they have no `Compound` variant.
+
+### #757 probably closes item 14 — re-measure, do not assume
+
+`fix(pagination): stop losing lines at a page boundary`, CodeRabbit-approved,
+near-zero collision with our hunks. Its first defect is a pre-loop guard: if
+`paragraph_top_in_body + first_line_extent > page_height_px`, break *before* the
+paragraph. Item 14's shape (254mm block, ~4.2mm line, 257mm band) runs straight
+through it. But item 14 is recorded here as **unverified** — rebuilt from those
+parameters it gives the right answer on every engine — so adopt #757 and
+re-measure against the filing fixture before closing it.
+
+### Read `75add415` before writing item 8's patch
+
+Its `drain_column_css_texts` → fold-at-the-`<link>`'s-document-position pattern is
+structurally what item 8 needs, run in the opposite direction. It is the third
+instance of the "inline `<style>` bypasses the handler" shape this file already
+names, solved once for linked stylesheets.
 
 ## Upstream sync, measured 2026-08-24
 
@@ -1068,7 +1150,7 @@ Also note #719 makes "a fragment escaping the content strip" a **panic in all
 test builds**. Our pagination fixes get judged against that invariant on rebase.
 
 Decision (2026-08-24): wait for it to land, then re-port. Do not offer 11/12
-upstream ahead of it.
+upstream ahead of it. **Superseded 2026-09-11 — see below.**
 
 ### Untouched upstream
 

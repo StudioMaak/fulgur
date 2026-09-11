@@ -192,14 +192,41 @@ them. Upstream's `repeating_table_header` has the reference version.
 
 ### Tracking upstream
 
-`upstream/main` is mostly coverage and dependency traffic and merges clean. The one
-to watch is **PR #719** (`fulgur-pgbrk page-fragmentation overhaul`): +9818/−6038 in
-`pagination_layout.rs`, a converged walker replacing the two recursive ones, and a
-new invariant that **panics in test builds** when a fragment escapes the content
-strip. Most of this fork's pagination diff lands in that file. Measured 2026-08-24:
-it does not fix repros 10, 11 or 12, so those fixes survive the rebase as work, not
-as merge conflicts. `paperworx-repros/README.md` has the per-commit portability
-table. Decision on record: wait for it to land, then re-port.
+`upstream/main` is mostly coverage and dependency traffic, but not *only* that — read
+the source diff before assuming a sync is free. Measured 2026-09-11 over the 77 commits
+since `dbf4dc62`: 15 changed library source, and among them was a **P0 silent
+content-loss fix** (upstream PR #741) that a title-level skim reads as routine.
+
+**PR #719 is no longer the thing to wait for.** It is still a draft with
+`CHANGES_REQUESTED`, and its growth since 2026-08-24 (+9818/−6038 → +19783/−6699) is a
+WPT ledger and ~1900 lines of design docs, not fragmentation work — which stopped on
+**2026-08-27**. The author is dismantling it: #754, #755 and #757 each open with
+*"Extracted from #719, which is blocked on a larger reconciliation with `main`."*
+It also branched *before* upstream's own repeating-header stack landed, so it must
+reconcile against the same code our `<tfoot>` re-port sits on — that pain is shared,
+not ours alone.
+
+**Decision superseded** (was: wait for #719 to land, then re-port). Take the
+extractions as they appear, and stop holding repros 11 and 12 back on #719's account —
+offer them as standalone PRs the way #757 was, each with the WeasyPrint/Chrome
+measurement already in `paperworx-repros/README.md`. If #719 ever lands, reconciling a
+merged small PR is upstream's problem, not ours.
+
+Two mechanical traps this sync exposed, both worth repeating next time:
+
+- **`git merge` reported one conflict and silently merged two more files wrong.**
+  `paragraph.rs` (upstream's new `make_test_inline_box` predates our three
+  `InlineBoxItem` fields) and a probe fn that landed twice verbatim. Neither shows in
+  `git status`; `cargo build` catches only one. **Gate a sync on
+  `cargo clippy --all-targets`, not on a clean merge.**
+- **One conflict is a standing policy disagreement, not a mechanical one.** Upstream's
+  `fragment_block_subtree_break_before_after_gap_places_child_at_y_zero` asserts a
+  forced `break-before: page` discards the child's top margin; our `874877ef` /
+  `8d75e147` keep it, measured against WeasyPrint 69 and Chrome 151. Upstream is
+  internally inconsistent — its own
+  `body_level_break_before_preserves_own_top_margin_on_new_page` asserts the margin
+  *is* kept at body level. Expect this to re-conflict on every sync until it is
+  settled upstream.
 
 Paged.js is not a design reference for pagination features: 0.4.3's only table-aware code
 propagates `break-inside: avoid` from `<tbody>`/`<thead>`, and it has no repeat concept at
