@@ -844,6 +844,7 @@ const BREAK_AFTER_LAST_ROW: &str = r#"<!doctype html>
       <tr><td><div class="m" id="last"></div></td></tr>
     </tbody>
   </table>
+  <div class="m" id="after"></div>
 </body></html>"#;
 
 #[test]
@@ -867,6 +868,127 @@ fn probe_break_after_last_row_makes_no_header_only_page() {
         "trailing break manufactured header-only page(s) {phantom:?}: table={table:?}, \
          body pages={body_pages:?}"
     );
+
+    // The sibling after the table must not be offset by a band that was never
+    // drawn: it starts on the page the break moved to, at its top.
+    let after = block_fragments(&layout, "after");
+    println!("[break-after] after = {after:?}");
+    assert!(
+        after[0].1 < 0.5,
+        "sibling placed below a header that was never drawn: after={after:?}"
+    );
+}
+
+/// An out-of-flow first child does not hold the row open, so it must not be
+/// taken as the leading unit that has to fit under the band.
+const ABS_FIRST_CHILD_IN_BODY_CELL: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  #lead { height: 60px; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th { box-sizing: border-box; padding: 0; height: 20px; }
+  td { box-sizing: border-box; padding: 0; position: relative; }
+  #floaty { position: absolute; top: 0; left: 0; width: 20px; height: 5px;
+            background: rgb(8,8,8); }
+  .m { height: 30px; background: rgb(6,6,6); }
+</style></head><body>
+  <div id="lead"></div>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td>
+        <div id="floaty"></div>
+        <div class="m" id="real"></div>
+      </td></tr>
+      <tr><td><div class="m" id="real2"></div></td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+fn probe_out_of_flow_first_child_does_not_shrink_the_reserve() {
+    let engine = engine_200x100();
+    let layout = engine.layout(ABS_FIRST_CHILD_IN_BODY_CELL).expect("layout");
+    let table = table_fragments(&layout, "t");
+    let real = block_fragments(&layout, "real");
+    println!("[abs-lead] table = {table:?}  real = {real:?}");
+    // Without these, missing geometry would leave `header_only` empty and the
+    // test would pass while checking nothing.
+    assert!(!table.is_empty(), "table must record pagination geometry");
+    assert!(!real.is_empty(), "body row must record pagination geometry");
+
+    // lead 60 + band 20 + row 30 = 110 > 100, so the table must not start on
+    // page 0. Measuring the 5px absolute box as the leading unit would make
+    // 60 + 20 + 5 = 85 look like it fits and strand the header there.
+    let body_pages: std::collections::BTreeSet<u32> = real.iter().map(|(p, _, _)| *p).collect();
+    let header_only: Vec<u32> = table
+        .iter()
+        .map(|(p, _, _)| *p)
+        .filter(|p| !body_pages.contains(p))
+        .collect();
+    assert!(
+        header_only.is_empty(),
+        "an out-of-flow first child shrank the reserve: pages {header_only:?} carry \
+         the band with no body row (table={table:?}, real={real:?})"
+    );
+}
+
+/// `break-after: page` on the header row itself.
+const BREAK_ON_HEADER_ROW: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; height: 30px; }
+  #hrow { break-after: page; }
+  .m { height: 30px; background: rgb(6,6,6); }
+</style></head><body>
+  <table id="t">
+    <thead><tr id="hrow"><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><div class="m" id="d1"></div></td></tr>
+      <tr><td><div class="m" id="d2"></div></td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+#[ignore = "forced breaks on rows and row groups are not honoured anywhere in tables — the same break is ignored without a thead. Executable repro — run with --ignored."]
+fn probe_forced_break_on_header_row() {
+    let engine = engine_200x100();
+    let layout = engine.layout(BREAK_ON_HEADER_ROW).expect("layout");
+    let d1 = block_fragments(&layout, "d1");
+    println!("[hdr-row-break] d1 = {d1:?}");
+
+    // Same shape without a repeating header, to tell a repeating-path defect
+    // from the general row-break limitation.
+    let plain = BREAK_ON_HEADER_ROW
+        .replace("<thead><tr id=\"hrow\"><th>H</th></tr></thead>", "")
+        .replace("<tbody>", "<tbody><tr id=\"hrow\"><td>H</td></tr>");
+    let plain_layout = engine.layout(&plain).expect("layout");
+    let plain_d1 = block_fragments(&plain_layout, "d1");
+    println!("[hdr-row-break] no-thead d1 = {plain_d1:?}");
+
+    // The control is what makes the header-row claim meaningful: if plain rows
+    // start honouring the break, this probe's premise has changed and the
+    // #[ignore] reasoning needs revisiting — catch that separately from the
+    // header-row assertion below.
+    assert_eq!(
+        plain_d1
+            .first()
+            .expect("plain table must record a body fragment")
+            .0,
+        0,
+        "plain table rows now honour break-after: page: {plain_d1:?}"
+    );
+
+    assert!(
+        d1.first()
+            .expect("header table must record a body fragment")
+            .0
+            > 0,
+        "break-after:page on the header row was ignored: d1={d1:?} \
+         (same break on a plain row: {plain_d1:?})"
+    );
 }
 
 #[test]
@@ -882,5 +1004,314 @@ fn probe_forced_break_on_body_row_without_thead() {
         a2[0].0 > a1[0].0,
         "break-before:page on a body row is ignored even without a repeating \
          header, so this is a general table limitation: a1={a1:?}, a2={a2:?}"
+    );
+}
+
+/// A zero-height body node can still render: an absolutely positioned pseudo
+/// hangs off it. Such a page must keep its table slice and repeated header.
+const ZERO_HEIGHT_ROW_WITH_ABS_PSEUDO: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #ghost { height: 0; position: relative; break-before: page; }
+  #ghost::before {
+    content: "";
+    position: absolute;
+    top: 0; left: 0;
+    width: 40px; height: 12px;
+    background: rgb(7,7,7);
+  }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><div class="m" id="c1"></div></td></tr>
+      <tr><td><div id="ghost"></div></td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+#[ignore = "break-before:page at the head of a cell is not honoured, so this shape never reaches a second page. The reachable variant — a break after an in-flow sibling in the same cell — is covered by probe_painted_zero_height_box_keeps_its_table_page. Run with --ignored."]
+fn probe_zero_height_row_with_visible_pseudo_keeps_its_page() {
+    let engine = engine_200x100();
+    let layout = engine
+        .layout(ZERO_HEIGHT_ROW_WITH_ABS_PSEUDO)
+        .expect("layout");
+    let table = table_fragments(&layout, "t");
+    let ghost = block_fragments(&layout, "ghost");
+    println!("[zero-abs] table = {table:?}  ghost = {ghost:?}");
+
+    // Wherever the zero-height row landed, the table must still have a slice
+    // there — its positioned pseudo is painted relative to that box.
+    let table_pages: std::collections::BTreeSet<u32> = table.iter().map(|(p, _, _)| *p).collect();
+    let all_pages: std::collections::BTreeSet<u32> = layout
+        .geometry
+        .values()
+        .flat_map(|g| g.fragments.iter().map(|f| f.page_index))
+        .collect();
+    println!("[zero-abs] table_pages={table_pages:?} all_geometry_pages={all_pages:?}");
+    for (page, _, _) in &ghost {
+        assert!(
+            table_pages.contains(page),
+            "page {page} carries a renderable zero-height row but no table slice: \
+             table={table:?}, ghost={ghost:?}"
+        );
+    }
+}
+
+/// A zero-height box that still paints (box-shadow), moved to a continuation
+/// page by a break placed *after* an in-flow sibling in the same cell.
+const ZERO_HEIGHT_PAINTED_AFTER_SIBLING: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #ghost { height: 0; break-before: page; box-shadow: 0 0 0 6px rgb(9,9,9); }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td>
+        <div class="m" id="vis"></div>
+        <div id="ghost"></div>
+      </td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+fn probe_painted_zero_height_box_keeps_its_table_page() {
+    let engine = engine_200x100();
+    let layout = engine
+        .layout(ZERO_HEIGHT_PAINTED_AFTER_SIBLING)
+        .expect("layout");
+    let table = table_fragments(&layout, "t");
+    let ghost = block_fragments(&layout, "ghost");
+    println!("[painted-zero] table = {table:?}  ghost = {ghost:?}");
+
+    let table_pages: std::collections::BTreeSet<u32> = table.iter().map(|(p, _, _)| *p).collect();
+    for (page, _, _) in &ghost {
+        assert!(
+            table_pages.contains(page),
+            "page {page} paints a zero-height box but has no table slice: \
+             table={table:?}, ghost={ghost:?}"
+        );
+    }
+}
+
+/// The last body block sits inside a wrapper, so the wrapper — not the cell —
+/// gets the empty continuation on the page the break advances to.
+const TRAILING_BREAK_INSIDE_WRAPPER: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #last { break-after: page; }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><section id="wrap">
+        <div class="m"></div>
+        <div class="m" id="last"></div>
+      </section></td></tr>
+    </tbody>
+  </table>
+  <div class="m" id="after"></div>
+</body></html>"#;
+
+#[test]
+fn probe_wrapper_continuation_is_not_body_content() {
+    let engine = engine_200x100();
+    let layout = engine
+        .layout(TRAILING_BREAK_INSIDE_WRAPPER)
+        .expect("layout");
+    let table = table_fragments(&layout, "t");
+    let after = block_fragments(&layout, "after");
+    println!(
+        "[wrapper] table = {table:?}  wrap = {:?}  after = {after:?}",
+        block_fragments(&layout, "wrap")
+    );
+    assert!(!table.is_empty(), "table must record geometry");
+    assert!(!after.is_empty(), "sibling must record geometry");
+    assert!(
+        after[0].1 < 0.5,
+        "sibling offset by a band for a page whose only body fragment is an \
+         empty wrapper continuation: after={after:?}, table={table:?}"
+    );
+}
+
+/// A zero-height `<td>` that still paints must keep its page's table slice.
+const PAINTED_ZERO_HEIGHT_CELL: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #first { break-after: page; }
+  #ghost { height: 0; box-shadow: 0 0 0 6px rgb(9,9,9); }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><div class="m" id="first"></div></td></tr>
+      <tr><td id="ghost"></td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+fn probe_painted_zero_height_cell_keeps_its_table_page() {
+    let engine = engine_200x100();
+    let layout = engine.layout(PAINTED_ZERO_HEIGHT_CELL).expect("layout");
+    let table = table_fragments(&layout, "t");
+    let ghost = block_fragments(&layout, "ghost");
+    println!("[painted-cell] table = {table:?}  ghost = {ghost:?}");
+    assert!(!table.is_empty(), "table must record geometry");
+
+    let table_pages: std::collections::BTreeSet<u32> = table.iter().map(|(p, _, _)| *p).collect();
+    for (page, _, _) in &ghost {
+        assert!(
+            table_pages.contains(page),
+            "page {page} paints a zero-height cell but has no table slice: \
+             table={table:?}, ghost={ghost:?}"
+        );
+    }
+}
+
+/// A styled wrapper whose empty continuation lands on a page the table no
+/// longer occupies: geometry must not keep the orphan behind.
+const STYLED_WRAPPER_TRAILING_BREAK: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #wrap { background: rgb(3,3,3); border: 1px solid rgb(4,4,4); }
+  #last { break-after: page; }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><section id="wrap">
+        <div class="m"></div>
+        <div class="m" id="last"></div>
+      </section></td></tr>
+    </tbody>
+  </table>
+  <div class="m" id="after"></div>
+</body></html>"#;
+
+#[test]
+fn probe_discarded_page_keeps_no_descendant_orphans() {
+    let engine = engine_200x100();
+    let layout = engine
+        .layout(STYLED_WRAPPER_TRAILING_BREAK)
+        .expect("layout");
+    let table = table_fragments(&layout, "t");
+    let wrap = block_fragments(&layout, "wrap");
+    println!("[orphan] table = {table:?}  wrap = {wrap:?}");
+    assert!(!table.is_empty(), "table must record geometry");
+
+    // A descendant fragment on a page the table does not occupy has nothing to
+    // sit in: `draw_block_inner_paint` paints a zero-height split fragment at
+    // its full `layout_size`, so a styled wrapper would still show there.
+    let table_pages: std::collections::BTreeSet<u32> = table.iter().map(|(p, _, _)| *p).collect();
+    let orphans: Vec<_> = wrap
+        .iter()
+        .filter(|(page, _, _)| !table_pages.contains(page))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "descendant fragments {orphans:?} remain on pages the table left: \
+         table={table:?}, wrap={wrap:?}"
+    );
+}
+
+/// Inline-block children share one inline formatting context; the fragmenter
+/// keeps that atomic, so the first one is not an independently placeable lead.
+const INLINE_BLOCK_LEAD_IN_CELL: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  #lead { height: 60px; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th { box-sizing: border-box; padding: 0; height: 20px; }
+  td { box-sizing: border-box; padding: 0; }
+  span { display: inline-block; width: 20px; height: 10px; background: rgb(5,5,5); }
+  #tall { height: 30px; background: rgb(6,6,6); }
+</style></head><body>
+  <div id="lead"></div>
+  <table id="t">
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td id="cell"><span id="s1"></span><span id="s2"></span></td></tr>
+      <tr><td><div id="tall"></div></td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+#[ignore = "does not reproduce as reported: the table does not split at all here, so no header-only page appears. It does show content past the page bottom (tall bottom 120 on a 100px page) — a separate defect. Run with --ignored."]
+fn probe_inline_lead_does_not_shrink_the_reserve() {
+    let engine = engine_200x100();
+    let layout = engine.layout(INLINE_BLOCK_LEAD_IN_CELL).expect("layout");
+    let table = table_fragments(&layout, "t");
+    let s1 = block_fragments(&layout, "s1");
+    println!("[inline-lead] table = {table:?}  s1 = {s1:?}");
+    println!(
+        "[inline-lead] tall = {:?}",
+        block_fragments(&layout, "tall")
+    );
+    assert!(!table.is_empty(), "table must record geometry");
+
+    // The reported symptom was a header-only page 0. What actually happens is
+    // that the table never splits, so its last row runs past the page bottom.
+    let tall = block_fragments(&layout, "tall");
+    let overflow: Vec<_> = tall
+        .iter()
+        .filter(|(_, y, h)| y + h > 100.0 + 0.01)
+        .collect();
+    assert!(
+        overflow.is_empty(),
+        "table did not split and its content ran past the page bottom: \
+         {overflow:?} (table={table:?}, s1={s1:?})"
+    );
+}
+
+/// An out-of-flow descendant's forced break is skipped by the fragmenter, so it
+/// must not disqualify the header band from repeating.
+const ABS_BREAK_IN_HEADER: &str = r#"<!doctype html>
+<html><head><style>
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  th { height: 20px; position: relative; }
+  td { height: 30px; }
+  #abs { position: absolute; top: 0; left: 0; width: 1px; height: 1px;
+         break-after: page; }
+</style></head><body>
+  <table id="t">
+    <thead><tr><th id="hdr">H<div id="abs"></div></th></tr></thead>
+    <tbody>
+      <tr><td>1</td></tr><tr><td>2</td></tr><tr><td>3</td></tr>
+      <tr><td>4</td></tr><tr><td>5</td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+
+#[test]
+fn probe_out_of_flow_break_does_not_disqualify_the_header() {
+    let engine = engine_200x100();
+    let layout = engine.layout(ABS_BREAK_IN_HEADER).expect("layout");
+    let hdr = block_fragments(&layout, "hdr");
+    println!("[abs-break] hdr = {hdr:?}");
+    assert!(
+        hdr.len() > 1,
+        "an out-of-flow break stopped the header repeating: hdr={hdr:?}"
     );
 }

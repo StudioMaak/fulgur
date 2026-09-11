@@ -3632,8 +3632,10 @@ fn outline_titles(pdf_bytes: &[u8]) -> Vec<String> {
         // an integration test crate.
         if s.starts_with(&[0xFE, 0xFF]) {
             let chars: Vec<u16> = s[2..]
-                .chunks_exact(2)
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_be_bytes(c))
                 .collect();
             String::from_utf16_lossy(&chars)
         } else {
@@ -6495,4 +6497,220 @@ fn render_unaffected_by_at_page_only_margin_without_builder_override() {
         .render(html)
         .expect("no builder override means Config::validate must not reject @page-only CSS");
     assert!(!pdf.is_empty());
+}
+
+/// A `break-after: page` on the last body block ends the table on the page it
+/// advances to. That page keeps no table fragment, so the band must not be
+/// added to the returned cursor — otherwise the table's next sibling renders
+/// below a header that was never drawn.
+#[test]
+fn table_sibling_after_trailing_forced_break_is_not_offset_by_a_phantom_band() {
+    let html = r#"<!doctype html>
+<html><head><style>
+  @page { size: 200px 100px; margin: 0; }
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #last { break-after: page; }
+</style></head><body>
+  <table>
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><div class="m"></div></td></tr>
+      <tr><td><div class="m" id="last"></div></td></tr>
+    </tbody>
+  </table>
+  <div class="m" id="after"></div>
+</body></html>"#;
+    let pdf = Engine::builder()
+        .build()
+        .render(html)
+        .expect("table with a trailing forced break should render");
+    assert!(!pdf.is_empty());
+}
+
+/// A zero-height box that still paints — here via `box-shadow` — moved to a
+/// continuation page by a forced break must keep the table slice and repeated
+/// header on that page.
+#[test]
+fn table_page_with_only_a_painted_zero_height_box_still_renders() {
+    let html = r#"<!doctype html>
+<html><head><style>
+  @page { size: 200px 100px; margin: 0; }
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #ghost { height: 0; break-before: page; box-shadow: 0 0 0 6px rgb(9,9,9); }
+</style></head><body>
+  <table>
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td>
+        <div class="m"></div>
+        <div id="ghost"></div>
+      </td></tr>
+    </tbody>
+  </table>
+</body></html>"#;
+    let pdf = Engine::builder()
+        .build()
+        .render(html)
+        .expect("painted zero-height continuation should render");
+    assert!(!pdf.is_empty());
+}
+
+/// When a trailing forced break leaves a page without a table fragment, a
+/// styled wrapper inside the cell must not be left painting there: a
+/// zero-height fragment of a split block draws at its full `layout_size`, so
+/// the orphan would appear at the offset of a header that is no longer drawn.
+#[test]
+fn table_discarded_page_leaves_no_styled_wrapper_behind() {
+    let html = r#"<!doctype html>
+<html><head><style>
+  @page { size: 200px 100px; margin: 0; }
+  html, body { margin: 0; padding: 0; }
+  table { margin: 0; border-spacing: 0; width: 100px; }
+  th, td { box-sizing: border-box; padding: 0; }
+  .m { height: 30px; background: rgb(6,6,6); }
+  #wrap { background: rgb(3,3,3); border: 1px solid rgb(4,4,4); }
+  #last { break-after: page; }
+</style></head><body>
+  <table>
+    <thead><tr><th>H</th></tr></thead>
+    <tbody>
+      <tr><td><section id="wrap">
+        <div class="m"></div>
+        <div class="m" id="last"></div>
+      </section></td></tr>
+    </tbody>
+  </table>
+  <div class="m" id="after"></div>
+</body></html>"#;
+    let pdf = Engine::builder()
+        .build()
+        .render(html)
+        .expect("styled wrapper with a trailing forced break should render");
+    assert!(!pdf.is_empty());
+}
+
+/// fulgur-2s7p.1: a first in-flow child (a `<p>` wrapped in one or
+/// more plain `<div>`s, itself the first and only child at every
+/// nesting level) whose own content overflows the remaining page
+/// strip must have its lines continue onto the next page instead of
+/// being silently dropped past the page bottom.
+///
+/// Pre-fix, `pagination_layout.rs`'s nested walker
+/// (`fragment_block_subtree_inner`) had no path to
+/// `fragment_inline_root` (only the body-direct walker did) — a first
+/// in-flow child's `child_page_y` always equals `page_start_y`
+/// (fulgur-2s7p.1's reported gate at line ~2893), so the strip-overflow
+/// check never fired, and the whole nested paragraph was emitted as one
+/// oversized fragment. Reported symptom: exit code 0, no warning, and
+/// 30 of 120 space-separated tokens silently missing from
+/// `pdftotext` output.
+///
+/// Uses `margin: 150px 0` on the `<p>` rather than the originally
+/// reported `padding: 150px 0` — deliberately, not as a simplification.
+/// `padding-top` on inline roots is a separate, pre-existing, already
+/// documented Blitz limitation (CLAUDE.md Gotchas: "`padding-top` on
+/// inline roots ignored (use `margin-top`)"): Taffy correctly sizes
+/// the box including the padding, but the nested walker's split
+/// decision (mirroring the body-direct walker's identical, unmodified
+/// `fragment_inline_root` call) reasons in line-metric space, which
+/// does not include padding either. Verified independently that the
+/// *original* `padding: 150px 0` repro (unchanged from the bug report)
+/// still loses the same 30/120 tokens even with this fix applied, and
+/// that a plain body-direct `<p style="padding:150px 0">` (no nesting
+/// at all) loses them too on unmodified `main` — proving the padding
+/// gap is pre-existing and orthogonal to the nested-recursion defect
+/// this test targets. Tracked separately; not fixed here (see the
+/// fulgur-2s7p.1 fix commit message for the full writeup).
+#[test]
+fn fulgur_2s7p1_nested_first_child_overflow_continues_across_page() {
+    let mut words = String::new();
+    for i in 0..120 {
+        words.push_str(&format!("W{i:04} "));
+    }
+    let html = format!(
+        r#"<!DOCTYPE html>
+<style>@page {{ size: 600px 500px; margin: 50px; }}
+body {{ margin:0; font-size:14px; }}</style>
+<body>
+<div style="height:100px"></div>
+<div><div><p style="margin:150px 0;padding:0;line-height:20px">
+{words}
+</p></div></div>
+</body>"#
+    );
+    let pdf = Engine::builder().build().render(&html).expect("v2 render");
+    assert!(pdf.starts_with(b"%PDF"));
+    let pages = page_count(&pdf);
+    assert!(
+        pages >= 2,
+        "expected the overflow to force a 2nd page, got {pages}"
+    );
+
+    let Some(text) = extract_pdf_text(&pdf) else {
+        // pdftotext not installed locally — page-count assertion above
+        // still exercises the fix; CI has poppler-utils preinstalled.
+        return;
+    };
+    let missing: Vec<String> = (0..120)
+        .map(|i| format!("W{i:04}"))
+        .filter(|tok| !text.contains(tok.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "expected all 120 tokens in pdftotext output, missing: {missing:?}"
+    );
+}
+
+/// fulgur-2s7p.1 follow-up: a `break-inside: avoid` box with a
+/// non-zero top padding — a real CSS Fragmentation class-C break
+/// point, distinct from the zero-gap first-child case the test above
+/// covers — split-before-pushed to a fresh page, whose own short
+/// paragraph fits entirely on that one fresh page (no further page
+/// crossing).
+///
+/// Found while regenerating `examples/break-inside` after the fix
+/// above: `fragment_block_subtree_inner`'s split-before pre-check
+/// resets `page_index` / `page_start_y` / `page_taffy_origin` /
+/// `child_page_y` for the fresh page but deliberately leaves the outer
+/// `cursor_y` untouched (that staleness is intentional for a
+/// grid/flex row, where a parallel sibling cell's bottom must survive
+/// the rebase). The line right after `fragment_inline_root` returns —
+/// `cursor_y = if new_page_index == pre_split_page { cursor_y.max(new_cursor_y) } else { new_cursor_y }`
+/// — then took the `==` branch (the paragraph fit on the fresh page,
+/// no further crossing) and kept the *stale pre-push* `cursor_y` via
+/// `.max()`, since outside a grid/flex row `row_state` was `None` and
+/// nothing had reset it. The parent's own trailing-close fragment
+/// (`cursor_y - page_start_y`) then spanned from that stale pre-push
+/// value down to `page_start_y = 0`, i.e. nearly the *entire* fresh
+/// page — the box's background visibly stretched far past its actual
+/// short content, and the sibling below it (`<div id="after">`) was
+/// pushed onto a spurious extra page reading from the wrong `cursor_y`.
+/// Fixed by only taking the `.max()` when `row_state.is_some()`.
+#[test]
+fn nested_break_inside_avoid_box_with_padding_split_before_does_not_stretch_parent() {
+    let html = r#"<!DOCTYPE html>
+<style>@page { size: 300px 400px; margin: 0; }
+body { margin:0; font-size:14px; line-height:1.4; }</style>
+<body>
+<div style="height:370px"></div>
+<div style="break-inside:avoid; padding-top:20px; background:#eef;">
+<p style="margin:0;padding:0;line-height:20px">Key Insight line one two three four five six seven</p>
+</div>
+<div id="after" style="height:20px; background:#0f0;"></div>
+</body>"#;
+    let pdf = Engine::builder().build().render(html).expect("v2 render");
+    assert!(pdf.starts_with(b"%PDF"));
+    let pages = page_count(&pdf);
+    assert_eq!(
+        pages, 2,
+        "expected the padded break-inside:avoid box (and the sibling after it) to \
+         fit on a compact page 2 — a stale-cursor stretch instead pushes both onto \
+         a spurious extra page, got {pages}"
+    );
 }

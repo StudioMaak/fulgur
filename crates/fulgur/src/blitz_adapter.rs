@@ -239,7 +239,7 @@ pub fn parse_html_with_local_resources(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
     base_path: Option<&Path>,
-) -> (HtmlDocument, crate::gcpm::GcpmContext) {
+) -> (HtmlDocument, crate::gcpm::GcpmContext, Vec<(usize, String)>) {
     use std::collections::HashSet;
 
     let net_provider = Arc::new(crate::net::FulgurNetProvider::new(
@@ -295,7 +295,22 @@ pub fn parse_html_with_local_resources(
     for ctx in net_provider.drain_gcpm_contexts() {
         gcpm.extend_from(ctx);
     }
-    (doc, gcpm)
+
+    // fulgur-s5ro: same dedup as the first resource drain above — a
+    // media-rewritten `<link>`'s original (wrong-media) fetch pushed a
+    // `column_css_texts` entry too, tagged with the *original* `<link>`
+    // node id, which is exactly what `rewrite_node_ids` holds. The
+    // replacement `<style>@import ...>`'s own fetch carries a different
+    // node id (the synthetic element's), so it survives this filter
+    // untouched — `extract_column_style_table`'s DOM walk will find it
+    // there instead once `apply_link_media_rewrites` has replaced the
+    // node in `doc`.
+    let column_css_texts: Vec<(usize, String)> = net_provider
+        .drain_column_css_texts()
+        .into_iter()
+        .filter(|(node_id, _)| !rewrite_node_ids.contains(node_id))
+        .collect();
+    (doc, gcpm, column_css_texts)
 }
 
 /// Make the registered fonts the collection's last resort, but only when it
@@ -689,13 +704,28 @@ fn walk_for_inline_styles(
 /// bytes (O(nodes + css_bytes)), the second applies the cascade (also
 /// O(nodes + css_bytes)). Keeping them separate mirrors the CSS cascade —
 /// stylesheets are parsed once, then matched against every node.
+///
+/// `external_css` is the `(node_id, raw_css_text)` list drained from
+/// [`crate::net::FulgurNetProvider::drain_column_css_texts`] by
+/// [`parse_html_with_local_resources`] (fulgur-s5ro) — every successfully
+/// loaded `<link rel=stylesheet>` / `@import` payload, so their `break-*` /
+/// `column-*` declarations fold into the side-table the same as an inline
+/// `<style>` block's would. Pass `&[]` when there is no linked-resource
+/// context (e.g. `--css` inline content, or a test with no `base_path`).
 pub(crate) fn extract_column_style_table(
     doc: &HtmlDocument,
+    external_css: &[(usize, String)],
 ) -> crate::column_css::ColumnStyleTable {
-    // 1. Concatenate every top-level <style> block's text content.
+    // 1. Concatenate every top-level <style> block's text content, folding
+    //    in each `<link rel=stylesheet>`'s drained text at its own position
+    //    in document order.
     let mut css = String::new();
     let root_id = doc.root_element().id;
-    walk_for_column_styles(doc, root_id, &mut css, 0);
+    let external_by_node: std::collections::BTreeMap<usize, &str> = external_css
+        .iter()
+        .map(|(id, text)| (*id, text.as_str()))
+        .collect();
+    walk_for_column_styles(doc, root_id, &mut css, &external_by_node, 0);
 
     // 2. Parse the aggregate as a stylesheet. `parse_stylesheet` silently
     //    drops malformed rules / unsupported selectors — matches the
@@ -992,6 +1022,23 @@ fn is_vertical_writing_mode(
     !matches!(mode, W::HorizontalTb)
 }
 
+/// True when `node` is a text node holding nothing but whitespace.
+///
+/// The fragmenter skips these: markup formatting puts them between block
+/// children, where they carry no content and have no box of their own. Keeping
+/// the `text_data()` call here rather than at each call site keeps the Blitz
+/// API surface inside this adapter.
+pub fn is_whitespace_only_text_node(node: &Node) -> bool {
+    node.text_data()
+        .is_some_and(|text| text.content.chars().all(char::is_whitespace))
+}
+
+/// True when `node` is taken out of normal flow (absolutely positioned, fixed,
+/// or floated) and so does not contribute to its parent's in-flow height.
+pub fn is_out_of_flow_node(node: &Node) -> bool {
+    child_is_out_of_flow(node)
+}
+
 fn child_is_out_of_flow(node: &Node) -> bool {
     use ::style::properties::longhands::position::computed_value::T as Pos;
     node.primary_styles().is_some_and(|s| {
@@ -1022,13 +1069,40 @@ fn is_block_level_outside(node: &Node) -> bool {
 // <style>". A shared `fn visit_style_blocks<F>(doc, F)` closure-based visitor
 // would collapse them. Kept duplicated for now to avoid risky refactoring
 // during v7a Phase A.
-fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, depth: usize) {
+fn walk_for_column_styles(
+    doc: &HtmlDocument,
+    node_id: usize,
+    out: &mut String,
+    external_css: &std::collections::BTreeMap<usize, &str>,
+    depth: usize,
+) {
     if depth >= MAX_DOM_DEPTH {
         return;
     }
     let Some(node) = doc.get_node(node_id) else {
         return;
     };
+    if let Some(el) = node.element_data()
+        && el.name.local.as_ref() == "link"
+        && el
+            .attr(blitz_dom::LocalName::from("rel"))
+            .is_some_and(|rel| {
+                rel.split_ascii_whitespace()
+                    .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
+            })
+    {
+        // fulgur-s5ro: a plain `<link rel=stylesheet>` (no `media`
+        // attribute — one with a non-empty, non-default value was
+        // already rewritten to a synthetic `<style>@import ...>` by
+        // `apply_link_media_rewrites` before this walk runs, so it no
+        // longer exists as a `<link>` node here) whose fetch landed in
+        // `external_css`, keyed by this node's own id.
+        if let Some(text) = external_css.get(&node_id) {
+            out.push_str(text);
+            out.push('\n');
+        }
+        return;
+    }
     if let Some(el) = node.element_data()
         && el.name.local.as_ref() == "style"
     {
@@ -1063,7 +1137,7 @@ fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, 
         return;
     }
     for &child_id in &node.children {
-        walk_for_column_styles(doc, child_id, out, depth + 1);
+        walk_for_column_styles(doc, child_id, out, external_css, depth + 1);
     }
 }
 
@@ -4531,7 +4605,7 @@ mod tests {
 <html><head><link rel="stylesheet" href="parent.css"></head>
 <body><p class="parent-rule child-rule">x</p></body></html>"#;
 
-        let (_doc, gcpm) =
+        let (_doc, gcpm, _column_css) =
             parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
 
         let cleaned = &gcpm.cleaned_css;
@@ -6781,7 +6855,8 @@ mod tests {
         }
         html.push_str("</body></html>");
 
-        let (doc, _gcpm) = parse_html_with_local_resources(&html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(&html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let root = doc.root_element();
         let _ = element_text(doc.deref(), root.id);
@@ -6819,7 +6894,8 @@ mod tests {
     #[test]
     fn element_text_inserts_space_between_block_children() {
         let html = "<html><body><a id='x'><div>foo</div><div>bar</div></a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6829,7 +6905,8 @@ mod tests {
     #[test]
     fn element_text_inserts_space_for_br() {
         let html = "<html><body><a id='x'>foo<br>bar</a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6841,7 +6918,8 @@ mod tests {
         // If the text already ends in whitespace, a block boundary should
         // not add another space.
         let html = "<html><body><a id='x'>foo <div>bar</div></a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6857,7 +6935,8 @@ mod tests {
         let html = r#"<!doctype html><html><head>
             <style>@page { size: A4 landscape; }</style>
         </head><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert_eq!(
             gcpm.page_settings.len(),
@@ -6869,7 +6948,8 @@ mod tests {
     #[test]
     fn extract_gcpm_from_inline_styles_returns_empty_for_no_style_tag() {
         let html = r#"<!doctype html><html><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert!(gcpm.page_settings.is_empty());
     }
@@ -6884,7 +6964,8 @@ mod tests {
             <style>@page { size: A4 landscape; }</style>
             <style>@page { margin: 2cm; }</style>
         </head><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert_eq!(
             gcpm.page_settings.len(),
@@ -7031,7 +7112,7 @@ mod tests {
         let a = find_element_by_attr_id(doc.deref(), "a");
         let b = find_element_by_attr_id(doc.deref(), "b");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         // `a` picks up both declarations from the stylesheet.
         let a_props = table.get(&a).expect("a in table");
@@ -7050,6 +7131,90 @@ mod tests {
         // Inline `column-rule` overrides only the rule field — `column-fill`
         // is still populated from the stylesheet.
         assert_eq!(b_props.fill, Some(crate::column_css::ColumnFill::Auto));
+    }
+
+    /// fulgur-s5ro: `break-inside` (and the rest of `column_css`'s tiny
+    /// grammar) declared in a genuinely *external* `<link rel=stylesheet>`
+    /// file must reach the side-table, not just inline `style="..."` /
+    /// `<style>` blocks. Before this fix, `walk_for_column_styles` only
+    /// ever scanned inline `<style>` text nodes, so `column_styles.get`
+    /// returned `None` for every element styled purely via `<link>` — the
+    /// exact shape `examples/break-inside`'s `.callout` uses, which is why
+    /// `needs_recursion`'s `avoid_fits_whole_page` guard (fulgur-2s7p.5)
+    /// never actually fired for it despite the CSS declaring
+    /// `break-inside: avoid`.
+    #[test]
+    fn extract_column_style_table_picks_up_linked_external_stylesheet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("style.css"),
+            r#".callout { break-inside: avoid; column-fill: auto; }"#,
+        )
+        .unwrap();
+
+        let html = r#"<!DOCTYPE html>
+<html><head><link rel="stylesheet" href="style.css"></head>
+<body><div class="callout" id="c"></div></body></html>"#;
+
+        let (doc, _gcpm, column_css_texts) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
+        assert!(
+            !column_css_texts.is_empty(),
+            "expected the linked stylesheet's text to be drained"
+        );
+
+        use std::ops::Deref;
+        let c = find_element_by_attr_id(doc.deref(), "c");
+        let table = extract_column_style_table(&doc, &column_css_texts);
+        let props = table.get(&c).expect("callout div must be in the table");
+        assert_eq!(
+            props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid),
+            "break-inside: avoid from the linked stylesheet must resolve, got {props:?}"
+        );
+        assert_eq!(props.fill, Some(crate::column_css::ColumnFill::Auto));
+    }
+
+    #[test]
+    fn extract_column_style_table_picks_up_extensionless_linked_stylesheet() {
+        // codex P2 review on PR #741: `looks_like_css` only recognises a
+        // stylesheet by MIME (`request.content_type`, always empty for
+        // local `file://` fetches — Blitz never populates it there) or by
+        // `.css` file extension. A `<link rel="stylesheet" href="theme">`
+        // (no extension) used to be classified as non-CSS up front, so
+        // `column_css_text` was never captured for it even though Blitz's
+        // own callback still resolves the fetch as `Resource::Css` and
+        // applies its declarations normally — silently dropping
+        // `break-inside` / `column-*` from the side table for this file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("theme"),
+            r#".callout { break-inside: avoid; column-fill: auto; }"#,
+        )
+        .unwrap();
+
+        let html = r#"<!DOCTYPE html>
+<html><head><link rel="stylesheet" href="theme"></head>
+<body><div class="callout" id="c"></div></body></html>"#;
+
+        let (doc, _gcpm, column_css_texts) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
+        assert!(
+            !column_css_texts.is_empty(),
+            "expected the extensionless linked stylesheet's text to be drained"
+        );
+
+        use std::ops::Deref;
+        let c = find_element_by_attr_id(doc.deref(), "c");
+        let table = extract_column_style_table(&doc, &column_css_texts);
+        let props = table.get(&c).expect("callout div must be in the table");
+        assert_eq!(
+            props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid),
+            "break-inside: avoid from the extensionless linked stylesheet must \
+             resolve, got {props:?}"
+        );
+        assert_eq!(props.fill, Some(crate::column_css::ColumnFill::Auto));
     }
 
     #[test]
@@ -7084,7 +7249,7 @@ mod tests {
         let a = find_element_by_attr_id(doc.deref(), "a");
         let n = find_element_by_attr_id(doc.deref(), "n");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         // `screen` media: rule must NOT appear in the table.
         assert!(
@@ -7121,7 +7286,7 @@ mod tests {
         use std::ops::Deref;
         let k = find_element_by_attr_id(doc.deref(), "k");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         let props = table.get(&k).expect("k in table");
         assert_eq!(
