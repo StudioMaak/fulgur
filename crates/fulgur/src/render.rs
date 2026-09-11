@@ -4,7 +4,9 @@ use crate::drawables::Drawables;
 use crate::error::{Error, Result};
 use crate::gcpm::GcpmContext;
 use crate::gcpm::counter::resolve_content_to_html_with_anchor;
-use crate::gcpm::margin_box::{Edge, MarginBoxPosition, MarginBoxRect, compute_edge_layout};
+use crate::gcpm::margin_box::{
+    BlockAlign, Edge, MarginBoxPosition, MarginBoxRect, TextAlign, compute_edge_layout,
+};
 use crate::gcpm::running::RunningElementStore;
 use crate::gcpm::target_ref::AnchorMap;
 use crate::units::F32Units;
@@ -1081,7 +1083,7 @@ pub(crate) fn dispatch_fragment(
     page_index: u32,
 ) {
     if let Some(table) = drawables.tables.get(&node_id) {
-        draw_table_v2(canvas, table, x_pt, y_pt, frag);
+        draw_table_v2(canvas, table, geom, x_pt, y_pt, frag);
         return;
     }
     // True when this block / list-item / paragraph spans multiple
@@ -1354,11 +1356,20 @@ fn paint_multicol_paragraph_slices(
     // `multicol-inline-root-split-case-a`: padding 40px, cutoff
     // ≈ 88pt, but valid slices reach origin_pt.1 + size_pt.1 ≈ 105pt).
     //
-    // `is_split()` (false when `is_repeat=true`) is the right gate:
-    // multicol containers can't be `position: fixed` (the only producer
-    // of `is_repeat=true` geometry; see `pagination_layout.rs:2251`),
-    // so `is_split() == fragments.len() > 1` for any valid input here.
-    // Using the predicate documents the intent.
+    // `is_split()` (false when `is_repeat=true`) is the right gate, but
+    // NOT because multicol can only ever have one fragment per page. It
+    // used to say `position: fixed` was the sole producer of
+    // `is_repeat=true`, so `is_split() == fragments.len() > 1` here; a
+    // repeated table header can hold a multicol container too, which
+    // makes that premise false (fulgur-naj7.12 measured `is_repeat=true`
+    // with one fragment per page for `#mc` inside a `<th>`).
+    //
+    // The predicate is still correct under the real rule: `is_repeat`
+    // fragments are *copies* of the whole container, not slices of it,
+    // so each page must draw the full column content and partitioning
+    // would be wrong. The spike confirmed the rendered output — the
+    // header's paragraphs appear complete on every page
+    // (`tests/repeated_header_is_repeat_contract.rs`).
     let needs_partition = container_geom.is_split();
     let run_tag_node_id = run_tag_target(drawables, source_node_id);
     let use_run_tagging = canvas.tag_collector.is_some()
@@ -2835,48 +2846,63 @@ fn draw_block_inner_paint(
 ///
 /// Tables with `overflow: hidden | clip` route through
 /// [`draw_under_clip_table`] instead so the clip path wraps every
-/// cell dispatched in the same scope. Multi-page table header
-/// repetition (`<thead>` cloned on continuation pages) is deferred
-/// to a later change.
+/// cell dispatched in the same scope. Split tables size their frame
+/// from the current fragment in both paths.
 fn draw_table_v2(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
     entry: &crate::drawables::TableEntry,
+    geom: &crate::pagination_layout::PaginationGeometry,
     x: f32,
     y: f32,
     frag: &crate::pagination_layout::Fragment,
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
+    // A split table can record a zero-height fragment — nested tables
+    // whose header does not fit the remaining outer strip do this on
+    // page 0. `table_box_size` then falls back to the full layout box
+    // (the unsplit zero-height path still needs `cached_height`), so
+    // painting here would leak a full-size frame as a sliver.
+    if geom.is_split() && frag.height <= crate::units::Px::ZERO {
+        return;
+    }
+
     draw_with_opacity(canvas, entry.opacity, |canvas| {
-        let (total_width, total_height) = table_box_size(entry, frag);
+        let (total_width, total_height) = table_box_size(entry, geom, frag);
         if entry.visible {
             paint_table_outer_frame(canvas, entry, x, y, total_width, total_height);
         }
     });
 }
 
-/// Resolve the table's outer-frame width/height from the cached
-/// layout. Falls back to the current Fragment height (and finally
-/// `cached_height`) when `layout_size` is unset (test-only paths).
+/// Resolve the table's outer-frame width/height from split geometry
+/// or the cached layout. Falls back to the current Fragment height
+/// (and finally `cached_height`) when `layout_size` is unset.
 fn table_box_size(
     entry: &crate::drawables::TableEntry,
+    geom: &crate::pagination_layout::PaginationGeometry,
     frag: &crate::pagination_layout::Fragment,
 ) -> (f32, f32) {
     let total_width = entry
         .layout_size
         .map(|s| s.width.to_f32())
         .unwrap_or(entry.width.to_f32());
-    let total_height = entry
-        .layout_size
-        .map(|s| s.height.to_f32())
-        .unwrap_or_else(|| {
-            let from_frag = frag.height.in_pt().to_f32();
-            if from_frag > 0.0 {
-                from_frag
-            } else {
-                entry.cached_height.to_f32()
-            }
-        });
+    let fragment_height = frag.height.in_pt().to_f32();
+    let total_height = if geom.is_split() && fragment_height > 0.0 {
+        fragment_height
+    } else {
+        entry
+            .layout_size
+            .map(|s| s.height.to_f32())
+            .unwrap_or_else(|| {
+                let from_frag = fragment_height;
+                if from_frag > 0.0 {
+                    from_frag
+                } else {
+                    entry.cached_height.to_f32()
+                }
+            })
+    };
     (total_width, total_height)
 }
 
@@ -2904,8 +2930,8 @@ fn paint_table_outer_frame(
     );
 }
 
-/// Push a `compute_overflow_clip_path` clip around the table's outer
-/// frame, dispatch each cell descendant inside the clip, then pop.
+/// Push a `compute_overflow_clip_path` clip around the table's current
+/// fragment frame, dispatch each cell descendant inside the clip, then pop.
 /// Mirrors [`draw_under_clip`]'s shape for blocks but specialised for
 /// tables (no list-item marker, no shared-node_id inner content).
 #[allow(clippy::too_many_arguments)]
@@ -2924,27 +2950,38 @@ fn draw_under_clip_table(
 ) {
     use crate::draw_primitives::draw_with_opacity;
 
-    let _ = geom;
-    let (total_width, total_height) = table_box_size(table, frag);
+    // A 0-tall split slice must not paint or clip at `layout_size` /
+    // `cached_height` — same reason as `draw_table_v2`. Unlike that
+    // no-clip path we must NOT return here: `build_page_skip_sets`
+    // (see `render.rs:463`) routes every cell of an `overflow: hidden`
+    // table through this function, so an early return would drop the
+    // whole page's cells — repeated header included. Suppress the
+    // outer frame and the clip, then dispatch descendants as usual.
+    let zero_height_slice = geom.is_split() && frag.height <= crate::units::Px::ZERO;
+
+    let (total_width, total_height) = table_box_size(table, geom, frag);
 
     draw_with_opacity(canvas, table.opacity, |canvas| {
         // bg / border / shadow OUTSIDE the clip, mirroring
         // `draw_under_clip` for blocks (`pageable.rs:1796-1827`).
-        if table.visible {
+        if table.visible && !zero_height_slice {
             paint_table_outer_frame(canvas, table, x_pt, y_pt, total_width, total_height);
         }
 
         // Push clip — fall through to descendant dispatch even if
         // `compute_overflow_clip_path` returns `None` so the cells
         // still paint (defensive, mirrors `draw_under_clip`).
-        let clip_pushed = if let Some(clip_path) =
-            crate::draw_primitives::compute_overflow_clip_path(
-                &table.style,
-                x_pt,
-                y_pt,
-                total_width,
-                total_height,
-            ) {
+        // A zero-height slice clips to nothing, so skip the push
+        // entirely rather than erase the descendants we just kept.
+        let clip_pushed = if zero_height_slice {
+            false
+        } else if let Some(clip_path) = crate::draw_primitives::compute_overflow_clip_path(
+            &table.style,
+            x_pt,
+            y_pt,
+            total_width,
+            total_height,
+        ) {
             canvas
                 .surface
                 .push_clip_path(&clip_path, &krilla::paint::FillRule::default());
@@ -3558,11 +3595,17 @@ fn parse_datetime(s: &str) -> Option<krilla::metadata::DateTime> {
 
 /// Cached max-content width and rendered `Drawables` for margin boxes.
 /// Measure cache: (html, page_height as bits) → max-content width.
-/// Render cache: (html, final_width as bits, final_height as bits) →
-/// (`Drawables`, `PaginationGeometryTable`).
+/// Render cache: (html, final_width as bits, final_height as bits,
+/// alignment) → (`Drawables`, `PaginationGeometryTable`).
+///
+/// The alignment belongs in the render key because it is written into the
+/// wrapper *before* layout, so it decides where the glyphs land: `@top-left`
+/// and `@top-right` holding identical content on identically-sized rects are
+/// not interchangeable renders. Two slots that do share an alignment still
+/// share the entry.
 type MeasureCache = HashMap<(String, u32, u32), crate::units::Pt>;
 type RenderCache = HashMap<
-    (String, u32, u32),
+    (String, u32, u32, TextAlign, BlockAlign),
     (
         crate::drawables::Drawables,
         crate::pagination_layout::PaginationGeometryTable,
@@ -3743,6 +3786,7 @@ impl<'a> MarginBoxRenderer<'a> {
             .get(&page_idx)
             .map(String::as_str);
         let mut resolved_htmls: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
+        let mut resolved_contents: BTreeMap<MarginBoxPosition, String> = BTreeMap::new();
         for (&pos, rule) in &effective_boxes {
             let content_html = resolve_content_to_html_with_anchor(
                 &rule.content,
@@ -3757,8 +3801,19 @@ impl<'a> MarginBoxRenderer<'a> {
                 implicit_href,
             );
             if !content_html.is_empty() {
+                // Two forms of the same box. `resolved_htmls` keeps the
+                // author's declarations wrapped around the content, which is
+                // what the measure passes size and what the caches key on —
+                // unchanged, because a declaration like `font-size` legitimately
+                // changes the box's max-content width.
+                //
+                // `resolved_contents` keeps the bare content. The render pass
+                // uses it and hands the declarations to `margin_box_document`
+                // separately, so they can style the *box* — a background has to
+                // fill the box's whole band, and an inner wrapper sized to its
+                // own content cannot do that.
                 let html = if rule.declarations.is_empty() {
-                    content_html
+                    content_html.clone()
                 } else {
                     format!(
                         "<div style=\"{}\">{}</div>",
@@ -3767,6 +3822,7 @@ impl<'a> MarginBoxRenderer<'a> {
                     )
                 };
                 resolved_htmls.insert(pos, html);
+                resolved_contents.insert(pos, content_html);
             }
         }
 
@@ -3891,15 +3947,44 @@ impl<'a> MarginBoxRenderer<'a> {
                 .copied()
                 .unwrap_or_else(|| pos.bounding_rect(page_size, resolved_margin));
 
+            // CSS Paged Media 3 §5.3.2 gives each slot a default alignment.
+            // Without it every box renders flush to the top-left of its
+            // rect, which for a lone `@bottom-right` — whose rect spans the
+            // whole content width — puts the footer at the *left* margin.
+            //
+            // It is a *default*, so an author's own `vertical-align` in the
+            // at-rule replaces it. `text-align` needs no equivalent here: it
+            // is inherited, so the author's copy rides along in
+            // `declarations` on the inner element and wins by cascade.
+            let text_align = pos.default_text_align();
+            let block_align = effective_boxes
+                .get(&pos)
+                .and_then(|rule| rule.vertical_align)
+                .unwrap_or_else(|| pos.default_block_align());
+
             let cache_key = (
                 html.clone(),
                 width_key(rect.width.to_f32()),
                 width_key(rect.height.to_f32()),
+                text_align,
+                block_align,
             );
             if !self.render_cache.contains_key(&cache_key) {
-                let render_html = format!(
-                    "<html><head><style>{}</style></head><body style=\"margin:0;padding:0;\">{}</body></html>",
-                    self.margin_css, html
+                let declarations = effective_boxes
+                    .get(&pos)
+                    .map(|rule| rule.declarations.as_str())
+                    .unwrap_or("");
+                let content = resolved_contents
+                    .get(&pos)
+                    .map(String::as_str)
+                    .unwrap_or(html.as_str());
+                let render_html = margin_box_document(
+                    &self.margin_css,
+                    declarations,
+                    content,
+                    rect.height,
+                    text_align,
+                    block_align,
                 );
                 let mut render_doc = crate::blitz_adapter::parse_and_layout(
                     &render_html,
@@ -3909,9 +3994,21 @@ impl<'a> MarginBoxRenderer<'a> {
                     self.system_fonts,
                 );
                 let empty_column_styles = crate::column_css::ColumnStyleTable::new();
+                // Half a CSS pixel of slack on the page height. A box whose
+                // content exactly fills it — a bottom-aligned box, whose
+                // content's bottom edge lands precisely on the box's own
+                // height — otherwise trips the fragmenter's boundary test on
+                // a float comparison, spills onto a second page, and vanishes:
+                // only page 0 is ever drawn. `@left-bottom` / `@right-bottom`
+                // lost their content outright this way.
+                //
+                // The slack is far too small to change where genuinely
+                // overflowing content is cut, which must keep happening —
+                // that clipping is what stops an oversized margin box from
+                // painting over the page body.
                 let geometry = crate::pagination_layout::run_pass_with_break_styles(
                     &mut render_doc,
-                    rect.height.in_px(),
+                    rect.height.in_px() + 0.5.as_px(),
                     &empty_column_styles,
                 );
                 let dummy_store = RunningElementStore::new();
@@ -3981,6 +4078,87 @@ impl<'a> MarginBoxRenderer<'a> {
         // unclickable.
         !resolved_htmls.is_empty()
     }
+}
+
+/// Build the document Blitz lays out for one margin box.
+///
+/// This is the handoff between the two halves of margin-box layout. fulgur
+/// owns the box's rect: `compute_edge_layout` implements the CSS Paged
+/// Media 3 §5.3.3 distribution in Rust, over intrinsic sizes the engine
+/// measured. Everything *inside* that rect is the engine's, so the rect and
+/// the slot's §5.3.2 default alignment are handed over as ordinary CSS
+/// rather than applied afterwards to the painted result — a paint-time
+/// translation would drag the box's background and borders along with its
+/// content, when only the content is meant to move.
+///
+/// Two nested elements, because they are two different things:
+///
+/// Two nested elements, because they are two different things:
+///
+/// - `<body>` is the **slot**: its `margin` / `padding` are zeroed so the
+///   renderer can paint at `rect.x, rect.y` against a (0, 0) body offset.
+/// - the `<div>` is the **margin box**: it takes the rect's height, carries
+///   the author's declarations, and aligns the content inside itself.
+///
+/// The author's declarations have to land on that div rather than on an
+/// inner wrapper, because an inner wrapper is sized to its own content — a
+/// `background` then painted only the strip the text occupied instead of the
+/// whole band. They cannot go on the body either: a body background is not
+/// emitted by this render path at all.
+///
+/// Content taller than its band now spills out of it rather than being cut
+/// off, because the box has an explicit height and centring overflows in
+/// both directions. The reference engines disagree on this degenerate case —
+/// WeasyPrint spills the same way, Chrome contains it — and `overflow:
+/// hidden` does not clip in this render path, so containing it needs the
+/// clip machinery the main path uses. Tracked in paperworx-repros as the
+/// remaining half of item 5.
+///
+/// `margin` is re-zeroed *after* the declarations, so it is the one property
+/// an author cannot set here. The box is positioned by fulgur, not by the
+/// document, and a margin would shift it off the rect the renderer paints
+/// against. `padding` stays overridable — it insets content within the
+/// background, which is exactly what it should do.
+///
+/// Keeping them apart is what makes a `background` fill the whole band, as
+/// Chrome does — the author's declarations used to render on an inner
+/// wrapper sized to its own content, so a background painted only the strip
+/// the text occupied. It also makes an author `margin` behave: it insets the
+/// box within the slot, which is what margin means, while the slot itself
+/// stays pinned to the rect the renderer paints against.
+///
+/// Author declarations come last in the box's style attribute, so they beat
+/// the defaults written before them. `text-align` is inherited, so content
+/// picks it up either way.
+fn margin_box_document(
+    margin_css: &str,
+    declarations: &str,
+    content_html: &str,
+    height: crate::units::Pt,
+    text_align: TextAlign,
+    block_align: BlockAlign,
+) -> String {
+    // Column flex is how the engine is asked to place the content block.
+    // Measured on Blitz: `justify-content` resolves exactly, while
+    // `display: table-cell` + `vertical-align: middle` leaves the content
+    // sitting at the box's top edge.
+    let justify = match block_align {
+        BlockAlign::Top => "flex-start",
+        BlockAlign::Middle => "center",
+        BlockAlign::Bottom => "flex-end",
+    };
+    format!(
+        "<html><head><style>{}</style></head>\
+         <body style=\"margin:0;padding:0;\">\
+         <div style=\"height:{}pt;display:flex;flex-direction:column;\
+         justify-content:{};text-align:{};{};margin:0;\">{}</div></body></html>",
+        margin_css,
+        height.to_f32(),
+        justify,
+        text_align.as_css(),
+        escape_attr(declarations),
+        content_html
+    )
 }
 
 /// Get a layout dimension of the first non-zero child of `<body>` in a Blitz document.
@@ -4579,6 +4757,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         let line = make_shaped_line(vec![crate::paragraph::LineItem::InlineBox(item)]);
         let para = make_para(vec![line]);
@@ -4596,6 +4777,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         make_para(vec![make_shaped_line(vec![
             crate::paragraph::LineItem::InlineBox(item),
@@ -4852,6 +5036,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         let line = make_shaped_line(vec![
             crate::paragraph::LineItem::Image(img),
@@ -5223,9 +5410,32 @@ mod tests {
         };
         let entry = make_table_entry_for_size(Some(sz), 200.0, 50.0);
         let frag = make_frag_with_height(99.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let geom = crate::pagination_layout::PaginationGeometry {
+            fragments: vec![frag.clone()],
+            is_repeat: false,
+        };
+        let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 120.0).abs() < 0.001, "width from layout_size");
         assert!((h - 80.0).abs() < 0.001, "height from layout_size");
+    }
+
+    #[test]
+    fn table_box_size_split_table_uses_fragment_height() {
+        use crate::units::F32Units;
+        let sz = crate::draw_primitives::Size {
+            width: 120.0_f32.as_pt(),
+            height: 80.0_f32.as_pt(),
+        };
+        let entry = make_table_entry_for_size(Some(sz), 200.0, 50.0);
+        let frag = make_frag_with_height(40.0);
+        let mut continuation = frag.clone();
+        continuation.page_index = 1;
+        let geom = crate::pagination_layout::PaginationGeometry {
+            fragments: vec![frag.clone(), continuation],
+            is_repeat: false,
+        };
+        let (_, h) = table_box_size(&entry, &geom, &frag);
+        assert!((h - 30.0).abs() < 0.01, "height = frag.height.in_pt()");
     }
 
     #[test]
@@ -5233,9 +5443,38 @@ mod tests {
         // frag.height = 40 CSS px → 40 × 0.75 = 30 PDF pt (via Px::in_pt)
         let entry = make_table_entry_for_size(None, 150.0, 99.0);
         let frag = make_frag_with_height(40.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let geom = crate::pagination_layout::PaginationGeometry {
+            fragments: vec![frag.clone()],
+            is_repeat: false,
+        };
+        let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
         assert!((h - 30.0).abs() < 0.01, "height = frag.height.in_pt()");
+    }
+
+    #[test]
+    fn table_box_size_split_zero_height_falls_back_to_layout_size() {
+        // The paint guard in `draw_table_v2` / `draw_under_clip_table`
+        // skips this slice. `table_box_size` itself must keep the
+        // layout_size fallback so unsplit callers are unchanged.
+        use crate::units::F32Units;
+        let sz = crate::draw_primitives::Size {
+            width: 120.0_f32.as_pt(),
+            height: 80.0_f32.as_pt(),
+        };
+        let entry = make_table_entry_for_size(Some(sz), 200.0, 50.0);
+        let frag = make_frag_with_height(0.0);
+        let mut continuation = make_frag_with_height(40.0);
+        continuation.page_index = 1;
+        let geom = crate::pagination_layout::PaginationGeometry {
+            fragments: vec![frag.clone(), continuation],
+            is_repeat: false,
+        };
+        let (_, h) = table_box_size(&entry, &geom, &frag);
+        assert!(
+            (h - 80.0).abs() < 0.001,
+            "split zero-height still reports layout_size; paint must skip"
+        );
     }
 
     #[test]
@@ -5244,7 +5483,11 @@ mod tests {
         // guard, so cached_height is used instead.
         let entry = make_table_entry_for_size(None, 150.0, 55.0);
         let frag = make_frag_with_height(0.0);
-        let (w, h) = table_box_size(&entry, &frag);
+        let geom = crate::pagination_layout::PaginationGeometry {
+            fragments: vec![frag.clone()],
+            is_repeat: false,
+        };
+        let (w, h) = table_box_size(&entry, &geom, &frag);
         assert!((w - 150.0).abs() < 0.001, "width falls back to entry.width");
         assert!(
             (h - 55.0).abs() < 0.001,
@@ -5619,6 +5862,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 20.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         let line = crate::paragraph::ShapedLine {
             height: 16.0_f32.as_pt(),
@@ -6033,6 +6279,111 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF"));
     }
 
+    // Minimal 1×1 grayscale baseline JPEG with proper DQT, SOF0, DHT, SOS, and scan data.
+    // Needed to exercise the ImageFormat::Jpeg success path in decode_image_for_v2.
+    const GRAY_1X1_JPEG: &[u8] = &[
+        // SOI
+        0xFF, 0xD8, // APP0 (JFIF), length=16
+        0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x00,
+        // DQT (quantization table 0, 8-bit, all-1s → lossless quality), length=67
+        0xFF, 0xDB, 0x00, 0x43, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        // SOF0 (baseline DCT), length=11: 8-bit, 1×1, 1 component (Y only)
+        0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+        // DHT (DC luma, table 0): length=31, 1 symbol of length 2 = code 0x00 (DC=0)
+        0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0B,
+        // DHT (AC luma, table 0): standard JFIF AC Huffman table, length=181
+        0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03, 0x02, 0x04, 0x03, 0x05, 0x05,
+        0x04, 0x04, 0x00, 0x00, 0x01, 0x7D, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21,
+        0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+        0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A,
+        0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56,
+        0x57, 0x58, 0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
+        0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93,
+        0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9,
+        0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6,
+        0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+        0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7,
+        0xF8, 0xF9, 0xFA,
+        // SOS (scan header): length=8, 1 component, DC table 0, AC table 0
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+        // Huffman-coded scan data for a single 1×1 DC=128 (gray) block, EOB
+        // DC: diff=0 from 128 → code 0x00 (2 bits: 00), AC: EOB → 0xF0 byte
+        0x7F, 0xA0, // EOI
+        0xFF, 0xD9,
+    ];
+
+    // Minimal 1×1 red GIF89a (2-entry global color table, LZW-coded single pixel).
+    const RED_1X1_GIF: &[u8] = &[
+        // Header
+        0x47, 0x49, 0x46, 0x38, 0x39, 0x61, // "GIF89a"
+        // Logical Screen Descriptor
+        0x01, 0x00, // width = 1 (LE)
+        0x01, 0x00, // height = 1 (LE)
+        0x80, // packed: GCT flag=1, color_res=0, sort=0, GCT size=0 → 2 entries
+        0x00, // background color index
+        0x00, // pixel aspect ratio
+        // Global Color Table (2 × 3 bytes)
+        0xFF, 0x00, 0x00, // entry 0: red
+        0x00, 0x00, 0x00, // entry 1: black (filler)
+        // Image Descriptor
+        0x2C, // image separator
+        0x00, 0x00, // image left = 0
+        0x00, 0x00, // image top = 0
+        0x01, 0x00, // image width = 1 (LE)
+        0x01, 0x00, // image height = 1 (LE)
+        0x00, // packed: no local CT, not interlaced
+        // Image Data (LZW min code size=2; CLEAR=4, pixel_index=0, EOI=5)
+        0x02, // LZW minimum code size = 2
+        0x02, // sub-block byte count = 2
+        0x44, // LZW stream byte 0 (3-bit codes packed LSB-first: 4,0,5 → 0x44)
+        0x01, // LZW stream byte 1 (remaining bit of code 5)
+        0x00, // block terminator
+        // Trailer
+        0x3B,
+    ];
+
+    #[test]
+    fn render_smoke_jpeg_image_in_flow() {
+        // Exercises decode_image_for_v2 → ImageFormat::Jpeg branch.
+        let mut bundle = crate::asset::AssetBundle::default();
+        bundle.add_image("img.jpg", GRAY_1X1_JPEG.to_vec());
+        let pdf = crate::engine::Engine::builder()
+            .assets(bundle)
+            .build()
+            .render(
+                r#"<!doctype html><html><body>
+                <img src="img.jpg" style="width:64px;height:64px;">
+                </body></html>"#,
+            )
+            .expect("render");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn render_smoke_gif_image_in_flow() {
+        // Exercises decode_image_for_v2 → ImageFormat::Gif branch.
+        let mut bundle = crate::asset::AssetBundle::default();
+        bundle.add_image("img.gif", RED_1X1_GIF.to_vec());
+        let pdf = crate::engine::Engine::builder()
+            .assets(bundle)
+            .build()
+            .render(
+                r#"<!doctype html><html><body>
+                <img src="img.gif" style="width:64px;height:64px;">
+                </body></html>"#,
+            )
+            .expect("render");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
     // --- draw_svg_v2 / draw_svg_inner_paint ---
 
     #[test]
@@ -6147,6 +6498,27 @@ mod tests {
                 </body></html>"#,
             )
             .expect("tagged render");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[test]
+    fn render_smoke_tagged_pdf_with_table() {
+        // Exercises try_start_tagged for Table/Th/Td elements (the `_ => None` arm).
+        // In tagged mode the table cells are wrapped in artifact spans rather than
+        // semantic structure elements, which exercises the fallback path.
+        let pdf = crate::engine::Engine::builder()
+            .tagged(true)
+            .lang("en")
+            .build()
+            .render(
+                r#"<!doctype html><html><body>
+                <table>
+                  <tr><th>Header A</th><th>Header B</th></tr>
+                  <tr><td>Cell 1</td><td>Cell 2</td></tr>
+                </table>
+                </body></html>"#,
+            )
+            .expect("tagged render with table");
         assert!(pdf.starts_with(b"%PDF"));
     }
 
@@ -7050,6 +7422,99 @@ mod tests {
             <p>Content with left and right margin boxes.</p>
             </body></html>"#,
         );
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    // --- dispatch_inline_box_content: opacity branch (lines 829-843) ---
+
+    #[test]
+    fn render_smoke_inline_block_with_opacity_and_block_child() {
+        // An inline-block with fractional `opacity` containing a block-level
+        // `<div>` child. During convert, the span becomes an opacity scope with
+        // the inner div in `opacity_descendants`. In `dispatch_inline_box_content`
+        // the `!block.opacity_descendants.is_empty()` guard fires, routing through
+        // `draw_under_opacity` (lines 829-843).
+        //
+        // NOTE: outer container MUST be <div>, not <p>. The HTML5 parser
+        // implicitly closes an open <p> when it encounters a block-level <div>
+        // start tag, which would place the <span> outside the paragraph and
+        // prevent the inline-box dispatch path from being exercised.
+        let pdf = render_html(
+            r#"<!doctype html><html><body>
+            <div>Before
+              <span style="display:inline-block;opacity:0.5;
+                           width:60px;height:40px">
+                <div style="width:50px;height:30px;background:#cef">inner</div>
+              </span>
+            after</div>
+            </body></html>"#,
+        );
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    // --- dispatch_inline_box_content: plain subtree descendants (lines 864-892) ---
+
+    #[test]
+    fn render_smoke_inline_block_plain_with_block_descendant() {
+        // An inline-block with NO transform, NO overflow:hidden, NO opacity but
+        // containing a block-level `<div>` child. The child is recorded in
+        // `inline_box_subtree_descendants` so `dispatch_inline_box_content` falls
+        // through to the plain descendant dispatch loop (lines 862-892) after
+        // calling `dispatch_fragment` for the inline-block itself.
+        //
+        // NOTE: outer container MUST be <div> (not <p>) for the same HTML-parser
+        // reason explained in render_smoke_inline_block_with_opacity_and_block_child.
+        let pdf = render_html(
+            r#"<!doctype html><html><body>
+            <div>Before
+              <span style="display:inline-block;width:60px;height:40px">
+                <div style="width:50px;height:20px;background:#fce">child</div>
+              </span>
+            after</div>
+            </body></html>"#,
+        );
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    // --- paint_multicol_paragraph_slices: multi-page multicol partition (lines 1396-1401) ---
+
+    #[test]
+    fn render_smoke_multicol_tall_paragraph_spanning_pages() {
+        // A multicol container with a `column-span: all` direct child forces
+        // the fragmenter (pagination_layout.rs:835-842) to split the container
+        // across pages, giving `container_geom.is_split() = true` and therefore
+        // `needs_partition = true` in `paint_multicol_paragraph_slices`.
+        //
+        // Without `column-span: all` the fragmenter treats the multicol box as
+        // atomic (lines 827-845) and `is_split()` stays false, which skips the
+        // visibility-range filter at lines 1386-1401 entirely.
+        //
+        // Page: 80 mm × 40 mm with zero PDF margins (PageSize::custom = mm;
+        // Margin::uniform = pt). The first paragraph fills the first column group,
+        // the span-all heading forces a new fragment, and the second paragraph
+        // fills subsequent pages — ensuring at least two fragments and therefore
+        // the `needs_partition = true` branch.
+        let sentence = "Alpha beta gamma delta epsilon zeta eta theta iota kappa \
+                        lambda mu nu xi omicron pi rho sigma tau upsilon phi chi \
+                        psi omega. Lorem ipsum dolor sit amet consectetur adipiscing \
+                        elit sed do eiusmod tempor incididunt ut labore et dolore \
+                        magna aliqua ut enim ad minim veniam quis nostrud. ";
+        let long_text = sentence.repeat(4);
+        let html = format!(
+            r#"<!doctype html><html><body style="margin:0">
+            <div style="column-count:2;column-gap:5px;width:80mm;font-size:10px">
+              <p>{long_text}</p>
+              <div style="column-span:all;background:#eee;padding:2px">Spanning heading</div>
+              <p>{long_text}</p>
+            </div>
+            </body></html>"#,
+        );
+        let pdf = crate::engine::Engine::builder()
+            .page_size(crate::config::PageSize::custom(80.0, 40.0))
+            .margin(crate::config::Margin::uniform(0.0))
+            .build()
+            .render(&html)
+            .expect("render");
         assert!(pdf.starts_with(b"%PDF"));
     }
 }

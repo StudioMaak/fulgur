@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!--
+  Repro 16 - a table row never fragments, so `break-inside: auto` on `<tr>`
+  (the CSS default) behaves as `avoid`.
+
+  Twelve rows of eight lines each on an A4 band. Row 04 straddles the first
+  page boundary.
+
+    engine       | break-inside: auto | break-inside: avoid
+    -------------|--------------------|--------------------
+    WeasyPrint 69| row 04 splits      | row 04 moves whole
+    Chrome 151   | row 04 splits      | row 04 moves whole
+    fulgur       | row 04 moves whole | row 04 moves whole
+
+  Both references fragment the row when asked to; fulgur cannot, so the two
+  modes render identically. Benign for paperworx - the NBB themes ask for
+  `tbody tr { break-inside: avoid }`, which is what fulgur does anyway - but
+  it means our documents get the right result for the wrong reason, and a
+  template that drops the declaration silently changes nothing.
+
+  Set the mode below to `auto` or `avoid` to reproduce either column.
+-->
+<html><head><meta charset="utf-8"><title>row break-inside</title><style>
+@page { size: A4; margin: 20mm }
+body { margin: 0; font: 10pt/2.0 "Liberation Sans", Arimo, sans-serif }
+table { width: 100%; border-collapse: collapse }
+td { border: 1px solid #999; padding: 0 }
+tbody tr { break-inside: auto }
+</style></head><body><table><tbody><tr><td>R00L0<br>R00L1<br>R00L2<br>R00L3<br>R00L4<br>R00L5<br>R00L6<br>R00L7</td></tr><tr><td>R01L0<br>R01L1<br>R01L2<br>R01L3<br>R01L4<br>R01L5<br>R01L6<br>R01L7</td></tr><tr><td>R02L0<br>R02L1<br>R02L2<br>R02L3<br>R02L4<br>R02L5<br>R02L6<br>R02L7</td></tr><tr><td>R03L0<br>R03L1<br>R03L2<br>R03L3<br>R03L4<br>R03L5<br>R03L6<br>R03L7</td></tr><tr><td>R04L0<br>R04L1<br>R04L2<br>R04L3<br>R04L4<br>R04L5<br>R04L6<br>R04L7</td></tr><tr><td>R05L0<br>R05L1<br>R05L2<br>R05L3<br>R05L4<br>R05L5<br>R05L6<br>R05L7</td></tr><tr><td>R06L0<br>R06L1<br>R06L2<br>R06L3<br>R06L4<br>R06L5<br>R06L6<br>R06L7</td></tr><tr><td>R07L0<br>R07L1<br>R07L2<br>R07L3<br>R07L4<br>R07L5<br>R07L6<br>R07L7</td></tr><tr><td>R08L0<br>R08L1<br>R08L2<br>R08L3<br>R08L4<br>R08L5<br>R08L6<br>R08L7</td></tr><tr><td>R09L0<br>R09L1<br>R09L2<br>R09L3<br>R09L4<br>R09L5<br>R09L6<br>R09L7</td></tr><tr><td>R10L0<br>R10L1<br>R10L2<br>R10L3<br>R10L4<br>R10L5<br>R10L6<br>R10L7</td></tr><tr><td>R11L0<br>R11L1<br>R11L2<br>R11L3<br>R11L4<br>R11L5<br>R11L6<br>R11L7</td></tr></tbody></table></body></html>

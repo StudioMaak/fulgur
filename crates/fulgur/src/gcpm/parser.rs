@@ -6,10 +6,11 @@ use cssparser::{
 use super::bookmark::{BookmarkLevel, BookmarkMapping};
 use super::margin_box::MarginBoxPosition;
 use super::{
-    ContentCounterMapping, ContentItem, CounterMapping, CounterOp, CounterStyle, ElementPolicy,
-    GcpmContext, LeaderStyle, MarginBoxRule, PageSettingsRule, PageSizeDecl, ParsedSelector,
-    PartialMargin, PseudoElement, RunningMapping, StaticContentMapping, StringPolicy,
-    StringSetMapping, StringSetValue, TargetTextKind, TargetUrl,
+    AttrOp, CompoundSelector, ContentCounterMapping, ContentItem, CounterMapping, CounterOp,
+    CounterStyle, ElementPolicy, GcpmContext, LeaderStyle, MarginBoxRule, PageSettingsRule,
+    PageSizeDecl, ParsedSelector, PartialMargin, PseudoElement, RunningMapping, SelectorPart,
+    StaticContentMapping, StringPolicy, StringSetMapping, StringSetValue, TargetTextKind,
+    TargetUrl,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,6 +43,14 @@ struct GcpmSheetParser<'a> {
     static_content_mappings: &'a mut Vec<StaticContentMapping>,
     page_settings: &'a mut Vec<PageSettingsRule>,
     bookmark_mappings: &'a mut Vec<BookmarkMapping>,
+    /// Source text of the last prelude the parser could not represent.
+    ///
+    /// Set by [`GcpmSheetParser::unsupported_prelude`] and read by
+    /// `parse_block`, which warns when the block those tokens introduce
+    /// carries a paged-media-only declaration. Without it the rule is dropped
+    /// silently — the failure mode that left a running element in the body
+    /// flow of every real filing (paperworx repro 9).
+    rejected_prelude: Option<String>,
 }
 
 /// Describes a region in the original CSS to edit when building `cleaned_css`.
@@ -120,6 +129,77 @@ struct QualifiedPrelude {
     pseudo: Option<PseudoElement>,
 }
 
+impl<'a> GcpmSheetParser<'a> {
+    /// Drain a prelude the parser cannot represent, remembering its source
+    /// text so `parse_block` can report it if the block turns out to carry a
+    /// paged-media-only declaration.
+    ///
+    /// Returns `None` — the `Prelude` value that makes `parse_block` skip the
+    /// rule without recording mappings or CSS edits.
+    fn unsupported_prelude<'i, 't>(
+        &mut self,
+        input: &mut Parser<'i, 't>,
+        start: cssparser::SourcePosition,
+    ) -> Option<QualifiedPrelude> {
+        while input.next_including_whitespace().is_ok() {}
+        let text = input.slice_from(start).trim();
+        // A prelude longer than a line is never a selector a theme meant to
+        // hand a GCPM construct; truncating keeps a hostile stylesheet from
+        // writing an unbounded string into the log.
+        self.rejected_prelude = Some(text.chars().take(120).collect());
+        None
+    }
+}
+
+/// Parse the inside of a `[...]` attribute selector.
+///
+/// Case-sensitivity flags (`[a=b i]`) and namespaces (`[ns|a]`) are rejected
+/// rather than ignored: matching more elements than the author wrote would
+/// hide the wrong ones.
+fn parse_attr_selector<'i, 't>(
+    input: &mut Parser<'i, 't>,
+) -> Result<SelectorPart, ParseError<'i, ()>> {
+    let name = input.expect_ident()?.to_ascii_lowercase();
+    if input.is_exhausted() {
+        return Ok(SelectorPart::Attr { name, test: None });
+    }
+    let op = match input.next()?.clone() {
+        Token::Delim('=') => AttrOp::Equals,
+        Token::IncludeMatch => AttrOp::Includes,
+        Token::DashMatch => AttrOp::DashMatch,
+        Token::PrefixMatch => AttrOp::Prefix,
+        Token::SuffixMatch => AttrOp::Suffix,
+        Token::SubstringMatch => AttrOp::Substring,
+        _ => return Err(input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    let value = match input.next()?.clone() {
+        Token::QuotedString(ref v) => v.to_string(),
+        Token::Ident(ref v) => v.to_string(),
+        _ => return Err(input.new_error::<()>(BasicParseErrorKind::QualifiedRuleInvalid)),
+    };
+    // Anything left is a case flag or a namespace; both change what matches.
+    input.expect_exhausted()?;
+    Ok(SelectorPart::Attr {
+        name,
+        test: Some((op, value)),
+    })
+}
+
+/// Is this token part of a declaration that only means something in paged
+/// media? Those are the ones worth warning about when their rule is dropped:
+/// `content` and `counter-*` are ordinary CSS and appear in every stylesheet.
+fn is_paged_media_only_token(token: &Token<'_>) -> bool {
+    match token {
+        Token::Function(name) => name.eq_ignore_ascii_case("running"),
+        Token::Ident(name) => {
+            name.eq_ignore_ascii_case("string-set")
+                || name.eq_ignore_ascii_case("bookmark-level")
+                || name.eq_ignore_ascii_case("bookmark-label")
+        }
+        _ => false,
+    }
+}
+
 impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
     type Prelude = Option<QualifiedPrelude>;
     type QualifiedRule = TopLevelItem;
@@ -129,6 +209,7 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
         &mut self,
         input: &mut Parser<'i, 't>,
     ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+        let prelude_start = input.position();
         // Skip leading whitespace
         let first = loop {
             match input.next_including_whitespace()?.clone() {
@@ -137,17 +218,63 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
             }
         };
 
-        let selector = match first {
-            Token::Delim('.') => {
-                let name = input.expect_ident()?.clone();
-                ParsedSelector::Class(name.to_string())
+        // A compound selector: an optional type selector, then any number of
+        // `.class` / `#id` / `[attr]` qualifiers on the same element. Real
+        // themes write `section[data-section="hdr"]`, and dropping that shape
+        // is what left a running element in the body flow (paperworx repro 9).
+        let mut tag: Option<String> = None;
+        let mut parts: Vec<SelectorPart> = Vec::new();
+        let mut tok = first;
+        loop {
+            match tok {
+                Token::Delim('.') => {
+                    let name = input.expect_ident()?.clone();
+                    parts.push(SelectorPart::Class(name.to_string()));
+                }
+                Token::IDHash(ref name) => parts.push(SelectorPart::Id(name.to_string())),
+                Token::Ident(ref name) if tag.is_none() && parts.is_empty() => {
+                    tag = Some(name.to_ascii_lowercase());
+                }
+                Token::SquareBracketBlock => match input.parse_nested_block(parse_attr_selector) {
+                    Ok(part) => parts.push(part),
+                    // An attribute selector we cannot represent — an `i`/`s`
+                    // case flag, or a namespace. Bail rather than widen the
+                    // match: a selector matching *more* than the author wrote
+                    // would hide the wrong elements.
+                    Err(_) => return Ok(self.unsupported_prelude(input, prelude_start)),
+                },
+                _ => return Ok(self.unsupported_prelude(input, prelude_start)),
             }
-            Token::IDHash(ref name) => ParsedSelector::Id(name.to_string()),
-            Token::Ident(ref name) => ParsedSelector::Tag(name.to_string()),
-            _ => {
-                while input.next_including_whitespace().is_ok() {}
-                return Ok(None);
+            // Peek: a further qualifier must follow with no whitespace, or the
+            // compound ends here.
+            let state = input.state();
+            match input.next_including_whitespace() {
+                Ok(next) => match next {
+                    Token::Delim('.')
+                    | Token::IDHash(_)
+                    | Token::SquareBracketBlock
+                    | Token::Ident(_) => tok = next.clone(),
+                    _ => {
+                        input.reset(&state);
+                        break;
+                    }
+                },
+                Err(_) => break,
             }
+        }
+
+        let selector = match (tag, parts.len()) {
+            (Some(t), 0) => ParsedSelector::Tag(t),
+            (None, 1) => match parts.remove(0) {
+                SelectorPart::Class(name) => ParsedSelector::Class(name),
+                SelectorPart::Id(name) => ParsedSelector::Id(name),
+                attr => ParsedSelector::Compound(CompoundSelector {
+                    tag: None,
+                    parts: vec![attr],
+                }),
+            },
+            (None, 0) => return Ok(self.unsupported_prelude(input, prelude_start)),
+            (tag, _) => ParsedSelector::Compound(CompoundSelector { tag, parts }),
         };
 
         // Try to detect ::before / ::after pseudo-element
@@ -166,12 +293,13 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
             })
             .ok();
 
-        // Reject compound/group selectors — only simple selectors are supported.
-        // If any non-whitespace tokens remain, this is not a simple selector.
+        // Reject combinators and selector lists — only a single compound
+        // selector is supported. If any non-whitespace tokens remain, this
+        // prelude is one of those.
         while let Ok(tok) = input.next_including_whitespace() {
             match tok {
                 Token::WhiteSpace(_) => {}
-                _ => return Ok(None),
+                _ => return Ok(self.unsupported_prelude(input, prelude_start)),
             }
         }
         Ok(Some(QualifiedPrelude { selector, pseudo }))
@@ -187,9 +315,21 @@ impl<'i, 'a> QualifiedRuleParser<'i> for GcpmSheetParser<'a> {
         // Otherwise, skip the block to avoid replacing declarations with
         // `display: none` for elements that won't be registered as running.
         let Some(qp) = prelude else {
-            while input.next().is_ok() {}
+            let selector = self.rejected_prelude.take();
+            let mut paged_media_only = false;
+            while let Ok(token) = input.next() {
+                paged_media_only |= is_paged_media_only_token(token);
+            }
+            if paged_media_only {
+                log::warn!(
+                    "GCPM declaration ignored: `{}` is not a single compound selector \
+                     (combinators and selector lists are unsupported), so the rule was dropped",
+                    selector.as_deref().unwrap_or("<selector>")
+                );
+            }
             return Ok(TopLevelItem::StyleRule);
         };
+        self.rejected_prelude = None;
 
         let selector = qp.selector;
         let pseudo = qp.pseudo;
@@ -479,10 +619,12 @@ impl<'i, 'a> AtRuleParser<'i> for PageRuleParser<'a> {
     ) -> Result<Self::AtRule, ParseError<'i, ()>> {
         let mut content_items = Vec::new();
         let mut declarations = String::new();
+        let mut vertical_align = None;
 
         let mut parser = MarginBoxParser {
             content: &mut content_items,
             declarations: &mut declarations,
+            vertical_align: &mut vertical_align,
         };
         let iter = RuleBodyParser::new(input, &mut parser);
         for item in iter {
@@ -494,6 +636,7 @@ impl<'i, 'a> AtRuleParser<'i> for PageRuleParser<'a> {
             position,
             content: content_items,
             declarations,
+            vertical_align,
         });
 
         Ok(())
@@ -561,9 +704,38 @@ impl<'i, 'a> RuleBodyItemParser<'i, (), ()> for PageRuleParser<'a> {
 // 3. Margin box block parser (MarginBoxParser)
 // ---------------------------------------------------------------------------
 
+/// Parse a margin box's `vertical-align` value.
+///
+/// Only the three keywords a page-margin box can meaningfully take are
+/// accepted. The baseline-relative values (`baseline`, `sub`, `super`, …)
+/// align an inline box against surrounding text, and a margin box has no
+/// surrounding text to align to — so they are treated as invalid and the
+/// slot's default is kept.
+fn parse_margin_box_vertical_align<'i>(
+    input: &mut Parser<'i, '_>,
+) -> Option<crate::gcpm::margin_box::BlockAlign> {
+    use crate::gcpm::margin_box::BlockAlign;
+    // CSS keywords are ASCII case-insensitive; matching the same way
+    // `MarginBoxPosition::from_at_keyword` does keeps the two consistent.
+    let ident = input.expect_ident().ok()?.to_ascii_lowercase();
+    let value = match ident.as_str() {
+        "top" => Some(BlockAlign::Top),
+        "middle" => Some(BlockAlign::Middle),
+        "bottom" => Some(BlockAlign::Bottom),
+        _ => None,
+    };
+    // A trailing token means the declaration was malformed (`middle red`),
+    // and CSS says to drop the whole thing rather than keep the prefix.
+    if input.next().is_ok() {
+        return None;
+    }
+    value
+}
+
 struct MarginBoxParser<'a> {
     content: &'a mut Vec<ContentItem>,
     declarations: &'a mut String,
+    vertical_align: &'a mut Option<crate::gcpm::margin_box::BlockAlign>,
 }
 
 impl<'i, 'a> DeclarationParser<'i> for MarginBoxParser<'a> {
@@ -578,6 +750,15 @@ impl<'i, 'a> DeclarationParser<'i> for MarginBoxParser<'a> {
     ) -> Result<(), ParseError<'i, ()>> {
         if name.eq_ignore_ascii_case("content") {
             *self.content = parse_content_value(input);
+        } else if name.eq_ignore_ascii_case("vertical-align") {
+            // Taken out of the raw declarations on purpose: this one
+            // positions the box's content *within the box*, so the renderer
+            // has to apply it to the wrapper it sizes to the box rect.
+            // Passed through as raw text it would style the inner element,
+            // where it has no effect. An unrecognised value leaves `None`
+            // standing, so the slot's default survives — per CSS, an invalid
+            // declaration is ignored rather than poisoning the property.
+            *self.vertical_align = parse_margin_box_vertical_align(input);
         } else {
             // Accumulate other declarations as raw text
             let start_pos = input.position();
@@ -1342,6 +1523,7 @@ pub fn parse_gcpm(css: &str) -> GcpmContext {
             static_content_mappings: &mut static_content_mappings,
             page_settings: &mut page_settings,
             bookmark_mappings: &mut bookmark_mappings,
+            rejected_prelude: None,
         };
 
         let iter = StyleSheetParser::new(&mut input, &mut parser);
@@ -1626,6 +1808,65 @@ mod tests {
         );
         assert!(mb.declarations.contains("font-size"));
         assert!(mb.declarations.contains("color"));
+    }
+
+    /// `vertical-align` is lifted out of the raw declarations because it
+    /// positions the content *within the box*: the renderer has to put it on
+    /// the wrapper it sizes to the box rect. Left in the string it would
+    /// style the inner element, where it does nothing — which is exactly the
+    /// bug this parsing fixes.
+    #[test]
+    fn margin_box_vertical_align_is_lifted_out_of_the_declarations() {
+        use crate::gcpm::margin_box::BlockAlign;
+        let css = "@page { @top-center { content: \"x\"; vertical-align: bottom; color: gray } }";
+        let mb = &parse_gcpm(css).margin_boxes[0];
+        assert_eq!(mb.vertical_align, Some(BlockAlign::Bottom));
+        assert!(
+            !mb.declarations.contains("vertical-align"),
+            "vertical-align must not also reach the inner element: {:?}",
+            mb.declarations
+        );
+        assert!(
+            mb.declarations.contains("color"),
+            "sibling declarations must survive: {:?}",
+            mb.declarations
+        );
+    }
+
+    #[test]
+    fn margin_box_vertical_align_accepts_the_three_box_keywords() {
+        use crate::gcpm::margin_box::BlockAlign;
+        for (keyword, expected) in [
+            ("top", BlockAlign::Top),
+            ("middle", BlockAlign::Middle),
+            ("bottom", BlockAlign::Bottom),
+            ("BOTTOM", BlockAlign::Bottom), // CSS keywords are case-insensitive
+        ] {
+            let css =
+                format!("@page {{ @top-center {{ content: \"x\"; vertical-align: {keyword} }} }}");
+            assert_eq!(
+                parse_gcpm(&css).margin_boxes[0].vertical_align,
+                Some(expected),
+                "keyword={keyword}"
+            );
+        }
+    }
+
+    /// An invalid declaration is dropped, leaving the slot's default to
+    /// apply — CSS ignores what it cannot parse rather than poisoning the
+    /// property. `baseline` and friends align an inline box against
+    /// surrounding text, and a margin box has none.
+    #[test]
+    fn margin_box_vertical_align_ignores_values_a_box_cannot_take() {
+        for value in ["baseline", "super", "10px", "middle red", ""] {
+            let css =
+                format!("@page {{ @top-center {{ content: \"x\"; vertical-align: {value} }} }}");
+            let boxes = parse_gcpm(&css).margin_boxes;
+            assert_eq!(
+                boxes[0].vertical_align, None,
+                "value={value:?} should have been ignored"
+            );
+        }
     }
 
     #[test]
@@ -3304,14 +3545,18 @@ mod tests {
     }
 
     #[test]
-    fn test_compound_selector_block_is_drained() {
-        // `.foo.bar` is a compound selector — our parser only handles simple
-        // selectors. When the prelude returns None, the block must be drained
-        // and the rule ignored (lines 190-191).
-        // The follow-up valid rule must still register to prove the block was
-        // drained and parsing continued.
+    fn test_unsupported_selector_block_is_drained() {
+        // A descendant combinator is not a single compound selector, so the
+        // parser cannot represent it. When the prelude returns None the block
+        // must be drained and the rule ignored. The follow-up valid rule must
+        // still register, proving parsing continued from the right place.
+        //
+        // This test used to assert the same of `.foo.bar`, which was a real
+        // limitation and is now supported — verified against WeasyPrint 69,
+        // which puts the running element in the margin box for that selector
+        // and takes it out of the flow. See `test_compound_class_selector`.
         let ctx = parse_gcpm(
-            ".foo.bar { position: running(header); } .valid { position: running(footer); }",
+            ".foo .bar { position: running(header); } .valid { position: running(footer); }",
         );
         assert!(
             !ctx.running_mappings
@@ -3323,6 +3568,104 @@ mod tests {
                 .iter()
                 .any(|m| m.running_name == "footer")
         );
+    }
+
+    #[test]
+    fn test_selector_list_block_is_drained() {
+        let ctx = parse_gcpm(
+            ".foo, .bar { position: running(header); } .valid { position: running(footer); }",
+        );
+        assert!(
+            !ctx.running_mappings
+                .iter()
+                .any(|m| m.running_name == "header")
+        );
+        assert!(
+            ctx.running_mappings
+                .iter()
+                .any(|m| m.running_name == "footer")
+        );
+    }
+
+    /// The bare forms must keep reducing to the simple variants — a `.foo`
+    /// that started arriving as a one-part `Compound` would still match, but
+    /// every existing assertion on `ParsedSelector::Class` would break, and
+    /// the injected CSS would gain needless nesting.
+    #[test]
+    fn test_bare_selectors_still_reduce_to_simple_variants() {
+        for (css, expected) in [
+            (".foo", ParsedSelector::Class("foo".into())),
+            ("#foo", ParsedSelector::Id("foo".into())),
+            ("aside", ParsedSelector::Tag("aside".into())),
+        ] {
+            let ctx = parse_gcpm(&format!("{css} {{ position: running(h); }}"));
+            assert_eq!(ctx.running_mappings[0].parsed, expected, "for `{css}`");
+        }
+    }
+
+    #[test]
+    fn test_compound_class_selector() {
+        let ctx = parse_gcpm(".foo.bar { position: running(h); }");
+        assert_eq!(
+            ctx.running_mappings[0].parsed,
+            ParsedSelector::Compound(CompoundSelector {
+                tag: None,
+                parts: vec![
+                    SelectorPart::Class("foo".into()),
+                    SelectorPart::Class("bar".into())
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn test_attribute_selector_forms() {
+        let cases = [
+            ("[data-role]", None),
+            ("[data-role=hdr]", Some((AttrOp::Equals, "hdr"))),
+            ("[data-role=\"hdr\"]", Some((AttrOp::Equals, "hdr"))),
+            ("[data-role~=\"hdr\"]", Some((AttrOp::Includes, "hdr"))),
+            ("[data-role|=\"hdr\"]", Some((AttrOp::DashMatch, "hdr"))),
+            ("[data-role^=\"hdr\"]", Some((AttrOp::Prefix, "hdr"))),
+            ("[data-role$=\"hdr\"]", Some((AttrOp::Suffix, "hdr"))),
+            ("[data-role*=\"hdr\"]", Some((AttrOp::Substring, "hdr"))),
+        ];
+        for (css, test) in cases {
+            let ctx = parse_gcpm(&format!("section{css} {{ position: running(h); }}"));
+            assert_eq!(
+                ctx.running_mappings.len(),
+                1,
+                "`section{css}` should register a mapping"
+            );
+            assert_eq!(
+                ctx.running_mappings[0].parsed,
+                ParsedSelector::Compound(CompoundSelector {
+                    tag: Some("section".into()),
+                    parts: vec![SelectorPart::Attr {
+                        name: "data-role".into(),
+                        test: test.map(|(op, v)| (op, v.to_string())),
+                    }],
+                }),
+                "for `section{css}`"
+            );
+        }
+    }
+
+    /// A case-sensitivity flag changes *which* elements match, so an
+    /// attribute selector carrying one is rejected rather than matched
+    /// case-sensitively — hiding the wrong elements is worse than not
+    /// hiding at all.
+    #[test]
+    fn test_attribute_selector_with_case_flag_is_rejected() {
+        let ctx = parse_gcpm("section[data-role=\"hdr\" i] { position: running(h); }");
+        assert!(ctx.running_mappings.is_empty());
+    }
+
+    #[test]
+    fn test_tag_after_qualifier_is_rejected() {
+        // `.foo section` is a descendant combinator, not a compound.
+        let ctx = parse_gcpm(".foo section { position: running(h); }");
+        assert!(ctx.running_mappings.is_empty());
     }
 
     // --- page-size error paths (lines 336, 355-357, 363) ---
@@ -3576,5 +3919,275 @@ mod tests {
         // making the whole declaration invalid (returns None → ignored).
         assert_no_page_settings("@page { size: 0pt; }");
         assert_no_page_settings("@page { size: 0mm 200pt; }");
+    }
+
+    // ── parse_counter_style: upper-alpha / upper-latin / lower-latin aliases ──
+
+    #[test]
+    fn test_counter_upper_alpha_style() {
+        // `upper-alpha` → CounterStyle::UpperAlpha.
+        // The `"upper-alpha" | "upper-latin"` match arm (line ~974) was not
+        // previously exercised by any test.
+        let css = r#"@page { @bottom-center { content: counter(chapter, upper-alpha); } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![ContentItem::Counter {
+                name: "chapter".into(),
+                style: CounterStyle::UpperAlpha,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_counter_upper_latin_style_alias() {
+        // `upper-latin` is an alias for `upper-alpha` (same match arm, line ~974).
+        let css = r#"@page { @bottom-center { content: counter(chapter, upper-latin); } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![ContentItem::Counter {
+                name: "chapter".into(),
+                style: CounterStyle::UpperAlpha,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_counter_lower_latin_style_alias() {
+        // `lower-latin` is an alias for `lower-alpha` (line ~975).
+        let css = r#"@page { @bottom-center { content: counter(section, lower-latin); } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![ContentItem::Counter {
+                name: "section".into(),
+                style: CounterStyle::LowerAlpha,
+            }]
+        );
+    }
+
+    // ── GcpmSheetParser::parse_prelude: non-@page at-rule error path ──────────
+
+    #[test]
+    fn test_non_page_at_rule_does_not_crash_and_is_preserved() {
+        // An at-rule other than `@page` must not be extracted as a page rule
+        // and must survive verbatim in `cleaned_css`.
+        // Exercises the early-return error path in `GcpmSheetParser::parse_prelude`
+        // (the `!name.eq_ignore_ascii_case("page")` guard).
+        let css = "@media screen { body { color: red; } }";
+        let ctx = parse_gcpm(css);
+        assert!(ctx.margin_boxes.is_empty());
+        assert!(ctx.page_settings.is_empty());
+        assert!(ctx.running_mappings.is_empty());
+        assert!(
+            ctx.cleaned_css.contains("@media"),
+            "non-page at-rule must survive in cleaned_css: {:?}",
+            ctx.cleaned_css
+        );
+    }
+
+    #[test]
+    fn test_non_page_at_rule_mixed_with_gcpm() {
+        // A `@media` rule alongside real GCPM content: `@media` must survive
+        // in `cleaned_css` while `@page` is removed.
+        let css = "@media print { body { margin: 0; } } @page { size: A4; }";
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.page_settings.len(), 1);
+        assert_eq!(
+            ctx.page_settings[0].size,
+            Some(PageSizeDecl::Keyword("A4".to_string()))
+        );
+        assert!(
+            ctx.cleaned_css
+                .contains("@media print { body { margin: 0; } }"),
+            "complete @media rule must survive in cleaned_css: {:?}",
+            ctx.cleaned_css
+        );
+        assert!(
+            !ctx.cleaned_css.contains("@page"),
+            "@page must be removed: {:?}",
+            ctx.cleaned_css
+        );
+    }
+
+    // ── parse_counter_style: upper-alpha / upper-latin via pseudo-element ─────
+
+    #[test]
+    fn test_pseudo_counter_upper_alpha_style() {
+        // Same `upper-alpha` arm, but accessed through a pseudo-element
+        // `content:` declaration to confirm `parse_content_value` routes it
+        // through `parse_counter_style` correctly.
+        let css = r#"li::before { content: counter(item, upper-alpha) ". "; }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.content_counter_mappings.len(), 1);
+        let items = &ctx.content_counter_mappings[0].content;
+        assert!(
+            items.iter().any(|i| matches!(
+                i,
+                ContentItem::Counter {
+                    style: CounterStyle::UpperAlpha,
+                    ..
+                }
+            )),
+            "expected UpperAlpha counter in items: {items:?}"
+        );
+    }
+
+    // ── parse_page_size_value: trailing token rejection (lines 365-367) ───────
+
+    #[test]
+    fn test_page_size_dim_with_trailing_ident_rejected() {
+        // `100pt` is a valid first dimension, but `landscape` is an ident, not
+        // a dimension. try_parse for height fails (line 357), so h = w = 100pt
+        // and `result = Some(Custom(100, 100))`. Then `input.next()` still
+        // finds `landscape` → trailing token → return None (line 367).
+        // No PageSettingsRule is pushed because size is None and margin is empty.
+        assert_no_page_settings("@page { size: 100pt landscape; }");
+    }
+
+    // ── parse_page_margin_value: trailing-token rejection for >4 values ────────
+    //
+    // Note: the `_ => None` arm at line 417 (values.len() == 0) is defensive
+    // code that cannot be reached through normal CSS parsing: if no valid length
+    // tokens are present the failing try_parse rolls back, leaving the token in
+    // the input, so `input.next()` succeeds and the function returns None at
+    // lines 402-403 before the match is reached. This test exercises the more
+    // common "4 values read, 5th triggers trailing-token rejection" path.
+
+    #[test]
+    fn test_page_margin_five_values_trailing_token_rejected() {
+        // The loop reads 4 values and breaks. The 5th token (`5pt`) is still in
+        // the input → `input.next()` succeeds → return None at lines 402-403
+        // (trailing-token rejection). The margin is not stored. The @page rule
+        // still produces a PageSettingsRule because `size: A4` is valid.
+        let ctx = parse_gcpm("@page { size: A4; margin: 1pt 2pt 3pt 4pt 5pt; }");
+        assert_eq!(ctx.page_settings.len(), 1);
+        let ps = &ctx.page_settings[0];
+        assert!(
+            ps.margin.top.is_none(),
+            "5-value margin shorthand must be discarded; got: {:?}",
+            ps.margin
+        );
+    }
+
+    // ── parse_page_margin_value: zero-value arm (line 417 `_ => None`) ────────
+
+    #[test]
+    fn test_page_margin_zero_values_returns_none() {
+        // The `_ => None` arm (line 417, values.len() == 0) is unreachable
+        // through normal CSS declaration parsing.  Exercise it by calling the
+        // private helper directly with an empty parser: the loop exits
+        // immediately with values = [], `input.next()` fails (exhausted), so
+        // the match falls through to `_ => None`.
+        let mut pi = ParserInput::new("");
+        let mut p = Parser::new(&mut pi);
+        assert!(parse_page_margin_value(&mut p).is_none());
+    }
+
+    // ── parse_string_set_value_list: unknown function silently ignored ────────
+
+    #[test]
+    fn test_string_set_unknown_function_silently_ignored() {
+        // fn_name is neither "content" nor "attr" → implicit else at line 885;
+        // the nested block is exhausted (empty arg list) and `Ok(())` is returned,
+        // so the loop CONTINUES. Using `other-func()` (no arguments) ensures the
+        // nested block is trivially empty after the closure, avoiding an
+        // early-termination via unconsumed nested tokens. A literal placed AFTER
+        // the ignored function is asserted present to prove continuation.
+        let css = r#"h1 { string-set: title "Before" other-func() "After"; }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.string_set_mappings.len(), 1);
+        assert_eq!(
+            ctx.string_set_mappings[0].values,
+            vec![
+                StringSetValue::Literal("Before".to_string()),
+                StringSetValue::Literal("After".to_string()),
+            ]
+        );
+    }
+
+    // ── parse_string_set_value_list: unknown token type silently ignored ──────
+
+    #[test]
+    fn test_string_set_bare_number_token_silently_ignored() {
+        // Token::Number hits `_ => {}` at line 890; the token is consumed and
+        // skipped; the loop CONTINUES. To distinguish continuation from early
+        // termination we place a valid literal AFTER the number and assert that
+        // both the preceding and following literals are retained.
+        let css = r#"h1 { string-set: title "start" 123 "end"; }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.string_set_mappings.len(), 1);
+        assert_eq!(
+            ctx.string_set_mappings[0].values,
+            vec![
+                StringSetValue::Literal("start".to_string()),
+                StringSetValue::Literal("end".to_string()),
+            ]
+        );
+    }
+
+    // ── parse_content_value: target-counters missing separator (line 1171) ───
+
+    #[test]
+    fn test_content_target_counters_non_string_separator_discarded() {
+        // The separator argument must be a quoted string. `not-a-string` is an
+        // ident → try_parse rolls back → Err(_) → return Ok(()) at line 1171;
+        // the TargetCounters item is NOT pushed.
+        //
+        // Early-termination: the rolled-back `not-a-string` token remains
+        // unconsumed in the nested block. parse_nested_block sees this after
+        // Ok(()) and returns Err; the outer try_parse propagates and breaks the
+        // loop. A "prefix" literal BEFORE the malformed call is retained (its
+        // own try_parse succeeded independently); "suffix" AFTER is not.
+        // Fixing this early-termination requires changes to parse_content_value.
+        let css = r#"@page { @top-center { content: "prefix" target-counters(attr(href), page, not-a-string) "suffix"; } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![ContentItem::String("prefix".to_string())]
+        );
+    }
+
+    // ── parse_content_value: target-text invalid URL token (line 1193) ───────
+
+    #[test]
+    fn test_content_target_text_invalid_url_discarded() {
+        // parse_target_url uses try_parse: Token::Number(123) is not attr(),
+        // url(), a quoted string, or an unquoted URL → try_parse rolls back
+        // (123 stays in stream) and returns None (line 1010).
+        // None => return Ok(()) at line 1193; but 123 is still unconsumed in
+        // the nested block → parse_nested_block returns Err → outer loop breaks.
+        // A "prefix" literal BEFORE is retained; "suffix" AFTER is not.
+        let css = r#"@page { @top-center { content: "prefix" target-text(123) "suffix"; } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![ContentItem::String("prefix".to_string())]
+        );
+    }
+
+    // ── parse_content_value: content(unknown) silently ignored (line 1224) ───
+
+    #[test]
+    fn test_content_function_unknown_arg_silently_ignored() {
+        // `content(unknown)` → arg is "unknown" → `_ => {}` at line 1224;
+        // no ContentItem is pushed for that call, but surrounding literals are
+        // kept so the rest of the content list is unaffected.
+        let css = r#"@page { @top-center { content: "prefix" content(unknown) "suffix"; } }"#;
+        let ctx = parse_gcpm(css);
+        assert_eq!(ctx.margin_boxes.len(), 1);
+        assert_eq!(
+            ctx.margin_boxes[0].content,
+            vec![
+                ContentItem::String("prefix".to_string()),
+                ContentItem::String("suffix".to_string()),
+            ]
+        );
     }
 }

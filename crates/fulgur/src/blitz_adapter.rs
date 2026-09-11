@@ -239,7 +239,7 @@ pub fn parse_html_with_local_resources(
     font_data: &[Arc<Vec<u8>>],
     system_fonts: bool,
     base_path: Option<&Path>,
-) -> (HtmlDocument, crate::gcpm::GcpmContext) {
+) -> (HtmlDocument, crate::gcpm::GcpmContext, Vec<(usize, String)>) {
     use std::collections::HashSet;
 
     let net_provider = Arc::new(crate::net::FulgurNetProvider::new(
@@ -295,7 +295,72 @@ pub fn parse_html_with_local_resources(
     for ctx in net_provider.drain_gcpm_contexts() {
         gcpm.extend_from(ctx);
     }
-    (doc, gcpm)
+
+    // fulgur-s5ro: same dedup as the first resource drain above — a
+    // media-rewritten `<link>`'s original (wrong-media) fetch pushed a
+    // `column_css_texts` entry too, tagged with the *original* `<link>`
+    // node id, which is exactly what `rewrite_node_ids` holds. The
+    // replacement `<style>@import ...>`'s own fetch carries a different
+    // node id (the synthetic element's), so it survives this filter
+    // untouched — `extract_column_style_table`'s DOM walk will find it
+    // there instead once `apply_link_media_rewrites` has replaced the
+    // node in `doc`.
+    let column_css_texts: Vec<(usize, String)> = net_provider
+        .drain_column_css_texts()
+        .into_iter()
+        .filter(|(node_id, _)| !rewrite_node_ids.contains(node_id))
+        .collect();
+    (doc, gcpm, column_css_texts)
+}
+
+/// Make the registered fonts the collection's last resort, but only when it
+/// would otherwise have none.
+///
+/// A font-family list that matches nothing has to land somewhere. With system
+/// fonts present that somewhere already exists, and this leaves the collection
+/// untouched — a desktop caller who registers one font still gets the host's
+/// `serif` for `serif`. With no system fonts there is nothing behind the
+/// lookup at all, so every glyph resolves to nothing and the page comes out
+/// blank while the render still reports success. A Worker isolate is always in
+/// that state: WASM has no system fonts whatsoever.
+///
+/// Emptiness is tested by asking the collection rather than by trusting the
+/// `system_fonts` flag. The flag says what was *requested*; on a host where
+/// the request cannot be honoured — WASM again, where it defaults to `true`
+/// and still yields nothing — only the collection knows what is actually
+/// there.
+///
+/// Both hooks are needed. The generic families catch `font-family: Georgia,
+/// serif`, where `serif` is a real fallback the author wrote. The script
+/// fallbacks catch `font-family: Georgia` on its own, which names no generic
+/// for the mapping to reach.
+fn install_last_resort_families(ctx: &mut FontContext, registered: &[parley::fontique::FamilyId]) {
+    use parley::fontique::{FallbackKey, GenericFamily, Script};
+
+    if registered.is_empty() {
+        return;
+    }
+    let has_system_fallback = ctx
+        .collection
+        .generic_families(GenericFamily::SansSerif)
+        .next()
+        .is_some();
+    if has_system_fallback {
+        return;
+    }
+
+    for generic in GenericFamily::all() {
+        ctx.collection
+            .set_generic_families(*generic, registered.iter().copied());
+    }
+    // Fallbacks are keyed by script. Latin is what a document with no system
+    // fonts is overwhelmingly asking for, and registering under it is what
+    // turns a bare unmatched family name into drawn glyphs rather than
+    // nothing at all.
+    ctx.collection.set_fallbacks(
+        FallbackKey::new(Script(*b"Latn"), None),
+        registered.iter().copied(),
+    );
 }
 
 /// The single primitive that actually constructs an `HtmlDocument`.
@@ -329,10 +394,16 @@ fn parse_inner(
             collection,
             source_cache: parley::fontique::SourceCache::new(Default::default()),
         };
+        let mut registered: Vec<parley::fontique::FamilyId> = Vec::new();
         for data in font_data {
             let blob: parley::fontique::Blob<u8> = (**data).clone().into();
-            ctx.collection.register_fonts(blob, None);
+            for (family_id, _) in ctx.collection.register_fonts(blob, None) {
+                if !registered.contains(&family_id) {
+                    registered.push(family_id);
+                }
+            }
         }
+        install_last_resort_families(&mut ctx, &registered);
         Some(ctx)
     };
 
@@ -633,13 +704,28 @@ fn walk_for_inline_styles(
 /// bytes (O(nodes + css_bytes)), the second applies the cascade (also
 /// O(nodes + css_bytes)). Keeping them separate mirrors the CSS cascade —
 /// stylesheets are parsed once, then matched against every node.
+///
+/// `external_css` is the `(node_id, raw_css_text)` list drained from
+/// [`crate::net::FulgurNetProvider::drain_column_css_texts`] by
+/// [`parse_html_with_local_resources`] (fulgur-s5ro) — every successfully
+/// loaded `<link rel=stylesheet>` / `@import` payload, so their `break-*` /
+/// `column-*` declarations fold into the side-table the same as an inline
+/// `<style>` block's would. Pass `&[]` when there is no linked-resource
+/// context (e.g. `--css` inline content, or a test with no `base_path`).
 pub(crate) fn extract_column_style_table(
     doc: &HtmlDocument,
+    external_css: &[(usize, String)],
 ) -> crate::column_css::ColumnStyleTable {
-    // 1. Concatenate every top-level <style> block's text content.
+    // 1. Concatenate every top-level <style> block's text content, folding
+    //    in each `<link rel=stylesheet>`'s drained text at its own position
+    //    in document order.
     let mut css = String::new();
     let root_id = doc.root_element().id;
-    walk_for_column_styles(doc, root_id, &mut css, 0);
+    let external_by_node: std::collections::BTreeMap<usize, &str> = external_css
+        .iter()
+        .map(|(id, text)| (*id, text.as_str()))
+        .collect();
+    walk_for_column_styles(doc, root_id, &mut css, &external_by_node, 0);
 
     // 2. Parse the aggregate as a stylesheet. `parse_stylesheet` silently
     //    drops malformed rules / unsupported selectors — matches the
@@ -936,6 +1022,23 @@ fn is_vertical_writing_mode(
     !matches!(mode, W::HorizontalTb)
 }
 
+/// True when `node` is a text node holding nothing but whitespace.
+///
+/// The fragmenter skips these: markup formatting puts them between block
+/// children, where they carry no content and have no box of their own. Keeping
+/// the `text_data()` call here rather than at each call site keeps the Blitz
+/// API surface inside this adapter.
+pub fn is_whitespace_only_text_node(node: &Node) -> bool {
+    node.text_data()
+        .is_some_and(|text| text.content.chars().all(char::is_whitespace))
+}
+
+/// True when `node` is taken out of normal flow (absolutely positioned, fixed,
+/// or floated) and so does not contribute to its parent's in-flow height.
+pub fn is_out_of_flow_node(node: &Node) -> bool {
+    child_is_out_of_flow(node)
+}
+
 fn child_is_out_of_flow(node: &Node) -> bool {
     use ::style::properties::longhands::position::computed_value::T as Pos;
     node.primary_styles().is_some_and(|s| {
@@ -966,13 +1069,40 @@ fn is_block_level_outside(node: &Node) -> bool {
 // <style>". A shared `fn visit_style_blocks<F>(doc, F)` closure-based visitor
 // would collapse them. Kept duplicated for now to avoid risky refactoring
 // during v7a Phase A.
-fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, depth: usize) {
+fn walk_for_column_styles(
+    doc: &HtmlDocument,
+    node_id: usize,
+    out: &mut String,
+    external_css: &std::collections::BTreeMap<usize, &str>,
+    depth: usize,
+) {
     if depth >= MAX_DOM_DEPTH {
         return;
     }
     let Some(node) = doc.get_node(node_id) else {
         return;
     };
+    if let Some(el) = node.element_data()
+        && el.name.local.as_ref() == "link"
+        && el
+            .attr(blitz_dom::LocalName::from("rel"))
+            .is_some_and(|rel| {
+                rel.split_ascii_whitespace()
+                    .any(|tok| tok.eq_ignore_ascii_case("stylesheet"))
+            })
+    {
+        // fulgur-s5ro: a plain `<link rel=stylesheet>` (no `media`
+        // attribute — one with a non-empty, non-default value was
+        // already rewritten to a synthetic `<style>@import ...>` by
+        // `apply_link_media_rewrites` before this walk runs, so it no
+        // longer exists as a `<link>` node here) whose fetch landed in
+        // `external_css`, keyed by this node's own id.
+        if let Some(text) = external_css.get(&node_id) {
+            out.push_str(text);
+            out.push('\n');
+        }
+        return;
+    }
     if let Some(el) = node.element_data()
         && el.name.local.as_ref() == "style"
     {
@@ -1007,7 +1137,7 @@ fn walk_for_column_styles(doc: &HtmlDocument, node_id: usize, out: &mut String, 
         return;
     }
     for &child_id in &node.children {
-        walk_for_column_styles(doc, child_id, out, depth + 1);
+        walk_for_column_styles(doc, child_id, out, external_css, depth + 1);
     }
 }
 
@@ -1248,6 +1378,97 @@ pub fn extract_vertical_align(node: &blitz_dom::Node) -> crate::paragraph::Verti
                 VerticalAlign::Length(px.as_px().in_pt())
             }
         }
+    }
+}
+
+/// The computed geometry of an inline formatting context's *strut*
+/// (CSS 2.1 §10.8): the zero-width inline box that every line box inherits
+/// from its block container's own `font` and `line-height`.
+///
+/// Parley has no strut concept — a line whose only content is an inline box
+/// gets `ascent = box height`, `descent = 0` — so fulgur has to synthesise it
+/// to place `vertical-align` correctly. Both fields are CSS px.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrutStyle {
+    /// Computed `font-size`.
+    pub font_size: crate::units::Px,
+    /// Used `line-height`.
+    pub line_height: crate::units::Px,
+}
+
+/// Extract the [`StrutStyle`] of an inline formatting context root.
+///
+/// The `line-height: normal` → `1.2 × font-size` mapping mirrors
+/// `blitz-dom-0.2.4 stylo_to_parley.rs:115`, which is what actually fed the
+/// Parley layout we are correcting; using a different factor here would make
+/// the synthesised strut disagree with the line heights Parley produced.
+pub fn extract_strut_style(node: &blitz_dom::Node) -> Option<StrutStyle> {
+    use crate::units::F32Units;
+    use style::values::computed::font::LineHeight;
+
+    let styles = node.primary_styles()?;
+    let font_size = styles.clone_font_size().used_size().px();
+    let line_height = match styles.clone_line_height() {
+        LineHeight::Normal => font_size * 1.2,
+        LineHeight::Number(num) => font_size * num.0,
+        LineHeight::Length(len) => len.0.px(),
+    };
+    Some(StrutStyle {
+        font_size: font_size.as_px(),
+        line_height: line_height.as_px(),
+    })
+}
+
+/// The used `margin-top` / `margin-left` of an atomic inline box, in CSS px.
+///
+/// This is the conversion between the two boxes fulgur has to hold in its
+/// head at once for an inline-block. Parley's inline box is the **margin**
+/// box — `blitz-dom-0.2.4 layout/inline.rs:56` builds it as
+/// `margin.left + margin.right + width` by `margin.top + margin.bottom +
+/// height` — so `InlineBoxItem::height`, and the line-box arithmetic that
+/// consumes it, are margin-box quantities. But every position fulgur records
+/// *for the node itself* is its **border** box: `layout/inline.rs:239` sets
+/// `location = ibox.{x,y} + margin.{left,top} + ...`, and that is the slot
+/// `render::dispatch_inline_box_content` writes `computed_y` / `x_offset`
+/// into. Mixing the two silently shifts a margined inline-block up and left
+/// by its own margins.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineBoxMargins {
+    pub top: crate::units::Px,
+    pub left: crate::units::Px,
+}
+
+/// Extract the [`InlineBoxMargins`] of an atomic inline box.
+///
+/// `auto` is zero on both axes for an inline-level box (CSS 2.1 §10.3.2,
+/// §10.6.4), and a percentage resolves against `cb_width` on both axes
+/// (§8.3). `cb_width` should be the inline formatting context root's own
+/// width, which is what blitz-dom resolves against.
+pub fn extract_inline_box_margins(
+    node: &blitz_dom::Node,
+    cb_width: crate::units::Px,
+) -> InlineBoxMargins {
+    use crate::units::F32Units;
+    use style::values::computed::Length;
+    use style::values::generics::length::GenericMargin as Margin;
+
+    let Some(styles) = node.primary_styles() else {
+        return InlineBoxMargins::default();
+    };
+    let basis = Length::new(cb_width.to_f32());
+    let resolve = |m: &Margin<style::values::computed::LengthPercentage>| match m {
+        Margin::LengthPercentage(lp) | Margin::AnchorContainingCalcFunction(lp) => {
+            lp.resolve(basis).px().as_px()
+        }
+        // `auto` is zero for an inline-level box; `anchor-size()` needs an
+        // anchor element fulgur does not resolve, and CSS Anchor Positioning 1
+        // makes an unresolvable one behave as its fallback, which is zero here.
+        Margin::Auto | Margin::AnchorSizeFunction(_) => crate::units::Px::ZERO,
+    };
+    let margin = styles.get_margin();
+    InlineBoxMargins {
+        top: resolve(&margin.margin_top),
+        left: resolve(&margin.margin_left),
     }
 }
 
@@ -1539,6 +1760,453 @@ fn caption_display_is_table_caption(doc: &HtmlDocument, caption_id: usize) -> bo
     doc.get_node(caption_id)
         .and_then(|n| n.primary_styles())
         .is_some_and(|s| s.clone_display() == Display::TableCaption)
+}
+
+/// Which of a `<table>`'s two promotable section groups a child is, by its
+/// *computed* display.
+///
+/// Keyed on the computed value rather than on the tag name because that is
+/// what decides placement: `<tfoot style="display:table-row-group">` is an
+/// ordinary row group and both reference engines leave it in source order
+/// (WeasyPrint 69 and Chrome 151 agree), while a tag-name test would wrongly
+/// demote it to the bottom. It is also the same predicate blitz-dom's own
+/// `collect_table_cells` dispatches on, so this pass and the code consuming
+/// its output classify a child identically.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableSectionGroup {
+    Header,
+    Footer,
+}
+
+/// Classify `node_id` as a table header / footer group, or `None` for
+/// anything else (row groups, `<caption>`, `<colgroup>`, `display: none`).
+fn table_section_group(doc: &HtmlDocument, node_id: usize) -> Option<TableSectionGroup> {
+    use ::style::values::specified::box_::DisplayInside;
+    let display = doc
+        .get_node(node_id)
+        .and_then(|n| n.primary_styles())
+        .map(|s| s.clone_display())?;
+    match display.inside() {
+        DisplayInside::TableHeaderGroup => Some(TableSectionGroup::Header),
+        DisplayInside::TableFooterGroup => Some(TableSectionGroup::Footer),
+        _ => None,
+    }
+}
+
+/// The element children of `node_id`, in document order.
+///
+/// Whitespace between `<thead>` and `<tbody>` survives html5ever's "in
+/// table" insertion mode as a text node, so "is this section first / last"
+/// has to be asked of the element children rather than of `children`.
+fn element_children(doc: &HtmlDocument, node_id: usize) -> Vec<usize> {
+    let Some(node) = doc.get_node(node_id) else {
+        return Vec::new();
+    };
+    node.children
+        .iter()
+        .copied()
+        .filter(|&child_id| {
+            doc.get_node(child_id)
+                .is_some_and(|c| c.element_data().is_some())
+        })
+        .collect()
+}
+
+/// Collect every `<table>` whose `<thead>` / `<tfoot>` children are not
+/// already written in visual order.
+///
+/// Deliberately a *tag-name* prefilter, run before any `resolve()`: it costs
+/// one DOM walk and lets the overwhelming majority of documents — every
+/// table already written header-first / footer-last — skip the pass's
+/// re-resolve entirely. Candidates are re-classified by computed display
+/// afterwards, so a candidate can still turn out to need no move.
+fn collect_misordered_section_tables(doc: &HtmlDocument) -> Vec<usize> {
+    let mut out = Vec::new();
+    collect_misordered_section_tables_recursive(doc, doc.root_element().id, 0, &mut out);
+    out
+}
+
+fn collect_misordered_section_tables_recursive(
+    doc: &HtmlDocument,
+    node_id: usize,
+    depth: usize,
+    out: &mut Vec<usize>,
+) {
+    if depth >= MAX_DOM_DEPTH {
+        return;
+    }
+    let Some(node) = doc.get_node(node_id) else {
+        return;
+    };
+    let is_table = node
+        .element_data()
+        .is_some_and(|el| el.name.local.as_ref() == "table");
+    if is_table {
+        let children = element_children(doc, node_id);
+        let tagged = |id: usize, tag: &str| {
+            doc.get_node(id)
+                .and_then(|c| c.element_data())
+                .is_some_and(|el| el.name.local.as_ref() == tag)
+        };
+        let head_misplaced = children
+            .iter()
+            .position(|&id| tagged(id, "thead"))
+            .is_some_and(|i| i != 0);
+        let foot_misplaced = children
+            .iter()
+            .position(|&id| tagged(id, "tfoot"))
+            .is_some_and(|i| i + 1 != children.len());
+        if head_misplaced || foot_misplaced {
+            out.push(node_id);
+        }
+    }
+    let children = node.children.clone();
+    for child_id in children {
+        collect_misordered_section_tables_recursive(doc, child_id, depth + 1, out);
+    }
+}
+
+/// Reorder `table_id`'s children so `head` is first and `foot` is last,
+/// leaving every other child — text nodes included — in relative order.
+///
+/// Writes `Node::children` directly instead of going through
+/// `DocumentMutator`, and that is the whole point: a mutator move marks the
+/// parent `RestyleHint::restyle_subtree()`, so the next `resolve()`
+/// re-matches selectors against the *moved* order, where a browser matches
+/// source order and reorders only boxes. Rewriting the vec in place changes
+/// what box construction walks without telling Stylo anything, so the
+/// cascade this pass just computed — in source order — is the one that
+/// survives. See [`TableSectionOrderPass`] for the ordering rules and for
+/// what this buys.
+///
+/// Safe because `children` is the tree's only record of child order:
+/// `Node` caches no child index (`index_of_child` searches the vec), and the
+/// reorder adds and removes nothing, so every parent pointer, id-map entry
+/// and computed style stays valid.
+///
+/// **Depends on blitz-dom rebuilding the box tree on every resolve.**
+/// `resolve_layout_children` rebuilds unconditionally under
+/// `NON_INCREMENTAL`, which is blitz-dom 0.2.4's default (its `incremental`
+/// feature is off, and fulgur does not enable it); the damage constants that
+/// would let this pass ask for a rebuild explicitly live in a private module
+/// and cannot be named from here. If that ever changes, the reorder is
+/// ignored and the footer renders at the top again — which
+/// `tests/table_section_order.rs` fails loudly on rather than letting it
+/// pass silently.
+fn reorder_table_children(
+    doc: &mut HtmlDocument,
+    table_id: usize,
+    head: Option<usize>,
+    foot: Option<usize>,
+) {
+    let Some(table) = doc.get_node_mut(table_id) else {
+        return;
+    };
+    if let Some(head_id) = head {
+        if let Some(pos) = table.children.iter().position(|&id| id == head_id) {
+            let id = table.children.remove(pos);
+            table.children.insert(0, id);
+        }
+    }
+    if let Some(foot_id) = foot {
+        if let Some(pos) = table.children.iter().position(|&id| id == foot_id) {
+            let id = table.children.remove(pos);
+            table.children.push(id);
+        }
+    }
+}
+
+/// Orders a `<table>`'s sections the way CSS puts them in the table box,
+/// whatever order they were written in.
+///
+/// CSS 2.1 §17.5.1 lays a table's boxes out header group → row groups →
+/// footer group regardless of source order, and HTML4 *required* `<tfoot>`
+/// to be written before `<tbody>`, so real documents carry the shape.
+/// blitz-dom builds the cell grid by walking the table's DOM children in
+/// order — `layout/table.rs::collect_table_cells` gives `TableHeaderGroup`
+/// and `TableFooterGroup` the same arm as `TableRowGroup`, assigning grid
+/// rows as it goes — so without this pass a `<tfoot>` written first renders
+/// at the *top* of the table.
+///
+/// Only the **first** header group and the **first** footer group are
+/// promoted; every other child, additional header / footer groups included,
+/// keeps its source position between them. That is CSS 2.1's model and both
+/// reference engines reproduce it exactly: on
+/// `<tfoot A><thead A><tbody><tfoot B><thead B>` WeasyPrint 69 and Chrome
+/// 151 both draw `HEAD A → rows → FOOT B → HEAD B → FOOT A`.
+///
+/// Runs before the engine's own `resolve()` and re-resolves internally,
+/// because the classification is a computed display; that cost is paid only
+/// by a document that actually contains a misordered section, and the
+/// tag-name prefilter in [`collect_misordered_section_tables`] is what keeps
+/// well-formed tables from paying it. Same shape as
+/// [`CaptionRestructurePass`].
+///
+/// Unlike that pass this one needs no `visibility: hidden` guard: a section
+/// stays inside the table it was written in, so no cascade that hid it can
+/// be escaped by the move. A `display: none` child is never classified as a
+/// section group in the first place (its `DisplayInside` is `None`), and a
+/// `display: none` *table* is skipped outright — it draws nothing, so the
+/// move would be pure restyle cost.
+///
+/// A browser reorders *boxes* and leaves the DOM alone, so a structural
+/// selector still matches source order: with `<tfoot>` written first,
+/// `table > tbody:nth-child(3)` matches the `<tbody>` in both references.
+/// This pass reproduces that by separating the two — it resolves the cascade
+/// *before* touching anything, and then reorders via
+/// [`reorder_table_children`], which rewrites `Node::children` without
+/// marking a restyle, so box construction walks the new order while the
+/// styles keep the ones matched against the old one. That split is also why
+/// the pass runs last in `engine.rs`, immediately before the engine's own
+/// `resolve()`: anything that injects CSS afterwards would dirty the stylist
+/// and re-cascade against the moved order.
+pub struct TableSectionOrderPass;
+
+impl DomPass for TableSectionOrderPass {
+    fn apply(&self, doc: &mut HtmlDocument, _ctx: &PassContext<'_>) {
+        let candidates = collect_misordered_section_tables(doc);
+        if candidates.is_empty() {
+            return;
+        }
+        // `table_section_group` reads a cascaded style, so resolve once. The
+        // engine re-resolves the reordered tree afterwards.
+        resolve(doc);
+        for table_id in candidates {
+            if display_is_none(doc, table_id) {
+                continue;
+            }
+            let children = element_children(doc, table_id);
+            let first_of = |group: TableSectionGroup| {
+                children
+                    .iter()
+                    .copied()
+                    .find(|&id| table_section_group(doc, id) == Some(group))
+            };
+            // Only pass along a section that is not already at its edge, so
+            // a table that needs just one of the two moves keeps the other
+            // child exactly where it is.
+            let head = first_of(TableSectionGroup::Header)
+                .filter(|head_id| children.first() != Some(head_id));
+            let foot = first_of(TableSectionGroup::Footer)
+                .filter(|foot_id| children.last() != Some(foot_id));
+            reorder_table_children(doc, table_id, head, foot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod table_section_order_tests {
+    use super::*;
+
+    fn tags_of_children(doc: &HtmlDocument, parent_id: usize) -> Vec<String> {
+        element_children(doc, parent_id)
+            .into_iter()
+            .filter_map(|id| {
+                doc.get_node(id)
+                    .and_then(|n| n.element_data())
+                    .map(|el| el.name.local.as_ref().to_string())
+            })
+            .collect()
+    }
+
+    fn find_first_table(doc: &HtmlDocument, node_id: usize) -> Option<usize> {
+        let node = doc.get_node(node_id)?;
+        if node
+            .element_data()
+            .is_some_and(|el| el.name.local.as_ref() == "table")
+        {
+            return Some(node_id);
+        }
+        node.children
+            .clone()
+            .into_iter()
+            .find_map(|child| find_first_table(doc, child))
+    }
+
+    /// Run the pass the way the engine does, and report the table's element
+    /// children by tag afterwards.
+    fn section_order_after_pass(html: &str) -> Vec<String> {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = parse(html, 600.0, &fonts);
+        let ctx = PassContext { font_data: &fonts };
+        TableSectionOrderPass.apply(&mut doc, &ctx);
+        let table_id = find_first_table(&doc, doc.root_element().id).expect("table");
+        tags_of_children(&doc, table_id)
+    }
+
+    #[test]
+    fn a_tfoot_written_first_is_moved_to_the_end() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tfoot><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tbody", "tfoot"],
+        );
+    }
+
+    #[test]
+    fn a_thead_written_last_is_moved_to_the_front() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tbody><tr><td>a</td></tr></tbody>\
+                 <thead><tr><th>h</th></tr></thead></table></body></html>"
+            ),
+            vec!["thead", "tbody"],
+        );
+    }
+
+    /// Both promotions at once, from the worst source order. Exercises the
+    /// re-read between the two moves: until the header is promoted the
+    /// *header* is the last element child, so a stale snapshot would decide
+    /// the footer still needs moving after it already sits last.
+    #[test]
+    fn a_header_and_footer_written_backwards_are_both_promoted() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table><tbody><tr><td>a</td></tr></tbody>\
+                 <tfoot><tr><td>f</td></tr></tfoot>\
+                 <thead><tr><th>h</th></tr></thead></table></body></html>"
+            ),
+            vec!["thead", "tbody", "tfoot"],
+        );
+    }
+
+    /// Only the first group of each kind is promoted; the rest keep their
+    /// source position. Both reference engines agree — see
+    /// `tests/table_section_order.rs`.
+    #[test]
+    fn only_the_first_header_and_footer_group_move() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot id=\"fa\"><tr><td>fa</td></tr></tfoot>\
+                 <thead id=\"ha\"><tr><th>ha</th></tr></thead>\
+                 <tbody><tr><td>a</td></tr></tbody>\
+                 <tfoot id=\"fb\"><tr><td>fb</td></tr></tfoot>\
+                 <thead id=\"hb\"><tr><th>hb</th></tr></thead>\
+                 </table></body></html>"
+            ),
+            vec!["thead", "tbody", "tfoot", "thead", "tfoot"],
+        );
+    }
+
+    /// A table already in visual order must come out untouched — and, more
+    /// importantly, must never reach the pass's re-resolve at all.
+    #[test]
+    fn a_table_already_in_order_is_left_alone() {
+        let html = "<html><body><table><thead><tr><th>h</th></tr></thead>\
+                    <tbody><tr><td>a</td></tr></tbody>\
+                    <tfoot><tr><td>f</td></tr></tfoot></table></body></html>";
+        assert_eq!(
+            section_order_after_pass(html),
+            vec!["thead", "tbody", "tfoot"],
+        );
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let doc = parse(html, 600.0, &fonts);
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "a well-formed table must not be a candidate, so it never pays the re-resolve"
+        );
+    }
+
+    /// The prefilter is by tag, the decision by computed display: a
+    /// `<tfoot>` demoted to a row group is a candidate (its tag is out of
+    /// place) but must not be moved, since both references leave it in
+    /// source order.
+    #[test]
+    fn a_tfoot_demoted_to_a_row_group_is_not_moved() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot style=\"display:table-row-group\"><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tfoot", "tbody"],
+        );
+    }
+
+    /// `display: none` is not a section group (its `DisplayInside` is
+    /// `None`), so a hidden `<tfoot>` is never promoted — it draws nothing
+    /// either way, and moving it would be pure restyle cost.
+    #[test]
+    fn a_display_none_tfoot_is_not_moved() {
+        assert_eq!(
+            section_order_after_pass(
+                "<html><body><table>\
+                 <tfoot style=\"display:none\"><tr><td>f</td></tr></tfoot>\
+                 <tbody><tr><td>a</td></tr></tbody></table></body></html>"
+            ),
+            vec!["tfoot", "tbody"],
+        );
+    }
+
+    /// Whitespace between the sections survives html5ever's "in table"
+    /// insertion mode as a text node, so "already last" has to be asked of
+    /// the *element* children. With the text node counted, a well-formed
+    /// table would look misordered and be needlessly moved.
+    #[test]
+    fn whitespace_between_sections_does_not_make_a_table_a_candidate() {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let doc = parse(
+            "<html><body><table>\n  <thead><tr><th>h</th></tr></thead>\n  \
+             <tbody><tr><td>a</td></tr></tbody>\n  \
+             <tfoot><tr><td>f</td></tr></tfoot>\n</table></body></html>",
+            600.0,
+            &fonts,
+        );
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "whitespace text nodes must not be mistaken for a misordered section"
+        );
+    }
+
+    /// A nested table is ordered on its own, and an outer table's sections
+    /// never absorb an inner one's.
+    #[test]
+    fn a_nested_table_is_ordered_independently() {
+        let fonts: Vec<Arc<Vec<u8>>> = Vec::new();
+        let mut doc = parse(
+            "<html><body><table><tfoot><tr><td>outer-f</td></tr></tfoot>\
+             <tbody><tr><td><table><tfoot><tr><td>inner-f</td></tr></tfoot>\
+             <tbody><tr><td>inner-a</td></tr></tbody></table></td></tr></tbody>\
+             </table></body></html>",
+            600.0,
+            &fonts,
+        );
+        let ctx = PassContext { font_data: &fonts };
+        assert_eq!(
+            collect_misordered_section_tables(&doc).len(),
+            2,
+            "both the outer and the inner table are candidates"
+        );
+        TableSectionOrderPass.apply(&mut doc, &ctx);
+        let outer = find_first_table(&doc, doc.root_element().id).expect("outer table");
+        assert_eq!(tags_of_children(&doc, outer), vec!["tbody", "tfoot"]);
+        let inner_body = element_children(&doc, outer)[0];
+        let inner = find_first_table(&doc, inner_body).expect("inner table");
+        assert_eq!(tags_of_children(&doc, inner), vec!["tbody", "tfoot"]);
+    }
+
+    #[test]
+    fn collect_misordered_section_tables_respects_depth_limit() {
+        let mut html = String::from("<html><body>");
+        for _ in 0..(MAX_DOM_DEPTH + 5) {
+            html.push_str("<div>");
+        }
+        html.push_str(
+            "<table><tfoot><tr><td>f</td></tr></tfoot><tbody><tr><td>a</td></tr></tbody></table>",
+        );
+        for _ in 0..(MAX_DOM_DEPTH + 5) {
+            html.push_str("</div>");
+        }
+        html.push_str("</body></html>");
+        let doc = parse(&html, 600.0, &[]);
+        assert!(
+            collect_misordered_section_tables(&doc).is_empty(),
+            "a table nested past MAX_DOM_DEPTH must not be collected"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1840,7 +2508,8 @@ use crate::gcpm::running::{RunningElementStore, serialize_node};
 use crate::gcpm::string_set::{StringSetEntry, StringSetStore, extract_text_content};
 use crate::gcpm::{
     ContentCounterMapping, ContentItem, CounterMapping, CounterOp, ParsedSelector, PseudoElement,
-    RunningMapping, StaticContentMapping, StringSetMapping, StringSetValue, TargetUrl,
+    RunningMapping, SelectorPart, StaticContentMapping, StringSetMapping, StringSetValue,
+    TargetUrl,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -1864,13 +2533,99 @@ fn is_non_visual_tag(tag: &str) -> bool {
     )
 }
 
-/// Check whether a `ParsedSelector` (simple class/id/tag selector) matches the given element.
+/// Check whether a `ParsedSelector` matches the given element.
+///
+/// Every accepted selector is a single compound — a type selector plus
+/// qualifiers on the *same* element — so this needs no tree walk.
 fn selector_matches(selector: &ParsedSelector, elem: &blitz_dom::node::ElementData) -> bool {
     match selector {
-        ParsedSelector::Class(name) => get_attr(elem, "class")
-            .is_some_and(|cls| cls.split_whitespace().any(|c| c == name.as_str())),
+        ParsedSelector::Class(name) => has_class(elem, name),
         ParsedSelector::Id(name) => get_attr(elem, "id") == Some(name.as_str()),
         ParsedSelector::Tag(name) => elem.name.local.as_ref().eq_ignore_ascii_case(name),
+        ParsedSelector::Compound(c) => {
+            if let Some(tag) = &c.tag {
+                if !elem.name.local.as_ref().eq_ignore_ascii_case(tag) {
+                    return false;
+                }
+            }
+            c.parts.iter().all(|part| match part {
+                SelectorPart::Class(name) => has_class(elem, name),
+                SelectorPart::Id(name) => get_attr(elem, "id") == Some(name.as_str()),
+                SelectorPart::Attr { name, test } => match get_attr(elem, name.as_str()) {
+                    None => false,
+                    Some(actual) => match test {
+                        None => true,
+                        Some((op, value)) => op.matches(actual, value.as_str()),
+                    },
+                },
+            })
+        }
+    }
+}
+
+fn has_class(elem: &blitz_dom::node::ElementData, name: &str) -> bool {
+    get_attr(elem, "class").is_some_and(|cls| cls.split_whitespace().any(|c| c == name))
+}
+
+/// Rebuild a [`ParsedSelector`] as CSS text, for the stylesheets fulgur
+/// injects (`build_running_display_none_css`, `build_static_content_css`).
+///
+/// Selector components come from the trusted author CSS via `gcpm::parser`
+/// (`Token::Ident` in cssparser), not from arbitrary HTML. Tag and attribute
+/// names are lowercased to match HTML's case-insensitive convention.
+///
+/// **Every** ident is escaped — tag names included — because cssparser hands
+/// back the *unescaped* token value: author CSS
+/// `p\7b x { position: running(h) }` parses to `Tag("p{x")`, so an unescaped
+/// tag arm emitted `p{x{display:none}` and the stray `{` swallowed every
+/// following rule in the generated sheet as that rule's body, silently
+/// dropping the suppression for every later running element (upstream
+/// PR #755, CodeRabbit review on PR #719). Escaping keeps each generated rule
+/// well-formed and self-delimiting, so one hostile selector can no longer
+/// disable the others. It is also what `element_specificity_prefix` relies on
+/// for the untrusted case (fulgur-ka6c), and a no-op for ordinary tag names
+/// (`div`, `h1`, `my-widget`), so no existing selector shifts.
+///
+/// Attribute *values* are emitted as quoted strings through the same escaper
+/// the `content` property uses.
+fn selector_text(selector: &ParsedSelector) -> String {
+    use std::fmt::Write;
+    match selector {
+        ParsedSelector::Tag(name) => css_escape_ident(&name.to_ascii_lowercase()),
+        ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
+        ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
+        ParsedSelector::Compound(c) => {
+            // The compound spelling needs the same tag escaping as the bare
+            // `Tag` arm above — upstream has no `Compound` variant, so its
+            // fix does not reach here.
+            let mut out = css_escape_ident(&c.tag.as_deref().unwrap_or("").to_ascii_lowercase());
+            for part in &c.parts {
+                match part {
+                    SelectorPart::Class(name) => {
+                        let _ = write!(out, ".{}", css_escape_ident(name));
+                    }
+                    SelectorPart::Id(name) => {
+                        let _ = write!(out, "#{}", css_escape_ident(name));
+                    }
+                    SelectorPart::Attr { name, test: None } => {
+                        let _ = write!(out, "[{}]", css_escape_ident(name));
+                    }
+                    SelectorPart::Attr {
+                        name,
+                        test: Some((op, value)),
+                    } => {
+                        let _ = write!(
+                            out,
+                            "[{}{}\"{}\"]",
+                            css_escape_ident(name),
+                            op.as_css(),
+                            crate::gcpm::parser::css_escape_string(value)
+                        );
+                    }
+                }
+            }
+            out
+        }
     }
 }
 
@@ -2967,6 +3722,35 @@ fn css_escape_ident(s: &str) -> String {
     out
 }
 
+/// Serialize running-element mappings into the `display: none` rules that
+/// suppress each running element's "real" copy at its source position.
+///
+/// `parse_gcpm` performs this rewrite inline, by editing
+/// `position: running(name)` into `display: none` inside its `cleaned_css`.
+/// That works for CSS fulgur injects wholesale (AssetBundle / `--css`) and
+/// for CSS it serves to Blitz itself (`net::FulgurNetProvider::fetch`), but
+/// not for an inline `<style>`, which Blitz has already parsed from the
+/// source document by the time fulgur sees it. Re-injecting that
+/// stylesheet's whole `cleaned_css` would deliver the rewrite, but
+/// `cleaned_css` preserves all non-GCPM CSS verbatim, so it also re-runs
+/// every ordinary rule as the last child of `<head>` — moving the sheet to
+/// the end of the cascade and dropping its `media` attribute. Emitting only
+/// the generated rules keeps the author's own cascade untouched.
+///
+/// Injected via [`InjectCssPass`], each rule carries the same specificity as
+/// the author's selector and so wins by source order — which is what
+/// suppression needs, since the author's sheet declares no competing
+/// `display` for these elements. Cost is O(mappings): no DOM walk, no
+/// per-node rule.
+pub(crate) fn build_running_display_none_css(mappings: &[crate::gcpm::RunningMapping]) -> String {
+    use std::fmt::Write;
+    let mut css = String::new();
+    for m in mappings {
+        let _ = write!(css, "{}{{display:none}}", selector_text(&m.parsed));
+    }
+    css
+}
+
 /// Serialize flattened static pseudo-content mappings into CSS: one
 /// `<selector><pseudo> { content: "<flattened>" }` rule per mapping.
 ///
@@ -2982,19 +3766,7 @@ pub(crate) fn build_static_content_css(mappings: &[StaticContentMapping]) -> Str
     use std::fmt::Write;
     let mut css = String::new();
     for m in mappings {
-        let selector = match &m.parsed {
-            // Selector components here come from the trusted author CSS via
-            // `gcpm::parser` (`Token::Ident` in cssparser), not from
-            // arbitrary HTML. Tag names are lowercased to match HTML's
-            // case-insensitive convention; id/class are still escaped
-            // because a hostile author can craft a bare token containing
-            // metacharacters via CSS escapes — defense in depth on the
-            // trusted side, and required by `element_specificity_prefix`
-            // for the untrusted case (fulgur-ka6c).
-            ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
-            ParsedSelector::Class(name) => format!(".{}", css_escape_ident(name)),
-            ParsedSelector::Id(name) => format!("#{}", css_escape_ident(name)),
-        };
+        let selector = selector_text(&m.parsed);
         let pseudo = match m.pseudo {
             PseudoElement::Before => "::before",
             PseudoElement::After => "::after",
@@ -3662,6 +4434,134 @@ mod tests {
         assert!(build_static_content_css(&[]).is_empty());
     }
 
+    #[test]
+    fn build_running_display_none_css_serializes_selectors_and_escapes() {
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag("HEADER".into()),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("page-header".into()),
+                running_name: "top".into(),
+            },
+            // A selector metacharacter must be escaped so the injected rule
+            // is well-formed and cannot widen its own match set.
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Id("a b".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r"header{display:none}.page-header{display:none}#a\ b{display:none}"
+        );
+    }
+
+    #[test]
+    fn build_running_display_none_css_empty_for_no_mappings() {
+        assert!(build_running_display_none_css(&[]).is_empty());
+    }
+
+    /// Upstream PR #755 (CodeRabbit review on PR #719): cssparser stores
+    /// `Token::Ident` *unescaped*, so author CSS `p\7b x { … }` reaches us
+    /// as `Tag("p{x")`. Emitting that tag verbatim produced
+    /// `p{x{display:none}.keep{display:none}` — the stray `{` opens a
+    /// declaration block, so a CSS parser reads every following rule as
+    /// this rule's body and `.keep` never gets its `display: none`. One
+    /// crafted tag selector could therefore un-suppress every other
+    /// running element in the document. Escaping the tag keeps each rule
+    /// self-delimiting.
+    #[test]
+    fn build_running_display_none_css_escapes_tag_metacharacters() {
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag("p{x".into()),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("keep".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r"p\{x{display:none}.keep{display:none}",
+            "the tag's `{{` must be escaped so the following rule survives"
+        );
+    }
+
+    /// The same hole in the *compound* spelling, which is this fork's own
+    /// (`ParsedSelector::Compound`, from the `section[data-section="hdr"]`
+    /// support upstream does not have — so upstream's fix does not cover
+    /// it). `section\7b x[data-role="hdr"]` must escape its tag exactly as
+    /// the bare `Tag` arm does, or the following rule is swallowed the same
+    /// way.
+    #[test]
+    fn build_running_display_none_css_escapes_compound_tag_metacharacters() {
+        use crate::gcpm::{AttrOp, CompoundSelector, SelectorPart};
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Compound(CompoundSelector {
+                    tag: Some("section{x".into()),
+                    parts: vec![SelectorPart::Attr {
+                        name: "data-role".into(),
+                        test: Some((AttrOp::Equals, "hdr".into())),
+                    }],
+                }),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("keep".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r#"section\{x[data-role="hdr"]{display:none}.keep{display:none}"#,
+            "the compound tag's `{{` must be escaped so the following rule survives"
+        );
+    }
+
+    /// The escaping must be a no-op for ordinary tag names, including
+    /// ones ending in a digit (`h1`) and custom elements (`my-widget`) —
+    /// otherwise every existing running-element selector would change.
+    #[test]
+    fn build_running_display_none_css_leaves_ordinary_tags_untouched() {
+        for tag in ["div", "h1", "my-widget", "HEADER"] {
+            let mappings = vec![crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag(tag.into()),
+                running_name: "top".into(),
+            }];
+            assert_eq!(
+                build_running_display_none_css(&mappings),
+                format!("{}{{display:none}}", tag.to_ascii_lowercase()),
+                "escaping must not alter the ordinary tag name {tag}"
+            );
+        }
+    }
+
+    /// Same no-op guarantee for the compound spelling: an ordinary tag
+    /// with an attribute qualifier must serialize unchanged.
+    #[test]
+    fn build_running_display_none_css_leaves_ordinary_compound_tags_untouched() {
+        use crate::gcpm::{AttrOp, CompoundSelector, SelectorPart};
+        let mappings = vec![crate::gcpm::RunningMapping {
+            parsed: ParsedSelector::Compound(CompoundSelector {
+                tag: Some("section".into()),
+                parts: vec![SelectorPart::Attr {
+                    name: "data-section".into(),
+                    test: Some((AttrOp::Equals, "hdr".into())),
+                }],
+            }),
+            running_name: "top".into(),
+        }];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r#"section[data-section="hdr"]{display:none}"#
+        );
+    }
+
     /// `relayout_position_fixed` must reshape every `position: fixed`
     /// subtree against the supplied viewport, not against the nearest
     /// positioned ancestor (the size that Taffy assigned during the
@@ -3849,7 +4749,7 @@ mod tests {
 <html><head><link rel="stylesheet" href="parent.css"></head>
 <body><p class="parent-rule child-rule">x</p></body></html>"#;
 
-        let (_doc, gcpm) =
+        let (_doc, gcpm, _column_css) =
             parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
 
         let cleaned = &gcpm.cleaned_css;
@@ -5729,6 +6629,26 @@ mod tests {
         walk(doc.deref(), doc.root_element().id, name)
     }
 
+    fn find_element_by_id(doc: &HtmlDocument, id_attr: &str) -> Option<usize> {
+        fn walk(doc: &blitz_dom::BaseDocument, id: usize, id_attr: &str) -> Option<usize> {
+            let node = doc.get_node(id)?;
+            if node.attrs().is_some_and(|a| {
+                a.iter()
+                    .any(|at| at.name.local.as_ref() == "id" && at.value == id_attr)
+            }) {
+                return Some(id);
+            }
+            for &c in &node.children {
+                if let Some(v) = walk(doc, c, id_attr) {
+                    return Some(v);
+                }
+            }
+            None
+        }
+        use std::ops::Deref;
+        walk(doc.deref(), doc.root_element().id, id_attr)
+    }
+
     #[test]
     fn test_extract_content_image_url_simple() {
         let html = r#"<!doctype html><html><head><style>
@@ -6079,7 +6999,8 @@ mod tests {
         }
         html.push_str("</body></html>");
 
-        let (doc, _gcpm) = parse_html_with_local_resources(&html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(&html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let root = doc.root_element();
         let _ = element_text(doc.deref(), root.id);
@@ -6117,7 +7038,8 @@ mod tests {
     #[test]
     fn element_text_inserts_space_between_block_children() {
         let html = "<html><body><a id='x'><div>foo</div><div>bar</div></a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6127,7 +7049,8 @@ mod tests {
     #[test]
     fn element_text_inserts_space_for_br() {
         let html = "<html><body><a id='x'>foo<br>bar</a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6139,7 +7062,8 @@ mod tests {
         // If the text already ends in whitespace, a block boundary should
         // not add another space.
         let html = "<html><body><a id='x'>foo <div>bar</div></a></body></html>";
-        let (doc, _gcpm) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _gcpm, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         use std::ops::Deref;
         let a_id = find_element_by_attr_id(doc.deref(), "x");
         let text = element_text(doc.deref(), a_id);
@@ -6155,7 +7079,8 @@ mod tests {
         let html = r#"<!doctype html><html><head>
             <style>@page { size: A4 landscape; }</style>
         </head><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert_eq!(
             gcpm.page_settings.len(),
@@ -6167,7 +7092,8 @@ mod tests {
     #[test]
     fn extract_gcpm_from_inline_styles_returns_empty_for_no_style_tag() {
         let html = r#"<!doctype html><html><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert!(gcpm.page_settings.is_empty());
     }
@@ -6182,7 +7108,8 @@ mod tests {
             <style>@page { size: A4 landscape; }</style>
             <style>@page { margin: 2cm; }</style>
         </head><body>x</body></html>"#;
-        let (doc, _) = parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
+        let (doc, _, _column_css) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, None);
         let gcpm = extract_gcpm_from_inline_styles(&doc);
         assert_eq!(
             gcpm.page_settings.len(),
@@ -6253,6 +7180,36 @@ mod tests {
         }
     }
 
+    /// All three Stylo `line-height` shapes have to resolve, and `normal`
+    /// must use the same 1.2 factor `blitz-dom` fed Parley — a different one
+    /// would make fulgur's synthesised strut disagree with the line heights
+    /// it is correcting.
+    #[test]
+    fn strut_style_resolves_every_line_height_shape() {
+        let html = r#"<html><body>
+            <p id="a" style="font-size: 20px">normal</p>
+            <p id="b" style="font-size: 20px; line-height: 1.5">number</p>
+            <p id="c" style="font-size: 20px; line-height: 40px">length</p>
+        </body></html>"#;
+        let doc = parse_and_layout(html, 400.0_f32.as_px(), 2000.0_f32.as_px(), &[], true);
+        let expected = [("a", 24.0), ("b", 30.0), ("c", 40.0)];
+        for (id, line_height_px) in expected {
+            let node_id = find_element_by_id(&doc, id).unwrap_or_else(|| panic!("<p id={id}>"));
+            let strut =
+                extract_strut_style(doc.get_node(node_id).expect("node")).expect("styled element");
+            assert!(
+                (strut.font_size.to_f32() - 20.0).abs() < 0.01,
+                "{id}: font-size {:?}",
+                strut.font_size
+            );
+            assert!(
+                (strut.line_height.to_f32() - line_height_px).abs() < 0.01,
+                "{id}: expected {line_height_px}px, got {:?}",
+                strut.line_height
+            );
+        }
+    }
+
     #[test]
     fn vertical_align_percent_is_unit_agnostic_ratio() {
         use crate::paragraph::VerticalAlign;
@@ -6299,7 +7256,7 @@ mod tests {
         let a = find_element_by_attr_id(doc.deref(), "a");
         let b = find_element_by_attr_id(doc.deref(), "b");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         // `a` picks up both declarations from the stylesheet.
         let a_props = table.get(&a).expect("a in table");
@@ -6318,6 +7275,90 @@ mod tests {
         // Inline `column-rule` overrides only the rule field — `column-fill`
         // is still populated from the stylesheet.
         assert_eq!(b_props.fill, Some(crate::column_css::ColumnFill::Auto));
+    }
+
+    /// fulgur-s5ro: `break-inside` (and the rest of `column_css`'s tiny
+    /// grammar) declared in a genuinely *external* `<link rel=stylesheet>`
+    /// file must reach the side-table, not just inline `style="..."` /
+    /// `<style>` blocks. Before this fix, `walk_for_column_styles` only
+    /// ever scanned inline `<style>` text nodes, so `column_styles.get`
+    /// returned `None` for every element styled purely via `<link>` — the
+    /// exact shape `examples/break-inside`'s `.callout` uses, which is why
+    /// `needs_recursion`'s `avoid_fits_whole_page` guard (fulgur-2s7p.5)
+    /// never actually fired for it despite the CSS declaring
+    /// `break-inside: avoid`.
+    #[test]
+    fn extract_column_style_table_picks_up_linked_external_stylesheet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("style.css"),
+            r#".callout { break-inside: avoid; column-fill: auto; }"#,
+        )
+        .unwrap();
+
+        let html = r#"<!DOCTYPE html>
+<html><head><link rel="stylesheet" href="style.css"></head>
+<body><div class="callout" id="c"></div></body></html>"#;
+
+        let (doc, _gcpm, column_css_texts) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
+        assert!(
+            !column_css_texts.is_empty(),
+            "expected the linked stylesheet's text to be drained"
+        );
+
+        use std::ops::Deref;
+        let c = find_element_by_attr_id(doc.deref(), "c");
+        let table = extract_column_style_table(&doc, &column_css_texts);
+        let props = table.get(&c).expect("callout div must be in the table");
+        assert_eq!(
+            props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid),
+            "break-inside: avoid from the linked stylesheet must resolve, got {props:?}"
+        );
+        assert_eq!(props.fill, Some(crate::column_css::ColumnFill::Auto));
+    }
+
+    #[test]
+    fn extract_column_style_table_picks_up_extensionless_linked_stylesheet() {
+        // codex P2 review on PR #741: `looks_like_css` only recognises a
+        // stylesheet by MIME (`request.content_type`, always empty for
+        // local `file://` fetches — Blitz never populates it there) or by
+        // `.css` file extension. A `<link rel="stylesheet" href="theme">`
+        // (no extension) used to be classified as non-CSS up front, so
+        // `column_css_text` was never captured for it even though Blitz's
+        // own callback still resolves the fetch as `Resource::Css` and
+        // applies its declarations normally — silently dropping
+        // `break-inside` / `column-*` from the side table for this file.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("theme"),
+            r#".callout { break-inside: avoid; column-fill: auto; }"#,
+        )
+        .unwrap();
+
+        let html = r#"<!DOCTYPE html>
+<html><head><link rel="stylesheet" href="theme"></head>
+<body><div class="callout" id="c"></div></body></html>"#;
+
+        let (doc, _gcpm, column_css_texts) =
+            parse_html_with_local_resources(html, 400.0, 10000, &[], true, Some(dir.path()));
+        assert!(
+            !column_css_texts.is_empty(),
+            "expected the extensionless linked stylesheet's text to be drained"
+        );
+
+        use std::ops::Deref;
+        let c = find_element_by_attr_id(doc.deref(), "c");
+        let table = extract_column_style_table(&doc, &column_css_texts);
+        let props = table.get(&c).expect("callout div must be in the table");
+        assert_eq!(
+            props.break_inside,
+            Some(crate::draw_primitives::BreakInside::Avoid),
+            "break-inside: avoid from the extensionless linked stylesheet must \
+             resolve, got {props:?}"
+        );
+        assert_eq!(props.fill, Some(crate::column_css::ColumnFill::Auto));
     }
 
     #[test]
@@ -6352,7 +7393,7 @@ mod tests {
         let a = find_element_by_attr_id(doc.deref(), "a");
         let n = find_element_by_attr_id(doc.deref(), "n");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         // `screen` media: rule must NOT appear in the table.
         assert!(
@@ -6389,7 +7430,7 @@ mod tests {
         use std::ops::Deref;
         let k = find_element_by_attr_id(doc.deref(), "k");
 
-        let table = extract_column_style_table(&doc);
+        let table = extract_column_style_table(&doc, &[]);
 
         let props = table.get(&k).expect("k in table");
         assert_eq!(

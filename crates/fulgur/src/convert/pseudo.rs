@@ -433,6 +433,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         let mut lines = vec![ShapedLine {
             height: 16.0_f32.as_pt(),
@@ -547,6 +550,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 5.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         };
         let mut lines = vec![ShapedLine {
             height: 16.0_f32.as_pt(),
@@ -618,6 +624,9 @@ mod tests {
                     link: None,
                     opacity: 1.0,
                     visible: true,
+                    vertical_align: crate::paragraph::VerticalAlign::Baseline,
+                    baseline_offset: 5.0_f32.as_pt(),
+                    margin_top: crate::units::Pt::ZERO,
                 }),
                 LineItem::Image(InlineImage {
                     data: Arc::new(vec![]),

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!--
+  Repro 12 — `position: absolute` is ignored once the element is not a direct
+  child of `<body>`.
+
+  Two documents, identical but for one wrapping `<section>` with no styling of
+  its own. The absolutely-positioned block must be pinned to the bottom of the
+  page's content box in both; a static ancestor is not a containing block for
+  it, so the wrapper cannot matter. WeasyPrint 69 puts it in the same place
+  either way.
+
+  Page-1 baseline, mm from the page top:
+
+    shape                       | WeasyPrint | fulgur
+    direct child of <body>      |   282.70   | 282.22
+    wrapped in a static section |   282.70   |  71.35   <- the wrapper's bottom
+
+  71.35mm is NOT the block's flow position, which an earlier version of this
+  note claimed. Measured with both insets `auto`, the static position is
+  75.58mm (WeasyPrint 76.19). 71.35 is the wrapper's bottom edge — Taffy
+  resolving `bottom: 0` against the immediate parent's box. So the inset was
+  mis-resolved, not dropped, and the two readings differ by only 4.2mm in this
+  fixture, which is what made them easy to conflate. `bottom: 50pt` on the same
+  element moves fulgur's output by exactly 50pt, which a dropped inset could
+  not do.
+
+  On the NBB filing this is `section[data-section="s1-voetnoten"] { position:
+  absolute; bottom: 0 }`, nested inside the section it belongs to: the
+  footnotes land 28mm high, overlapping the signature table.
+
+  The control is `12b-absolute-bottom-direct.html` — same document with the
+  wrapper removed. Removing only the wrapper's attribute is not a control: the
+  wrapper is unstyled, so it is the nesting itself that matters.
+-->
+<html><head><meta charset="utf-8"><title>absolute bottom on a nested element</title><style>
+@page { size: A4; margin: 62pt 30pt 38.5pt 10mm; }
+body { margin: 0; font: 10pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+p { margin: 0; }
+section[data-section="foot"] { position: absolute; bottom: 0; left: 0; right: 0; }
+section[data-section="filler"] { margin-top: 120pt; }
+</style></head><body>
+<section data-section="outer">
+  <p>FLOW-TOP</p>
+  <section data-section="filler"><p>FLOW-MID</p></section>
+  <section data-section="foot"><p>PINNED-BOTTOM</p></section>
+</section>
+</body></html>

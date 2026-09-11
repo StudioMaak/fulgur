@@ -10,10 +10,22 @@
 //!
 //! Scope and trade-offs:
 //!
-//! - Only inline `style="..."` attributes and top-level `<style>` blocks are
-//!   scanned. External stylesheets loaded via `<link rel=stylesheet>` reach
-//!   stylo/blitz for the properties they support but do **not** currently
-//!   populate this side-table — tracked as fulgur-s5ro.
+//! - Inline `style="..."` attributes, top-level `<style>` blocks, *and*
+//!   `<link rel=stylesheet>` / `@import`-loaded external stylesheets are all
+//!   scanned (fulgur-s5ro) — `blitz_adapter::parse_html_with_local_resources`
+//!   drains each successfully-loaded stylesheet's raw text via
+//!   [`crate::net::FulgurNetProvider::drain_column_css_texts`], and
+//!   `extract_column_style_table`'s DOM walk folds each one in at its
+//!   originating `<link>` element's own position, so document order is
+//!   preserved the same as for inline `<style>` blocks. One caveat: a
+//!   `<link rel=stylesheet media="...">` with a non-default, non-empty
+//!   `media` value is rewritten to a synthetic `<style>@import ...>` before
+//!   this walk runs (see `collect_link_media_rewrites`), and — like the
+//!   pre-existing `fulgur-owa` gap for GCPM contexts — its *first*
+//!   (wrong-media) fetch and its rewritten *second* fetch can both leave
+//!   entries in the drain buffer; only the second is folded in, but a
+//!   third-party CSS proxy/cache that serves different bytes per fetch could
+//!   still see both. Not solved here.
 //! - `<style media="...">` blocks whose media excludes `all` / `print` are
 //!   skipped by the harvester (`extract_column_style_table` in
 //!   `blitz_adapter.rs`). Full CSS media-query evaluation is deferred.
@@ -2423,6 +2435,194 @@ mod tests {
         assert!(
             props.rule.is_none(),
             "percentage width must drop the declaration"
+        );
+    }
+
+    // -------- parse_break_before_value: uncovered keyword arms --------
+
+    /// `left`, `right`, `recto`, `verso` in `break-before` collapse to
+    /// `BreakBefore::Page` — same treatment as in `break-after`. The existing
+    /// tests only cover `always`, `page`, and `auto`; this exercises the
+    /// remaining match-arm values.
+    #[test]
+    fn parse_break_before_left_and_right_collapse_to_page() {
+        let p1 = parse_declaration_block("break-before: left");
+        let p2 = parse_declaration_block("break-before: right");
+        assert_eq!(p1.break_before, Some(BreakBefore::Page), "left");
+        assert_eq!(p2.break_before, Some(BreakBefore::Page), "right");
+    }
+
+    #[test]
+    fn parse_break_before_recto_and_verso_collapse_to_page() {
+        let p1 = parse_declaration_block("break-before: recto");
+        let p2 = parse_declaration_block("break-before: verso");
+        assert_eq!(p1.break_before, Some(BreakBefore::Page), "recto");
+        assert_eq!(p2.break_before, Some(BreakBefore::Page), "verso");
+    }
+
+    /// An unrecognised `break-before` value drops the declaration silently,
+    /// leaving siblings unaffected. Exercises the `_` catch-all error arm.
+    #[test]
+    fn parse_break_before_invalid_is_silently_dropped() {
+        let props = parse_declaration_block("break-before: banana");
+        assert_eq!(
+            props.break_before, None,
+            "invalid ident must drop the declaration"
+        );
+    }
+
+    // -------- parse_column_fill_value: error arm --------
+
+    /// An unrecognised `column-fill` value drops the declaration silently.
+    /// Exercises the `else { Err(...) }` branch of `parse_column_fill_value`.
+    #[test]
+    fn parse_column_fill_invalid_is_silently_dropped() {
+        let props = parse_declaration_block("column-fill: spread;");
+        assert_eq!(
+            props.fill, None,
+            "unknown column-fill keyword must drop the declaration"
+        );
+    }
+
+    // -------- parse_page_value: multi-byte UTF-8 char-boundary truncation --------
+
+    /// A page name whose UTF-8 byte length exceeds `MAX_PAGE_NAME_BYTES` is
+    /// truncated at a valid char boundary. This test uses 254 ASCII bytes
+    /// followed by the 3-byte Unicode character '€' (U+20AC) so that the
+    /// natural truncation point (byte 256) falls inside the multi-byte
+    /// sequence. The `while !s.is_char_boundary(end)` loop in
+    /// `parse_page_value` steps back until it reaches the start of '€'
+    /// (byte 254), yielding a truncated name of exactly 254 ASCII bytes.
+    #[test]
+    fn parse_page_name_multibyte_utf8_truncated_at_char_boundary() {
+        // "a" × 254 + "€" + "x" = 254 + 3 + 1 = 258 bytes → exceeds MAX_PAGE_NAME_BYTES (256).
+        // '€' occupies bytes 254–256 (inclusive). Truncation steps back to 254.
+        let long = "a".repeat(254) + "€x";
+        assert!(
+            long.len() > crate::MAX_PAGE_NAME_BYTES,
+            "precondition: name must exceed the cap"
+        );
+        let css = format!("page: {long};");
+        let props = parse_declaration_block(&css);
+        // '€' straddles bytes 254–256; the loop backs up to 254, keeping only the "a" prefix.
+        let expected = "a".repeat(254);
+        match props.page {
+            Some(PageName::Named(s)) => {
+                assert_eq!(
+                    s, expected,
+                    "truncation must preserve the maximal valid ASCII prefix"
+                );
+            }
+            other => panic!("expected Named page, got {other:?}"),
+        }
+    }
+
+    // -------- column-rule-style longhand --------
+
+    /// `column-rule-style: solid` (longhand) sets `style` on a default spec.
+    /// The `if let Ok(style) = result` success path in `parse_value` fires.
+    #[test]
+    fn column_rule_style_longhand_solid() {
+        let props = parse_declaration_block("column-rule-style: solid;");
+        assert_eq!(
+            props.rule.expect("rule spec").style,
+            ColumnRuleStyle::Solid,
+            "longhand solid must set Solid style"
+        );
+    }
+
+    /// `column-rule-style: dashed` (longhand).
+    #[test]
+    fn column_rule_style_longhand_dashed() {
+        let props = parse_declaration_block("column-rule-style: dashed;");
+        assert_eq!(
+            props.rule.expect("rule spec").style,
+            ColumnRuleStyle::Dashed,
+            "longhand dashed must set Dashed style"
+        );
+    }
+
+    /// `column-rule-style: dotted` (longhand).
+    #[test]
+    fn column_rule_style_longhand_dotted() {
+        let props = parse_declaration_block("column-rule-style: dotted;");
+        assert_eq!(
+            props.rule.expect("rule spec").style,
+            ColumnRuleStyle::Dotted,
+            "longhand dotted must set Dotted style"
+        );
+    }
+
+    /// `column-rule-style: none` (longhand) produces `ColumnRuleStyle::None`.
+    #[test]
+    fn column_rule_style_longhand_none() {
+        let props = parse_declaration_block("column-rule-style: none;");
+        assert_eq!(
+            props.rule.expect("rule spec").style,
+            ColumnRuleStyle::None,
+            "longhand none must set None style"
+        );
+    }
+
+    /// `column-rule-style: double` is a Phase-C value — `parse_rule_style_ident`
+    /// returns `None`, which triggers the `ok_or_else` closure at the longhand
+    /// handler (line 589). The declaration must drop silently so later
+    /// longhand properties (width, color) still apply.
+    #[test]
+    fn column_rule_style_longhand_unsupported_value_drops_silently() {
+        let props = parse_declaration_block("column-rule-style: double;");
+        assert!(
+            props.rule.is_none(),
+            "unsupported longhand style value must drop the declaration"
+        );
+    }
+
+    /// Same Phase-C path for `groove`.
+    #[test]
+    fn column_rule_style_longhand_groove_drops_silently() {
+        let props = parse_declaration_block("column-rule-style: groove;");
+        assert!(
+            props.rule.is_none(),
+            "unsupported longhand style groove must drop the declaration"
+        );
+    }
+
+    /// A non-ident token in `column-rule-style` (e.g., a number) causes
+    /// `input.expect_ident()?` to return `Err`, dropping the declaration.
+    #[test]
+    fn column_rule_style_longhand_non_ident_drops_silently() {
+        let props = parse_declaration_block("column-rule-style: 42;");
+        assert!(
+            props.rule.is_none(),
+            "non-ident token in column-rule-style must drop the declaration"
+        );
+    }
+
+    /// Longhand `column-rule-style` can combine with other longhands:
+    /// setting width first and then style must preserve the width.
+    #[test]
+    fn column_rule_style_longhand_preserves_existing_width() {
+        let props = parse_declaration_block("column-rule-width: 2pt; column-rule-style: solid;");
+        let rule = props.rule.expect("rule spec");
+        assert_eq!(rule.style, ColumnRuleStyle::Solid, "style");
+        assert!(
+            (rule.width.to_f32() - 2.0).abs() < 0.1,
+            "width must be preserved: {}",
+            rule.width.to_f32()
+        );
+    }
+
+    // -------- parse_length: unknown dimension unit --------
+
+    /// A Dimension token with an unrecognised unit (e.g., `vw`) causes
+    /// `length_to_pt` to return `None`, which triggers the `ok_or_else`
+    /// closure inside `parse_length` (line 247). The declaration drops.
+    #[test]
+    fn parse_length_unknown_dimension_unit_drops_declaration() {
+        let props = parse_declaration_block("column-rule-width: 10vw;");
+        assert!(
+            props.rule.is_none(),
+            "unknown dimension unit must drop the declaration"
         );
     }
 }

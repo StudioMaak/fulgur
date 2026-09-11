@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<!--
+  Repro 11 — a `margin-top` on the first block after a *forced* break is
+  truncated to zero.
+
+  css-break-3 §5.4 truncates margins adjoining an unforced break only; at a
+  forced break they are retained. Both references retain it.
+
+  Every length here is an explicit `pt`, so the numbers do not depend on the
+  font. Page-2 baseline, mm from the page top:
+
+    margin-top | WeasyPrint | fulgur
+    0pt        |   23.52    | 22.91
+    24pt       |   31.99    | 22.91   <- should have moved by 24pt = 8.47mm
+
+  On the NBB filing this is `section[data-section="nbb-sectie-N"]
+  section[data-section="nbb-titelbox"] { margin-top: 8.6pt }`, and it puts
+  every section-opening page 3.0mm high.
+-->
+<html><head><meta charset="utf-8"><title>margin-top after a forced break</title><style>
+@page { size: A4; margin: 20mm; }
+body { margin: 0; font: 10pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+p { margin: 0; }
+.brk { break-before: page; }
+.gap { margin-top: 24pt; }
+</style></head><body>
+<p>PAGE1-TOP</p>
+<section class="brk"><section class="gap"><p>PAGE2-TOP</p></section></section>
+</body></html>

@@ -255,6 +255,174 @@ pub(super) fn metrics_from_line(line: &ShapedLine) -> LineFontMetrics {
     default
 }
 
+/// Per-em font metrics: each field is a fraction of the em square, so it can
+/// be scaled to whatever `font-size` the strut actually uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct FontRatios {
+    pub ascent: f32,
+    pub descent: f32,
+    pub x_height: f32,
+}
+
+/// Metrics of a generic sans-serif face, used only when a line's strut font
+/// cannot be recovered at all (no glyph run anywhere in the line or in the
+/// paragraphs of its inline boxes). Close to Helvetica / Liberation Sans.
+const FALLBACK_FONT_RATIOS: FontRatios = FontRatios {
+    ascent: 0.77,
+    descent: 0.23,
+    x_height: 0.52,
+};
+
+/// The CSS 2.1 §10.8 strut of an inline formatting context, resolved to pt.
+pub(super) struct Strut {
+    /// Font metrics at the strut's own `font-size`. Reused verbatim as the
+    /// `LineFontMetrics` that positions `middle` / `text-top` / `sub` boxes.
+    pub metrics: crate::paragraph::LineFontMetrics,
+    /// Distance from the baseline up to the strut's top edge
+    /// (`ascent + half-leading`).
+    pub above: crate::units::Pt,
+    /// Distance from the baseline down to the strut's bottom edge
+    /// (`descent + half-leading`).
+    pub below: crate::units::Pt,
+}
+
+/// Read per-em metrics out of a shaped glyph run.
+fn ratios_from_run(run: &ShapedGlyphRun) -> Option<FontRatios> {
+    let font_ref = skrifa::FontRef::from_index(&run.font_data, run.font_index).ok()?;
+    // `Size::new(1.0)` asks skrifa for metrics on a 1-unit em square, i.e.
+    // the per-em ratios directly — no division by the run's own font size,
+    // which may differ from the strut's.
+    let m = font_ref.metrics(
+        skrifa::instance::Size::new(1.0),
+        skrifa::instance::LocationRef::default(),
+    );
+    Some(FontRatios {
+        ascent: m.ascent,
+        descent: m.descent.abs(),
+        x_height: m.x_height.unwrap_or(m.ascent * 0.5),
+    })
+}
+
+/// Find per-em metrics for the strut font of a line.
+///
+/// `font-family` inherits, so the first real font on the line is the strut's
+/// font in every case that does not deliberately override it. A line can be
+/// entirely made of inline boxes (`<p>a</p><p>b</p>` with both on
+/// `display: inline-block`), in which case there is no glyph run to read and
+/// the search continues into the boxes' own already-converted paragraphs.
+pub(super) fn line_font_ratios(
+    items: &[LineItem],
+    out: &crate::drawables::Drawables,
+) -> Option<FontRatios> {
+    for item in items {
+        if let LineItem::Text(run) = item
+            && let Some(r) = ratios_from_run(run)
+        {
+            return Some(r);
+        }
+    }
+    for item in items {
+        let LineItem::InlineBox(ib) = item else {
+            continue;
+        };
+        let Some(para) = ib.node_id.and_then(|id| out.paragraphs.get(&id)) else {
+            continue;
+        };
+        for line in &para.lines {
+            for inner in &line.items {
+                if let LineItem::Text(run) = inner
+                    && let Some(r) = ratios_from_run(run)
+                {
+                    return Some(r);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build the [`Strut`] for `node`'s inline formatting context.
+pub(super) fn resolve_strut(
+    node: &Node,
+    items: &[LineItem],
+    out: &crate::drawables::Drawables,
+) -> Strut {
+    let style = crate::blitz_adapter::extract_strut_style(node);
+    let font_size = style
+        .map(|s| s.font_size.in_pt())
+        .unwrap_or(12.0_f32.as_pt());
+    let line_height = style
+        .map(|s| s.line_height.in_pt())
+        .unwrap_or(font_size * 1.2);
+    let ratios = line_font_ratios(items, out).unwrap_or(FALLBACK_FONT_RATIOS);
+
+    let ascent = font_size * ratios.ascent;
+    let descent = font_size * ratios.descent;
+    // CSS 2.1 §10.8.1: leading is split evenly above and below the em box.
+    let half_leading = (line_height - ascent - descent) / 2.0;
+    let above = ascent + half_leading;
+    Strut {
+        metrics: crate::paragraph::LineFontMetrics {
+            ascent: ascent.to_f32(),
+            descent: descent.to_f32(),
+            x_height: (font_size * ratios.x_height).to_f32(),
+            // Same 0.3 / 0.4 em-relative approximations `metrics_from_line`
+            // uses for images, so `sub` / `super` behave identically for an
+            // inline box and for an `<img>`.
+            subscript_offset: (ascent * 0.3).to_f32(),
+            superscript_offset: (ascent * 0.4).to_f32(),
+        },
+        above,
+        below: line_height - above,
+    }
+}
+
+/// Measure the part of the line box that the inline boxes must fit around.
+///
+/// When every inline box is short enough that Parley's own `ascent` and
+/// `line_height` were decided by text, Parley's line box is already the CSS
+/// one and is returned unchanged — that keeps output byte-identical for the
+/// overwhelmingly common "small inline-block inside a paragraph" shape.
+/// Otherwise Parley's metrics are contaminated by the box heights it folded
+/// into `ascent`, and the extent is rebuilt from the strut and the runs.
+pub(super) fn text_line_extent(
+    strut: &Strut,
+    probe: &LineProbe,
+) -> crate::paragraph::TextLineExtent {
+    // Strictly less: a box exactly as tall as the line is already the thing
+    // that decided `ascent`, so Parley's metrics are contaminated there too.
+    if probe.max_box_height < probe.line_height && probe.max_box_height < probe.parley_ascent {
+        return crate::paragraph::TextLineExtent {
+            top: crate::units::Pt::ZERO,
+            bottom: probe.line_height,
+        };
+    }
+    crate::paragraph::TextLineExtent {
+        top: (probe.baseline - strut.above).min(probe.baseline - probe.max_run_ascent),
+        bottom: (probe.baseline + strut.below).max(probe.baseline + probe.max_run_descent),
+    }
+}
+
+/// What one Parley line reported, plus what fulgur measured while walking it.
+///
+/// All pt. Collected per line in `extract_paragraph` and consumed only by
+/// [`text_line_extent`].
+pub(super) struct LineProbe {
+    /// Line-relative baseline, as Parley placed it.
+    pub baseline: crate::units::Pt,
+    /// `LineMetrics::line_height`.
+    pub line_height: crate::units::Pt,
+    /// `LineMetrics::ascent` — `max(text ascents, inline box heights)`.
+    pub parley_ascent: crate::units::Pt,
+    /// Tallest atomic inline box on the line, `0` when there is none.
+    pub max_box_height: crate::units::Pt,
+    /// Tallest glyph run ascent, read per run so the inline-box heights
+    /// Parley folded into `LineMetrics::ascent` cannot pollute it.
+    pub max_run_ascent: crate::units::Pt,
+    /// Deepest glyph run descent, same reasoning.
+    pub max_run_descent: crate::units::Pt,
+}
+
 /// Recalculate line boxes for all lines in a paragraph.
 pub(super) fn recalculate_paragraph_line_boxes(lines: &mut [ShapedLine]) {
     let mut original_y_acc = crate::units::Pt::ZERO;
@@ -458,8 +626,19 @@ pub(super) fn extract_paragraph(
     // drops it with the DOM, so we can't borrow.
     let text: Arc<str> = Arc::from(text_layout.text.as_str());
 
+    // Basis for a percentage `margin` on an atomic inline box. Blitz resolves
+    // those against the inline formatting context root's own box
+    // (`layout/inline.rs:51`, `inputs.parent_size`), so match it rather than
+    // the content box, or the two disagree whenever the root is padded.
+    let cb_width_px = node.final_layout.size.width.as_px();
+
     let mut shaped_lines = Vec::new();
     let mut accumulated_line_top = crate::units::Pt::ZERO;
+    // Same accumulator in the *post-alignment* geometry. The two diverge only
+    // when `align_inline_boxes` resizes a line box, which is why Parley's
+    // `positioned.y` is rebased with the former and `ShapedLine::baseline`
+    // with the latter.
+    let mut aligned_line_top = crate::units::Pt::ZERO;
 
     for line in parley_layout.lines() {
         let metrics = line.metrics();
@@ -468,11 +647,20 @@ pub(super) fn extract_paragraph(
         // that share the same parent Run. Reset when the Run changes.
         let mut prev_run_key = usize::MAX;
         let mut run_glyph_offset = 0usize;
+        // Inputs for the `vertical-align` pass below. Parley folds inline-box
+        // heights into the line's ascent, so its own `ascent` / `descent` are
+        // no use for recovering the text-only extent — the runs' metrics are.
+        let mut has_inline_box = false;
+        let mut max_box_height = crate::units::Pt::ZERO;
+        let mut max_run_ascent = crate::units::Pt::ZERO;
+        let mut max_run_descent = crate::units::Pt::ZERO;
 
         for item in line.items() {
             match item {
                 parley::PositionedLayoutItem::GlyphRun(glyph_run) => {
                     let run = glyph_run.run();
+                    max_run_ascent = max_run_ascent.max(run.metrics().ascent.as_px().in_pt());
+                    max_run_descent = max_run_descent.max(run.metrics().descent.as_px().in_pt());
                     let font_ref = run.font();
                     let font_index = font_ref.index;
                     let font_arc = ctx.get_or_insert_font(font_ref);
@@ -573,42 +761,90 @@ pub(super) fn extract_paragraph(
                         .insert(node_id, descendants);
 
                     let link = ctx.link_cache.lookup(doc, node_id);
+                    // Parley's inline box is the box's *margin* box
+                    // (`blitz-dom-0.2.4 layout/inline.rs:57`), so `height`
+                    // and everything derived from it below are margin-box
+                    // quantities.
                     let height = positioned.height.as_px().in_pt();
+                    let box_node = doc.get_node(node_id);
+                    let margins = box_node
+                        .map(|n| crate::blitz_adapter::extract_inline_box_margins(n, cb_width_px))
+                        .unwrap_or_default();
+                    let margin_top = margins.top.in_pt();
                     // Read baseline from `out` (Drawables). The Drawables-aware
                     // lookup queries `out.paragraphs[node_id]` (and
-                    // `block_styles[node_id]` for top-inset) directly.
-                    let baseline_shift =
+                    // `block_styles[node_id]` for top-inset) directly, so it
+                    // comes back relative to the *border* box — add
+                    // `margin_top` to land in the same box as `height`, and
+                    // clamp in case the two disagree about a percentage.
+                    // `None` (no in-flow line box, or `overflow` != visible)
+                    // collapses to the box's bottom margin edge, which is the
+                    // CSS 2.1 §10.8.1 fallback.
+                    let baseline_offset =
                         inline_box_baseline_offset_from_drawables(doc, out, node_id)
-                            .map(|bo| height - bo)
-                            .unwrap_or(crate::units::Pt::ZERO);
+                            .map(|bo| (margin_top + bo).min(height))
+                            .unwrap_or(height);
+                    // Provisional: `align_inline_boxes` always overwrites this
+                    // for a line that has an inline box. It is the border-box
+                    // top of Parley's own placement, so a future early-out
+                    // would still leave a coherent value here.
                     let computed_y =
-                        positioned.y.as_px().in_pt() - accumulated_line_top + baseline_shift;
-                    let visible = doc
-                        .get_node(node_id)
+                        positioned.y.as_px().in_pt() - accumulated_line_top + margin_top;
+                    let visible = box_node
                         .map(super::style::extract_opacity_visible)
                         .map(|(_, v)| v)
                         .unwrap_or(true);
+                    let vertical_align = box_node
+                        .map(crate::blitz_adapter::extract_vertical_align)
+                        .unwrap_or_default();
+                    has_inline_box = true;
+                    max_box_height = max_box_height.max(height);
                     items.push(LineItem::InlineBox(InlineBoxItem {
                         node_id: content,
                         width: positioned.width.as_px().in_pt(),
                         height,
-                        x_offset: positioned.x.as_px().in_pt(),
+                        // Border-box left, to match `computed_y`. There is
+                        // no line-box arithmetic on the inline axis — Parley
+                        // already packed the margin boxes — so the margin
+                        // folds in here rather than needing to be carried.
+                        x_offset: positioned.x.as_px().in_pt() + margins.left.in_pt(),
                         computed_y,
                         link,
                         opacity: 1.0,
                         visible,
+                        vertical_align,
+                        baseline_offset,
+                        margin_top,
                     }));
                 }
             }
         }
 
         let line_height = metrics.line_height.as_px().in_pt();
-        shaped_lines.push(ShapedLine {
+        // `ShapedLine::baseline` is paragraph-absolute, but the alignment pass
+        // works line-relative — rebase down, align, rebase back up.
+        let mut shaped = ShapedLine {
             height: line_height,
-            baseline: metrics.baseline.as_px().in_pt(),
+            baseline: metrics.baseline.as_px().in_pt() - accumulated_line_top,
             items,
-        });
+        };
+        if has_inline_box {
+            let strut = resolve_strut(node, &shaped.items, out);
+            let probe = LineProbe {
+                baseline: shaped.baseline,
+                line_height,
+                parley_ascent: metrics.ascent.as_px().in_pt(),
+                max_box_height,
+                max_run_ascent,
+                max_run_descent,
+            };
+            let extent = text_line_extent(&strut, &probe);
+            crate::paragraph::align_inline_boxes(&mut shaped, &strut.metrics, extent);
+        }
+        shaped.baseline += aligned_line_top;
         accumulated_line_top += line_height;
+        aligned_line_top += shaped.height;
+        shaped_lines.push(shaped);
     }
 
     if shaped_lines.is_empty() {
@@ -694,6 +930,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 10.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         })
     }
 
@@ -1075,6 +1314,176 @@ mod tests {
         // image_ys covers the LineItem::Image arm; the _ => None arm is covered in
         // recalculate_paragraph_line_boxes_expanding_line_shifts_subsequent_baseline.
         assert!(approx(image_ys(&lines[1].items)[0], 28.0));
+    }
+
+    // ── Strut resolution and line extent ──────────────────────────────────
+
+    const NOTO_SANS: &[u8] = include_bytes!("../../../../examples/.fonts/NotoSans-Regular.ttf");
+
+    fn test_strut() -> Strut {
+        Strut {
+            metrics: crate::paragraph::LineFontMetrics {
+                ascent: 8.0,
+                descent: 2.0,
+                x_height: 5.0,
+                subscript_offset: 3.0,
+                superscript_offset: 4.0,
+            },
+            above: 9.0_f32.as_pt(),
+            below: 3.0_f32.as_pt(),
+        }
+    }
+
+    /// Every inline box on the line is shorter than the text, so Parley's own
+    /// line box was decided by the text and is already the CSS one. Returning
+    /// it verbatim is what keeps existing output byte-identical.
+    #[test]
+    fn text_line_extent_keeps_parleys_box_when_the_text_decides_it() {
+        let e = text_line_extent(
+            &test_strut(),
+            &LineProbe {
+                baseline: 9.0_f32.as_pt(),
+                line_height: 12.0_f32.as_pt(),
+                parley_ascent: 9.0_f32.as_pt(),
+                max_box_height: 6.0_f32.as_pt(),
+                max_run_ascent: 8.0_f32.as_pt(),
+                max_run_descent: 2.0_f32.as_pt(),
+            },
+        );
+        assert_eq!(e.top, crate::units::Pt::ZERO);
+        assert!(approx_pt(e.bottom, 12.0));
+    }
+
+    /// A box exactly as tall as the line already *is* what set `ascent`, so
+    /// Parley's metrics are contaminated and the strut has to be synthesised.
+    #[test]
+    fn text_line_extent_rebuilds_from_the_strut_when_a_box_matches_the_line() {
+        let e = text_line_extent(
+            &test_strut(),
+            &LineProbe {
+                baseline: 12.0_f32.as_pt(),
+                line_height: 12.0_f32.as_pt(),
+                parley_ascent: 12.0_f32.as_pt(),
+                max_box_height: 12.0_f32.as_pt(),
+                max_run_ascent: 8.0_f32.as_pt(),
+                max_run_descent: 2.0_f32.as_pt(),
+            },
+        );
+        assert!(approx_pt(e.top, 3.0), "top={:?}", e.top);
+        assert!(approx_pt(e.bottom, 15.0), "bottom={:?}", e.bottom);
+    }
+
+    /// A run with a taller face than the block's own font still has to fit:
+    /// the extent is the union of the strut and the runs.
+    #[test]
+    fn text_line_extent_unions_the_strut_with_taller_runs() {
+        let e = text_line_extent(
+            &test_strut(),
+            &LineProbe {
+                baseline: 20.0_f32.as_pt(),
+                line_height: 20.0_f32.as_pt(),
+                parley_ascent: 20.0_f32.as_pt(),
+                max_box_height: 20.0_f32.as_pt(),
+                max_run_ascent: 30.0_f32.as_pt(), // beats the strut's 9
+                max_run_descent: 9.0_f32.as_pt(), // beats the strut's 3
+            },
+        );
+        assert!(approx_pt(e.top, -10.0), "top={:?}", e.top);
+        assert!(approx_pt(e.bottom, 29.0), "bottom={:?}", e.bottom);
+    }
+
+    #[test]
+    fn line_font_ratios_reads_the_lines_own_text_run() {
+        let out = crate::drawables::Drawables::default();
+        let items = vec![make_text_run(NOTO_SANS.to_vec())];
+        let r = line_font_ratios(&items, &out).expect("a parseable font is present");
+        assert!(r.ascent > 0.0 && r.ascent < 2.0, "ascent={}", r.ascent);
+        assert!(r.descent > 0.0 && r.descent < 1.0, "descent={}", r.descent);
+        assert!(
+            r.x_height > 0.0 && r.x_height < 1.0,
+            "x_height={}",
+            r.x_height
+        );
+    }
+
+    /// A row of inline-blocks has no glyph run of its own — the strut font has
+    /// to come out of a box's already-converted paragraph. This is the shape
+    /// `paperworx-repros/10-vertical-align-inline-block.html` uses.
+    #[test]
+    fn line_font_ratios_falls_back_into_an_inline_boxs_paragraph() {
+        let mut out = crate::drawables::Drawables::default();
+        out.paragraphs.insert(
+            7,
+            crate::drawables::ParagraphEntry {
+                lines: vec![ShapedLine {
+                    height: 12.0_f32.as_pt(),
+                    baseline: 9.0_f32.as_pt(),
+                    items: vec![make_text_run(NOTO_SANS.to_vec())],
+                }],
+                opacity: 1.0,
+                visible: true,
+                id: None,
+            },
+        );
+        let LineItem::InlineBox(mut ib) = make_inline_box() else {
+            panic!("expected an InlineBox");
+        };
+        ib.node_id = Some(7);
+        let r = line_font_ratios(&[LineItem::InlineBox(ib)], &out)
+            .expect("the box's paragraph carries a font");
+        assert!(r.x_height > 0.0);
+    }
+
+    /// Nothing parseable anywhere: the caller has to fall back rather than
+    /// panic, because a line really can be nothing but empty inline boxes.
+    #[test]
+    fn line_font_ratios_returns_none_without_any_parseable_font() {
+        let out = crate::drawables::Drawables::default();
+        assert_eq!(line_font_ratios(&[], &out), None);
+        assert_eq!(line_font_ratios(&[make_inline_box()], &out), None);
+        assert_eq!(
+            line_font_ratios(&[make_text_run(vec![0, 1, 2])], &out),
+            None
+        );
+    }
+
+    /// Half the leading goes above the baseline and half below, so the strut's
+    /// two extents must always add back up to the used `line-height`.
+    #[test]
+    fn resolve_strut_splits_the_leading_evenly_around_the_em_box() {
+        let doc = parse_doc(
+            "<html><body><p style=\"font-size:20px;line-height:30px\">x</p></body></html>",
+        );
+        let id = find_tag(&doc, "p");
+        let node = doc.deref().get_node(id).expect("the <p> node");
+        let out = crate::drawables::Drawables::default();
+        let strut = resolve_strut(node, &[make_text_run(NOTO_SANS.to_vec())], &out);
+        // 30 CSS px = 22.5 pt.
+        assert!(
+            approx_pt(strut.above + strut.below, 22.5),
+            "above={:?} below={:?}",
+            strut.above,
+            strut.below
+        );
+        assert!(strut.above > strut.below, "the ascent side must be larger");
+        assert!(strut.metrics.x_height > 0.0);
+    }
+
+    /// With no font to read, the documented generic-sans ratios stand in so
+    /// the strut is still proportioned sensibly rather than collapsing.
+    #[test]
+    fn resolve_strut_falls_back_to_generic_sans_ratios() {
+        let doc = parse_doc(
+            "<html><body><p style=\"font-size:20px;line-height:20px\">x</p></body></html>",
+        );
+        let id = find_tag(&doc, "p");
+        let node = doc.deref().get_node(id).expect("the <p> node");
+        let out = crate::drawables::Drawables::default();
+        let strut = resolve_strut(node, &[], &out);
+        // font-size 20px = 15pt, line-height 20px = 15pt → zero leading, so
+        // the split is exactly the fallback ascent / descent ratios.
+        assert!(approx_pt(strut.above, 15.0 * FALLBACK_FONT_RATIOS.ascent));
+        assert!(approx_pt(strut.below, 15.0 * FALLBACK_FONT_RATIOS.descent));
     }
 
     // ── Helpers for Blitz-backed tests ────────────────────────────────────────

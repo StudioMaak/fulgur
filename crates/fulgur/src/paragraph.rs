@@ -184,7 +184,8 @@ pub struct ShapedGlyphRun {
     pub link: Option<Arc<LinkSpan>>,
 }
 
-/// Vertical alignment for inline replaced elements (images).
+/// Vertical alignment for inline-level boxes: inline replaced elements
+/// (images) and atomic inline boxes (`display: inline-block` and friends).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum VerticalAlign {
     #[default]
@@ -241,6 +242,28 @@ pub struct InlineBoxItem {
     pub link: Option<Arc<LinkSpan>>,
     pub opacity: f32,
     pub visible: bool,
+    /// CSS `vertical-align` computed on the inline box itself.
+    ///
+    /// Parley knows nothing about `vertical-align`: it always puts an inline
+    /// box's *bottom* edge on the line's baseline. `align_inline_boxes`
+    /// re-places the box from this value.
+    pub vertical_align: VerticalAlign,
+    /// Distance from the box's **margin** box top edge down to the baseline
+    /// it contributes to the line (CSS 2.1 §10.8.1: the baseline of its last
+    /// in-flow line box, measured from the edge `height` is measured from).
+    ///
+    /// Equal to `height` when the box has no usable baseline — no in-flow
+    /// line box, or `overflow` other than `visible` — which is exactly the
+    /// spec's "use the bottom margin edge" rule.
+    pub baseline_offset: crate::units::Pt,
+    /// The box's own `margin-top`.
+    ///
+    /// `height` and `baseline_offset` are margin-box quantities because
+    /// that is what Parley hands over and what CSS aligns, but `computed_y`
+    /// has to come back out as a **border** box top for the renderer. This
+    /// is the offset between the two; see
+    /// `blitz_adapter::extract_inline_box_margin_top`.
+    pub margin_top: crate::units::Pt,
 }
 
 /// A single item in a shaped line: text glyph run, inline image, or an
@@ -999,6 +1022,131 @@ pub struct LineFontMetrics {
     pub superscript_offset: f32,
 }
 
+/// The line box occupied by everything that is *not* an atomic inline box —
+/// the CSS 2.1 §10.8 strut, the line's own glyph runs, and any already-placed
+/// inline image. Both fields are line-relative pt, measured from the line's
+/// pre-alignment top edge (so `top` is normally `0`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextLineExtent {
+    pub top: crate::units::Pt,
+    pub bottom: crate::units::Pt,
+}
+
+/// Place every `LineItem::InlineBox` on the line according to its CSS
+/// `vertical-align`, growing the line box where a box sticks out.
+///
+/// ## Why this exists
+///
+/// Parley has no `vertical-align` and no strut: it puts every inline box's
+/// *bottom* edge on the baseline and folds the box's entire height into the
+/// line's ascent (`parley-0.6.0 layout/line/greedy.rs:486`). When the tallest
+/// thing on the line is an inline box, that puts the line's baseline at the
+/// box's bottom edge — roughly half a box height below where `middle` wants
+/// it, and the error therefore grows with the box.
+///
+/// `extent` is the caller's measurement of the non-inline-box part of the
+/// line; the strut is the reason it is not simply `0 .. line.height`, since a
+/// line can legally contain no text at all and still have a baseline.
+///
+/// ## Known approximation
+///
+/// `VerticalAlign::Percent` resolves against the line box rather than the
+/// element's own `line-height`, matching what `recalculate_line_box` already
+/// does for images so the two agree.
+///
+/// ## Contract
+///
+/// * `line.baseline` must be **line-relative** on entry and is left
+///   line-relative on exit (`convert::inline_root` rebases to
+///   paragraph-absolute afterwards).
+/// * `InlineBoxItem::computed_y` is line-relative on entry and exit.
+/// * All box arithmetic here is in **margin** boxes — that is what
+///   `InlineBoxItem::height` and `baseline_offset` are, and what CSS 2.1
+///   §10.8 aligns for an atomic inline. `computed_y` is written back out as a
+///   *border* box top via `InlineBoxItem::margin_top`, because that is the
+///   edge `render::dispatch_inline_box_content` positions.
+/// * Any `LineItem::Image` present is assumed line-relative and is shifted
+///   with the line; in practice this runs before pseudo-image injection, so
+///   there are none.
+pub fn align_inline_boxes(
+    line: &mut ShapedLine,
+    metrics: &LineFontMetrics,
+    extent: TextLineExtent,
+) {
+    let baseline = line.baseline;
+    let mut line_top = extent.top;
+    let mut line_bottom = extent.bottom;
+
+    // Phase 1: flow-aligned boxes. `Top` / `Bottom` resolve against the final
+    // line box, so they are deferred to phase 2 — same two-phase shape as
+    // `recalculate_line_box` uses for images.
+    let mut positions: Vec<(usize, crate::units::Pt)> = Vec::new();
+    for (idx, item) in line.items.iter().enumerate() {
+        let LineItem::InlineBox(ib) = item else {
+            continue;
+        };
+        // CSS 2.1 §10.8.1: `baseline`, `sub`, `super` and a length/percentage
+        // offset all align the box's *own* baseline, so they start from
+        // `baseline_offset`; `middle`, `text-top` and `text-bottom` align an
+        // edge of the box and start from its top or bottom. Every one of them
+        // is the *margin* box's edge — a margined inline-block hangs from its
+        // margin edge, not from its border.
+        let top = match ib.vertical_align {
+            VerticalAlign::Top | VerticalAlign::Bottom => continue,
+            VerticalAlign::Baseline => baseline - ib.baseline_offset,
+            VerticalAlign::Middle => baseline - metrics.x_height.as_pt() / 2.0 - ib.height / 2.0,
+            VerticalAlign::Sub => baseline + metrics.subscript_offset.as_pt() - ib.baseline_offset,
+            VerticalAlign::Super => {
+                baseline - metrics.superscript_offset.as_pt() - ib.baseline_offset
+            }
+            VerticalAlign::TextTop => baseline - metrics.ascent.as_pt(),
+            VerticalAlign::TextBottom => baseline + metrics.descent.as_pt() - ib.height,
+            VerticalAlign::Length(v) => baseline - v - ib.baseline_offset,
+            VerticalAlign::Percent(p) => {
+                baseline - (extent.bottom - extent.top) * p - ib.baseline_offset
+            }
+        };
+        line_top = line_top.min(top);
+        line_bottom = line_bottom.max(top + ib.height);
+        positions.push((idx, top));
+    }
+
+    // Phase 2: `top` / `bottom` align to the (already expanded) line edges.
+    for (idx, item) in line.items.iter().enumerate() {
+        let LineItem::InlineBox(ib) = item else {
+            continue;
+        };
+        let top = match ib.vertical_align {
+            VerticalAlign::Top => line_top,
+            VerticalAlign::Bottom => line_bottom - ib.height,
+            _ => continue,
+        };
+        line_top = line_top.min(top);
+        line_bottom = line_bottom.max(top + ib.height);
+        positions.push((idx, top));
+    }
+
+    // Phase 3: shift everything so the line box starts at 0 again.
+    let shift = -line_top;
+    line.height = line_bottom - line_top;
+    line.baseline = baseline + shift;
+    for (idx, top) in positions {
+        if let LineItem::InlineBox(ib) = &mut line.items[idx] {
+            // `top` is the margin box's top edge, which is the box the line
+            // arithmetic above works in. `computed_y` is consumed as a
+            // *border* box top, so hand back the inner edge.
+            ib.computed_y = top + shift + ib.margin_top;
+        }
+    }
+    if shift != crate::units::Pt::ZERO {
+        for item in &mut line.items {
+            if let LineItem::Image(img) = item {
+                img.computed_y += shift;
+            }
+        }
+    }
+}
+
 /// Recalculate the line box height and baseline after inline images have been
 /// injected. Each image's `computed_y` (relative to the new line top) is set
 /// here; `draw_shaped_lines` uses it directly.
@@ -1099,6 +1247,195 @@ mod tests {
         0xCF, 0xC0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xC9, 0xFE, 0x92, 0xEF, 0x00, 0x00, 0x00,
         0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
+
+    // ── align_inline_boxes ────────────────────────────────────────────────
+
+    /// Metrics of a 10 pt face: ascent 8, descent 2, x-height 5.
+    fn box_metrics() -> LineFontMetrics {
+        LineFontMetrics {
+            ascent: 8.0,
+            descent: 2.0,
+            x_height: 5.0,
+            subscript_offset: 3.0,
+            superscript_offset: 4.0,
+        }
+    }
+
+    /// A line whose strut runs `[0, 10)` with the baseline 8 pt down.
+    fn strut_extent() -> TextLineExtent {
+        TextLineExtent {
+            top: crate::units::Pt::ZERO,
+            bottom: 10.0_f32.as_pt(),
+        }
+    }
+
+    fn make_aligned_box(height: f32, baseline_offset: f32, va: VerticalAlign) -> LineItem {
+        LineItem::InlineBox(InlineBoxItem {
+            node_id: None,
+            width: 20.0_f32.as_pt(),
+            height: height.as_pt(),
+            x_offset: crate::units::Pt::ZERO,
+            computed_y: crate::units::Pt::ZERO,
+            link: None,
+            opacity: 1.0,
+            visible: true,
+            vertical_align: va,
+            baseline_offset: baseline_offset.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
+        })
+    }
+
+    fn aligned_line(items: Vec<LineItem>) -> ShapedLine {
+        ShapedLine {
+            height: 10.0_f32.as_pt(),
+            baseline: 8.0_f32.as_pt(),
+            items,
+        }
+    }
+
+    fn box_y(line: &ShapedLine) -> f32 {
+        match &line.items[0] {
+            LineItem::InlineBox(ib) => ib.computed_y.to_f32(),
+            _ => panic!("expected an InlineBox at index 0"),
+        }
+    }
+
+    /// A box that fits inside the strut must leave the line box untouched —
+    /// this is the "small inline-block inside a paragraph" shape, and it is
+    /// what keeps existing output byte-identical.
+    #[test]
+    fn align_inline_boxes_short_baseline_box_leaves_the_line_box_alone() {
+        let mut line = aligned_line(vec![make_aligned_box(6.0, 5.0, VerticalAlign::Baseline)]);
+        align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+        assert_eq!(line.height.to_f32(), 10.0);
+        assert_eq!(line.baseline.to_f32(), 8.0);
+        // baseline 8 − own baseline offset 5.
+        assert_eq!(box_y(&line), 3.0);
+    }
+
+    /// `middle` straddles `baseline − x-height/2`, so a 40 pt box puts 20 pt
+    /// either side of 5.5 and the line grows in both directions.
+    #[test]
+    fn align_inline_boxes_middle_centres_on_the_x_height_midpoint() {
+        let mut line = aligned_line(vec![make_aligned_box(40.0, 40.0, VerticalAlign::Middle)]);
+        align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+        // top = 8 − 2.5 − 20 = −14.5, bottom = 25.5 → height 40, shift 14.5.
+        assert_eq!(line.height.to_f32(), 40.0);
+        assert_eq!(line.baseline.to_f32(), 22.5);
+        assert_eq!(box_y(&line), 0.0);
+    }
+
+    /// The defect in one assertion: the same box on `middle` and on
+    /// `baseline` must not land in the same place.
+    #[test]
+    fn align_inline_boxes_middle_and_baseline_differ_for_a_tall_box() {
+        let mut mid = aligned_line(vec![make_aligned_box(40.0, 40.0, VerticalAlign::Middle)]);
+        let mut base = aligned_line(vec![make_aligned_box(40.0, 40.0, VerticalAlign::Baseline)]);
+        align_inline_boxes(&mut mid, &box_metrics(), strut_extent());
+        align_inline_boxes(&mut base, &box_metrics(), strut_extent());
+        assert_ne!(mid.baseline.to_f32(), base.baseline.to_f32());
+        assert_ne!(mid.height.to_f32(), base.height.to_f32());
+    }
+
+    /// `top` and `bottom` resolve against the line box the flow-aligned
+    /// boxes produced, so a tall `baseline` box drags them with it.
+    #[test]
+    fn align_inline_boxes_top_and_bottom_use_the_expanded_line_box() {
+        let mut line = aligned_line(vec![
+            make_aligned_box(4.0, 4.0, VerticalAlign::Top),
+            make_aligned_box(4.0, 4.0, VerticalAlign::Bottom),
+            make_aligned_box(30.0, 30.0, VerticalAlign::Baseline),
+        ]);
+        align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+        // The 30 pt baseline box sits at 8 − 30 = −22; strut bottom is 10.
+        assert_eq!(line.height.to_f32(), 32.0);
+        match (&line.items[0], &line.items[1]) {
+            (LineItem::InlineBox(top), LineItem::InlineBox(bottom)) => {
+                assert_eq!(top.computed_y.to_f32(), 0.0);
+                assert_eq!(bottom.computed_y.to_f32(), 28.0);
+            }
+            _ => panic!("expected InlineBox items"),
+        }
+    }
+
+    /// `text-top` hangs the box from `baseline − ascent` and `text-bottom`
+    /// from `baseline + descent`, neither of which involves the box's own
+    /// baseline.
+    #[test]
+    fn align_inline_boxes_text_top_and_text_bottom_use_the_font_edges() {
+        let mut top = aligned_line(vec![make_aligned_box(30.0, 25.0, VerticalAlign::TextTop)]);
+        align_inline_boxes(&mut top, &box_metrics(), strut_extent());
+        // top = 8 − 8 = 0, so nothing shifts and the box starts at the line top.
+        assert_eq!(top.baseline.to_f32(), 8.0);
+        assert_eq!(box_y(&top), 0.0);
+
+        let mut bottom = aligned_line(vec![make_aligned_box(
+            30.0,
+            25.0,
+            VerticalAlign::TextBottom,
+        )]);
+        align_inline_boxes(&mut bottom, &box_metrics(), strut_extent());
+        // top = 8 + 2 − 30 = −20 → shift 20.
+        assert_eq!(bottom.baseline.to_f32(), 28.0);
+        assert_eq!(box_y(&bottom), 0.0);
+    }
+
+    /// `sub` / `super` / an explicit length all offset the box's *own*
+    /// baseline from the line's.
+    #[test]
+    fn align_inline_boxes_offset_values_move_the_boxes_own_baseline() {
+        for (va, expected_top) in [
+            (VerticalAlign::Sub, 8.0_f32 + 3.0 - 5.0),
+            (VerticalAlign::Super, 8.0 - 4.0 - 5.0),
+            (VerticalAlign::Length(2.0_f32.as_pt()), 8.0 - 2.0 - 5.0),
+            // 50% of the extent's height (10) = 5.
+            (VerticalAlign::Percent(0.5), 8.0 - 5.0 - 5.0),
+        ] {
+            let mut line = aligned_line(vec![make_aligned_box(6.0, 5.0, va)]);
+            align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+            let shift = -expected_top.min(0.0);
+            assert_eq!(
+                box_y(&line),
+                expected_top + shift,
+                "unexpected placement for {va:?}"
+            );
+        }
+    }
+
+    /// A line with no inline box at all is a no-op, including for images,
+    /// whose `computed_y` must not be perturbed when nothing shifts.
+    #[test]
+    fn align_inline_boxes_without_inline_boxes_is_a_noop() {
+        let mut img = make_inline_image(4.0, 4.0, VerticalAlign::Baseline);
+        img.computed_y = 4.0_f32.as_pt();
+        let mut line = aligned_line(vec![LineItem::Image(img)]);
+        align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+        assert_eq!(line.height.to_f32(), 10.0);
+        assert_eq!(line.baseline.to_f32(), 8.0);
+        match &line.items[0] {
+            LineItem::Image(i) => assert_eq!(i.computed_y.to_f32(), 4.0),
+            _ => panic!("expected an Image"),
+        }
+    }
+
+    /// When a tall box does shift the line, an already-placed image has to
+    /// travel with it or it detaches from the text it was injected beside.
+    #[test]
+    fn align_inline_boxes_shifts_images_along_with_the_line() {
+        let mut img = make_inline_image(4.0, 4.0, VerticalAlign::Baseline);
+        img.computed_y = 4.0_f32.as_pt();
+        let mut line = aligned_line(vec![
+            LineItem::Image(img),
+            make_aligned_box(30.0, 30.0, VerticalAlign::Baseline),
+        ]);
+        align_inline_boxes(&mut line, &box_metrics(), strut_extent());
+        // Box top = 8 − 30 = −22 → shift 22.
+        assert_eq!(line.baseline.to_f32(), 30.0);
+        match &line.items[0] {
+            LineItem::Image(i) => assert_eq!(i.computed_y.to_f32(), 26.0),
+            _ => panic!("expected an Image"),
+        }
+    }
 
     fn make_inline_image(width: f32, height: f32, va: VerticalAlign) -> InlineImage {
         InlineImage {
@@ -1559,6 +1896,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 20.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         });
         match item {
             LineItem::InlineBox(ib) => {
@@ -1603,6 +1943,9 @@ mod tests {
             link: None,
             opacity: 1.0,
             visible: true,
+            vertical_align: crate::paragraph::VerticalAlign::Baseline,
+            baseline_offset: 5.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
         });
         let s = format!("{:?}", ib);
         assert!(s.contains("InlineBox"), "{}", s);
@@ -1793,6 +2136,9 @@ mod tests {
                     link: None,
                     opacity: 1.0,
                     visible: true,
+                    vertical_align: crate::paragraph::VerticalAlign::Baseline,
+                    baseline_offset: 20.0_f32.as_pt(),
+                    margin_top: crate::units::Pt::ZERO,
                 }),
             ],
         };
@@ -2353,5 +2699,202 @@ mod render_smoke_tests {
             </body></html>"#,
         );
         assert!(pdf.starts_with(b"%PDF"));
+    }
+}
+
+// Tests for private draw helpers that are easier to verify by calling them
+// directly than by driving the full Engine pipeline.  All tests in this module
+// use a minimal Krilla surface so they run fast and in-process.
+#[cfg(test)]
+mod draw_decoration_direct_tests {
+    use super::*;
+    use crate::draw_primitives::Canvas;
+    use crate::image::ImageFormat;
+    use crate::units::F32Units;
+    use std::sync::Arc;
+
+    // Helpers ────────────────────────────────────────────────────────────────
+
+    /// Run `f` with a throwaway Krilla canvas (non-tagged, 200×200 pt page).
+    /// Returns the serialized PDF bytes so callers can assert the document
+    /// is non-empty, confirming the canvas pipeline completed successfully.
+    fn with_canvas<F: FnOnce(&mut Canvas<'_, '_>)>(f: F) -> Vec<u8> {
+        let mut doc = krilla::Document::new();
+        let settings = krilla::page::PageSettings::from_wh(200.0, 200.0).expect("valid page size");
+        {
+            let mut page = doc.start_page_with(settings);
+            let mut surface = page.surface();
+            let mut canvas = Canvas {
+                surface: &mut surface,
+                bookmark_collector: None,
+                link_collector: None,
+                tag_collector: None,
+                link_run_node_id: None,
+                in_marked_content: false,
+            };
+            f(&mut canvas);
+        }
+        doc.finish().expect("document serialization must succeed")
+    }
+
+    /// Construct a minimal 10×10 pt `InlineImage` using the 1×1 red PNG fixture.
+    /// Pass `visible: false` to exercise the invisible-image skip path.
+    fn make_test_image(visible: bool) -> InlineImage {
+        InlineImage {
+            data: Arc::new(super::tests::TEST_PNG.to_vec()),
+            format: ImageFormat::Png,
+            width: 10.0_f32.as_pt(),
+            height: 10.0_f32.as_pt(),
+            x_offset: crate::units::Pt::ZERO,
+            vertical_align: VerticalAlign::Baseline,
+            opacity: 1.0,
+            visible,
+            computed_y: crate::units::Pt::ZERO,
+            link: None,
+        }
+    }
+
+    /// Construct a minimal 30×20 pt `InlineBoxItem`.
+    /// Pass `visible: false` to exercise the invisible-inline-box skip path.
+    fn make_test_inline_box(visible: bool) -> InlineBoxItem {
+        InlineBoxItem {
+            node_id: None,
+            width: 30.0_f32.as_pt(),
+            height: 20.0_f32.as_pt(),
+            x_offset: crate::units::Pt::ZERO,
+            computed_y: crate::units::Pt::ZERO,
+            link: None,
+            opacity: 1.0,
+            visible,
+            // StudioMaak fork fields, absent from the upstream helper this
+            // merged in: a baseline-aligned box with no usable baseline of its
+            // own takes its bottom margin edge (CSS 2.1 §10.8.1), i.e.
+            // `baseline_offset == height`, and carries no margin.
+            vertical_align: VerticalAlign::Baseline,
+            baseline_offset: 20.0_f32.as_pt(),
+            margin_top: crate::units::Pt::ZERO,
+        }
+    }
+
+    // ── draw_decoration_line: Wavy + tiny thickness ──────────────────────────
+
+    /// Covers lines 471-483: when the computed `half` (= `thickness * 2.0`) is
+    /// less than 0.01, the wavy oscillation loop would run forever, so the guard
+    /// falls back to a plain straight line.  A thickness of 0.001 gives
+    /// `half = 0.002 < 0.01`.
+    #[test]
+    fn wavy_tiny_thickness_falls_back_to_straight_line() {
+        let pdf = with_canvas(|canvas| {
+            draw_decoration_line(
+                canvas,
+                0.0,
+                5.0,
+                50.0,
+                0.001, // thickness → half = 0.001 * 4.0 / 2.0 = 0.002 < 0.01
+                [0, 0, 0, 255],
+                TextDecorationStyle::Wavy,
+            );
+        });
+        assert!(!pdf.is_empty());
+    }
+
+    /// Edge case: thickness exactly at the boundary (half == 0.01).  This should
+    /// *not* trigger the guard (condition is strictly `< 0.01`) and therefore
+    /// enters the normal wavy loop.
+    #[test]
+    fn wavy_boundary_thickness_enters_normal_loop() {
+        let pdf = with_canvas(|canvas| {
+            // half = 0.005 * 4.0 / 2.0 = 0.01 → NOT < 0.01 → normal wavy loop
+            draw_decoration_line(
+                canvas,
+                0.0,
+                5.0,
+                50.0,
+                0.005,
+                [0, 0, 0, 255],
+                TextDecorationStyle::Wavy,
+            );
+        });
+        assert!(!pdf.is_empty());
+    }
+
+    // ── draw_line_decorations: span-merging continue ─────────────────────────
+
+    /// Covers line 561: when two consecutive runs share the same decoration and
+    /// their gap is zero, `draw_line_decorations` extends the existing
+    /// `DecorationSpan` instead of creating a new one (the `continue` branch).
+    ///
+    /// run1: x_offset = 0pt, glyph advance = 5.0, font_size = 10pt → width = 50pt
+    /// run2: x_offset = 50pt (exactly at run1's end) → gap = 0pt < 0.5pt → extend
+    #[test]
+    fn draw_line_decorations_adjacent_runs_span_merging_fires() {
+        let decoration = TextDecoration {
+            line: TextDecorationLine::UNDERLINE,
+            style: TextDecorationStyle::Solid,
+            color: [0, 0, 0, 255],
+        };
+
+        let make_run = |x_offset_pt: f32| ShapedGlyphRun {
+            font_data: Arc::new(Vec::new()),
+            font_index: 0,
+            font_size: 10.0_f32.as_pt(),
+            color: [0, 0, 0, 255],
+            decoration,
+            glyphs: vec![ShapedGlyph {
+                id: 0,
+                x_advance: 5.0, // 5.0 * 10pt = 50pt run width
+                x_offset: 0.0,
+                y_offset: 0.0,
+                text_range: 0..1,
+            }],
+            text: Arc::from("a"),
+            x_offset: x_offset_pt.as_pt(),
+            link: None,
+        };
+
+        let items = vec![
+            LineItem::Text(make_run(0.0)),  // ends at 50pt
+            LineItem::Text(make_run(50.0)), // starts at 50pt → gap = 0 → merges
+        ];
+
+        let pdf = with_canvas(|canvas| {
+            draw_line_decorations(canvas, &items, 0.0_f32.as_pt(), 12.0_f32.as_pt());
+        });
+        assert!(!pdf.is_empty());
+    }
+
+    // ── draw_shaped_lines: invisible image → continue (line 840) ─────────────
+
+    /// Covers line 840: an `InlineImage` with `visible = false` is skipped by
+    /// `draw_shaped_lines` without touching Krilla's draw_image path.
+    #[test]
+    fn draw_shaped_lines_invisible_image_skips_rendering() {
+        let line = ShapedLine {
+            height: 16.0_f32.as_pt(),
+            baseline: 12.0_f32.as_pt(),
+            items: vec![LineItem::Image(make_test_image(false))],
+        };
+        let pdf = with_canvas(|canvas| {
+            draw_shaped_lines(canvas, &[line], 0.0_f32.as_pt(), 0.0_f32.as_pt(), None);
+        });
+        assert!(!pdf.is_empty());
+    }
+
+    // ── draw_shaped_lines: invisible InlineBox → continue (lines 888-889) ────
+
+    /// Covers lines 888-889: an `InlineBoxItem` with `visible = false` is
+    /// skipped by `draw_shaped_lines`; `canvas.link_run_node_id` is restored and
+    /// the item is not dispatched.
+    #[test]
+    fn draw_shaped_lines_invisible_inline_box_skips_rendering() {
+        let line = ShapedLine {
+            height: 16.0_f32.as_pt(),
+            baseline: 12.0_f32.as_pt(),
+            items: vec![LineItem::InlineBox(make_test_inline_box(false))],
+        };
+        let pdf = with_canvas(|canvas| {
+            draw_shaped_lines(canvas, &[line], 0.0_f32.as_pt(), 0.0_f32.as_pt(), None);
+        });
+        assert!(!pdf.is_empty());
     }
 }
