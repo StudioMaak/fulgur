@@ -2568,7 +2568,7 @@ fn has_class(elem: &blitz_dom::node::ElementData, name: &str) -> bool {
 }
 
 /// Rebuild a [`ParsedSelector`] as CSS text, for the stylesheets fulgur
-/// injects (`build_running_hide_css`, `build_static_content_css`).
+/// injects (`build_running_display_none_css`, `build_static_content_css`).
 ///
 /// Selector components come from the trusted author CSS via `gcpm::parser`
 /// (`Token::Ident` in cssparser), not from arbitrary HTML. Tag and attribute
@@ -2578,7 +2578,7 @@ fn has_class(elem: &blitz_dom::node::ElementData, name: &str) -> bool {
 /// depth on the trusted side, and required by `element_specificity_prefix`
 /// for the untrusted case (fulgur-ka6c). Attribute *values* are emitted as
 /// quoted strings through the same escaper the `content` property uses.
-fn selector_to_css(selector: &ParsedSelector) -> String {
+fn selector_text(selector: &ParsedSelector) -> String {
     use std::fmt::Write;
     match selector {
         ParsedSelector::Tag(name) => name.to_ascii_lowercase(),
@@ -3709,6 +3709,35 @@ fn css_escape_ident(s: &str) -> String {
     out
 }
 
+/// Serialize running-element mappings into the `display: none` rules that
+/// suppress each running element's "real" copy at its source position.
+///
+/// `parse_gcpm` performs this rewrite inline, by editing
+/// `position: running(name)` into `display: none` inside its `cleaned_css`.
+/// That works for CSS fulgur injects wholesale (AssetBundle / `--css`) and
+/// for CSS it serves to Blitz itself (`net::FulgurNetProvider::fetch`), but
+/// not for an inline `<style>`, which Blitz has already parsed from the
+/// source document by the time fulgur sees it. Re-injecting that
+/// stylesheet's whole `cleaned_css` would deliver the rewrite, but
+/// `cleaned_css` preserves all non-GCPM CSS verbatim, so it also re-runs
+/// every ordinary rule as the last child of `<head>` — moving the sheet to
+/// the end of the cascade and dropping its `media` attribute. Emitting only
+/// the generated rules keeps the author's own cascade untouched.
+///
+/// Injected via [`InjectCssPass`], each rule carries the same specificity as
+/// the author's selector and so wins by source order — which is what
+/// suppression needs, since the author's sheet declares no competing
+/// `display` for these elements. Cost is O(mappings): no DOM walk, no
+/// per-node rule.
+pub(crate) fn build_running_display_none_css(mappings: &[crate::gcpm::RunningMapping]) -> String {
+    use std::fmt::Write;
+    let mut css = String::new();
+    for m in mappings {
+        let _ = write!(css, "{}{{display:none}}", selector_text(&m.parsed));
+    }
+    css
+}
+
 /// Serialize flattened static pseudo-content mappings into CSS: one
 /// `<selector><pseudo> { content: "<flattened>" }` rule per mapping.
 ///
@@ -3720,37 +3749,11 @@ fn css_escape_ident(s: &str) -> String {
 /// O(mappings): unlike `CounterPass`, no DOM walk and no per-node rule, so a
 /// hostile document cannot amplify a small input into an OOM (see
 /// [`crate::gcpm::StaticContentMapping`]).
-/// Build the CSS that takes running elements out of the document flow.
-///
-/// `position: running(<name>)` is normally rewritten to `display: none`
-/// while `cleaned_css` is assembled, but an inline `<style>` block's text is
-/// never rewritten that way — `extract_gcpm_from_inline_styles` reads the
-/// constructs out of the DOM and leaves the stylesheet itself alone. A
-/// running element declared inline was therefore harvested into its margin
-/// box *and* left in the body, printing twice and displacing everything
-/// after it. Since a themed document ships its CSS in a `<style>` block,
-/// that is the path real documents take.
-///
-/// Injecting the rule covers both sources: for bundled CSS the declaration
-/// is already there and this is a harmless repeat. It must be injected only
-/// after `RunningElementPass` has harvested the content — the pass reads the
-/// DOM directly, so hiding the element first would cost nothing, but the
-/// ordering is what makes that safe to rely on.
-pub(crate) fn build_running_hide_css(mappings: &[crate::gcpm::RunningMapping]) -> String {
-    use std::fmt::Write;
-    let mut css = String::new();
-    for m in mappings {
-        let selector = selector_to_css(&m.parsed);
-        let _ = write!(css, "{selector}{{display:none}}");
-    }
-    css
-}
-
 pub(crate) fn build_static_content_css(mappings: &[StaticContentMapping]) -> String {
     use std::fmt::Write;
     let mut css = String::new();
     for m in mappings {
-        let selector = selector_to_css(&m.parsed);
+        let selector = selector_text(&m.parsed);
         let pseudo = match m.pseudo {
             PseudoElement::Before => "::before",
             PseudoElement::After => "::after",
@@ -4416,6 +4419,35 @@ mod tests {
     #[test]
     fn build_static_content_css_empty_for_no_mappings() {
         assert!(build_static_content_css(&[]).is_empty());
+    }
+
+    #[test]
+    fn build_running_display_none_css_serializes_selectors_and_escapes() {
+        let mappings = vec![
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Tag("HEADER".into()),
+                running_name: "top".into(),
+            },
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Class("page-header".into()),
+                running_name: "top".into(),
+            },
+            // A selector metacharacter must be escaped so the injected rule
+            // is well-formed and cannot widen its own match set.
+            crate::gcpm::RunningMapping {
+                parsed: ParsedSelector::Id("a b".into()),
+                running_name: "bottom".into(),
+            },
+        ];
+        assert_eq!(
+            build_running_display_none_css(&mappings),
+            r"header{display:none}.page-header{display:none}#a\ b{display:none}"
+        );
+    }
+
+    #[test]
+    fn build_running_display_none_css_empty_for_no_mappings() {
+        assert!(build_running_display_none_css(&[]).is_empty());
     }
 
     /// `relayout_position_fixed` must reshape every `position: fixed`
