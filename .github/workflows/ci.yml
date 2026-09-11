@@ -292,25 +292,49 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # Give each matrix variant (and this job as a whole) its own cache
-          # slot instead of sharing `ubuntu-latest-fulgur` with the `vrt` job
-          # and every other `wpt` phase. All 6 phases previously restored/
-          # saved the identical key concurrently on push-to-main — observed
-          # once as 3 phases (bugs, opacity-visibility, smoke; the ones
-          # forced to queue behind the other 3 for a runner slot) all
-          # failing identically with `cargo: could not find Cargo.toml`
-          # right after a "Cache restored successfully" that otherwise
-          # looked clean. Root cause not conclusively pinned down (would
-          # need a corrupted/overwritten checkout mid-restore), but a
-          # same-key concurrent save/restore race across 6+ jobs is the
-          # only plausible mechanism and per-phase keys remove it outright
-          # regardless of the exact mechanism.
+          # Gives each of the 7 wpt matrix phases (css-page, multicol-1/2/3,
+          # bugs, opacity-visibility, smoke) its own cache slot instead of
+          # sharing `ubuntu-latest-fulgur` with the `vrt` job and each other.
+          # This is a hygiene improvement (avoids one phase's rebuild
+          # evicting another's cache entry), NOT a confirmed fix for a
+          # specific incident: on one push-to-main run, 3 phases (bugs,
+          # opacity-visibility, smoke — the ones queued behind the other 4
+          # for a runner slot) failed identically with `cargo: could not
+          # find Cargo.toml`, immediately after a "Cache restored
+          # successfully" that otherwise looked like a clean, complete
+          # download.
+          #
+          # Per Swatinem/rust-cache's own docs, the paths it restores are
+          # `~/.cargo/{bin,registry,git,...}` and `<workspace>/target` —
+          # never the checked-out working tree itself — and matrix jobs run
+          # on independent runner VMs with no shared filesystem, so a
+          # same-key concurrent save/restore cannot plausibly overwrite
+          # another job's `actions/checkout` output (Cargo.toml lives at the
+          # repo root, outside every cached path). Flagged by Codex review
+          # on the PR that introduced this comment (fulgur PR #752) — the
+          # real mechanism is still unknown. The "Verify checkout" step
+          # below exists to actually capture that if/when this recurs,
+          # rather than continuing to guess.
           shared-key: ubuntu-latest-fulgur-wpt-${{ matrix.phase }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install poppler-utils
         run: sudo apt-get update && sudo apt-get install -y poppler-utils mold
       - name: Configure mold linker
         run: echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> $GITHUB_ENV
+      - name: Verify checkout
+        # Cheap sanity check requested by Codex review on fulgur PR #752
+        # after an unexplained `cargo: could not find Cargo.toml` failure
+        # on this job. If the workspace is ever missing its manifest again,
+        # dump enough state (cwd, listing, disk usage) to actually diagnose
+        # it instead of failing with cargo's generic error message.
+        run: |
+          if [ ! -f Cargo.toml ]; then
+            echo "::error::Cargo.toml missing from $(pwd) — dumping diagnostics"
+            pwd
+            ls -la
+            df -h .
+            exit 1
+          fi
       - name: Fetch WPT subset
         run: scripts/wpt/fetch.sh
       - name: Run ${{ matrix.phase }} reftests
