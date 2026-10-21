@@ -1030,6 +1030,85 @@ page) and `fulgur-naj7.13` (a group that gets `display: table-header-group` from
 CSS rather than the `<thead>` tag is not hoisted, and therefore not repeated —
 our `TableSectionOrderPass` covers the tag spelling only).
 
+## Upstream sync, measured 2026-10-21
+
+Checked against `upstream/main` at `efb88937` — **331 commits** since `c89bb3b3`,
+28 558 insertions. The headline number is misleading: only **19 files** touch the
+crates we actually run. The bulk is `crates/fulgur-raikiri` (57 files, a complete
+second layout backend) plus `fulgur-dev`, `fulgur-vrt` and `fulgur-wpt`.
+
+**No features we wanted.** Upstream made **zero** commits to `pagination_layout.rs`,
+`paginate.rs`, `render.rs` or `gcpm/` in this window. Items **8, 11, 12 and 14 are
+all untouched**, verified by `-S` symbol search rather than by reading titles:
+
+| item | probe | result |
+|---|---|---|
+| 8 — `@font-face` from inline `<style>` | `-S'fetch_font_face'`, `-S'register_fonts'` | empty |
+| 11 — margin at a forced break | `-S'explicit_break_before'`, `-S'page_filling_break_child'` | empty |
+| 12 — ICB-anchored absolute | `-S'append_position_absolute_body_direct_fragments'` | empty (whole repo) |
+| 14 — oversized block does not break | `-S'fragment_block_subtree'` | empty |
+
+So every repro we hold is still uncontested ground, and the `<thead>` lesson does not
+apply to any of them.
+
+### Why the sync was taken anyway
+
+A **live arbitrary-file-read with exfiltration into the output PDF**, present in our
+tree on four entry paths, closed upstream by `0b167cad` / `234ee3d3` / `80b129f6` /
+`87bfffb2` / `c8b0d1e4`. The mechanism and the three lessons worth keeping are written
+up in CLAUDE.md under *"usvg reads local files"*; the short version is that usvg's
+default resolver reads non-`data:` `<image href>` values off the filesystem, the read
+happens inside usvg so our `canonical_base` check is not on the path, and the bytes
+reach the PDF.
+
+Measured on our own tree, before and after, with the same fixture and the same binary
+path: a document inside a base directory read a canary file outside it and rendered
+its contents (1 hit in the text layer); after the merge, 0 hits, with the benign
+content still rendering. That before/after is the evidence this sync rests on — not
+upstream's commit message.
+
+### Mechanics
+
+Eleven conflicts, **all binary, all regenerated output, zero source conflicts**:
+six VRT goldens where upstream's side is purely the new `/Lang` catalog entry from
+`a79abedb` (+78 bytes each; 46 goldens moved upstream-wide), and five example PDFs
+that both sides had regenerated. All resolved to upstream, then both sets regenerated
+against merged code in the pinned container and diffed.
+
+VRT came back 65/65, with each of the six conflicted goldens exactly **+78 bytes** over
+our pre-merge version — the `/Lang` entry, nothing else. Of the 20 example PDFs upstream
+regenerated, our code reproduced **15 byte-exactly**; the 5 that differ are the 5 that
+conflicted, and they differ for fork reasons (pagination and GCPM divergence), not sync
+reasons. `bookmark`'s −134 bytes was checked for content loss and is a page-break
+position moving between two paragraphs — 2 pages, 6 outline entries and identical text
+on both sides.
+
+Do not use `examples_determinism` as the judge here, which is a mistake worth not
+repeating: it renders each example twice and compares the two runs to each other. It
+proves determinism, never that a committed `index.pdf` matches the code.
+
+All four standing divergences survived untouched, because upstream never entered
+those files: the `break-before` top-margin policy, `ParsedSelector::Compound`,
+`<tfoot>` repetition, and `css_escape_ident` with its 28 call sites.
+
+One silent loss, caught by diffing the test inventory rather than by any tool:
+upstream's `87bfffb2` deleted
+`build_static_content_css_serializes_selectors_and_escapes` as collateral, with no
+conflict and a green build. Restored in `e7a3bb74`.
+
+### Carried forward
+
+- **The #719 cluster is frozen**, not being dismantled further — author inactive since
+  2026-09-09, nothing merged or reviewed. There is a fifth member earlier notes
+  missed, **#756** (WPT `css-break`). Stop treating the extractions as imminent.
+- **#775** is an open upstream content-loss defect of the same class as item 14
+  (`break-inside: avoid` on an unfittable paragraph drops line metrics, trailing words
+  vanish). Worth reading before writing item 14's patch.
+- **#747** (parley 0.6 → 0.11.1) and **#748** (taffy 0.9.2 → 0.14.0) would land under
+  the premises of items 10 and 12 respectively. Re-measure both against WeasyPrint 69
+  and Chrome 151 before either bump is merged.
+- Item 14 remains recorded as **unverified** against the actual filing fixture.
+
 ## Upstream sync, measured 2026-09-11
 
 Checked against `upstream/main` at `2632efc3` — 77 commits since `dbf4dc62`, of

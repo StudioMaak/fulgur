@@ -204,22 +204,31 @@ the source diff before assuming a sync is free. Measured 2026-09-11 over the 77 
 since `dbf4dc62`: 15 changed library source, and among them was a **P0 silent
 content-loss fix** (upstream PR #741) that a title-level skim reads as routine.
 
-**PR #719 is no longer the thing to wait for.** It is still a draft with
-`CHANGES_REQUESTED`, and its growth since 2026-08-24 (+9818/−6038 → +19783/−6699) is a
-WPT ledger and ~1900 lines of design docs, not fragmentation work — which stopped on
-**2026-08-27**. The author is dismantling it: #754, #755 and #757 each open with
-*"Extracted from #719, which is blocked on a larger reconciliation with `main`."*
-It also branched *before* upstream's own repeating-header stack landed, so it must
-reconcile against the same code our `<tfoot>` re-port sits on — that pain is shared,
-not ours alone.
+**The #719 cluster is frozen, not progressing.** Measured 2026-10-21: the draft is
+still `CHANGES_REQUESTED`, and its author has not pushed to the repo since
+**2026-09-09**. The extractions are #754, #755, #757 and — a fifth one earlier notes
+missed — **#756** (WPT `css-break` conformance). None merged, none reviewed, none
+closed. All five share an `updatedAt` of 2026-09-23, which is a repo-wide base-ref
+event every stale PR in the repo carries, not author activity. `gh search prs --repo
+fulgur-rs/fulgur "Extracted from #719"` returns exactly those five and nothing newer.
+Every PR opened since 2026-09-20 is coverage, dependabot or Raikiri, by a different
+author.
 
-**Decision superseded** (was: wait for #719 to land, then re-port). Take the
-extractions as they appear, and stop holding repros 11 and 12 back on #719's account —
-offer them as standalone PRs the way #757 was, each with the WeasyPrint/Chrome
-measurement already in `paperworx-repros/README.md`. If #719 ever lands, reconciling a
-merged small PR is upstream's problem, not ours.
+**Decision (unchanged, now firmer): do not wait on any of them.** Offer repros 11 and
+12 as standalone PRs, each with the WeasyPrint/Chrome measurement already in
+`paperworx-repros/README.md`. If #719 ever lands, reconciling a merged small PR is
+upstream's problem, not ours.
 
-Two mechanical traps this sync exposed, both worth repeating next time:
+**A sync's value is not in its feature list.** Measured 2026-10-21 over the 331
+commits since `c89bb3b3`: upstream made **zero** commits to `pagination_layout.rs`,
+`paginate.rs`, `render.rs` or `gcpm/`, and all four held defects (8, 11, 12, 14) were
+verified untouched by symbol search. No features we wanted. The sync was still worth
+taking, because buried in the coverage traffic was a **live arbitrary-file-read with
+exfiltration into the output PDF** — see below. Twice now (PR #741's content-loss fix,
+and this) the reason to sync has been a defect fix whose commit title reads as
+routine. Read the source diff; do not grade a sync by its changelog.
+
+Three mechanical traps these syncs exposed, all worth repeating next time:
 
 - **`git merge` reported one conflict and silently merged two more files wrong.**
   `paragraph.rs` (upstream's new `make_test_inline_box` predates our three
@@ -233,7 +242,80 @@ Two mechanical traps this sync exposed, both worth repeating next time:
   internally inconsistent — its own
   `body_level_break_before_preserves_own_top_margin_on_new_page` asserts the margin
   *is* kept at body level. Expect this to re-conflict on every sync until it is
-  settled upstream.
+  settled upstream. (It did **not** re-conflict on 2026-10-21 — only because upstream
+  never entered `pagination_layout.rs` that window. The disagreement is dormant, not
+  resolved.)
+- **A clean auto-merge can still delete one of our tests.** On 2026-10-21 upstream's
+  `87bfffb2` inserted new SVG tests exactly where our
+  `build_static_content_css_serializes_selectors_and_escapes` lived and deleted it.
+  Git took our modified function body *and* upstream's deletion of its test: no
+  conflict, no compile error, nothing in `git status`, clippy green, suite green —
+  because the only thing lost was coverage. Nothing automated catches this.
+  **After a sync, diff the test inventory, not just the build:**
+  `git diff <premerge>..HEAD -- '*.rs' | grep "^-.*fn .*("` and read what left.
+
+#### usvg reads local files, and our base-path confinement never sees it
+
+Closed upstream 2026-10-21 (`0b167cad`, `234ee3d3`, `80b129f6`, `87bfffb2`,
+`c8b0d1e4`); recorded here because the shape of the bug outlives the fix.
+
+`usvg::Options::default()` installs a resolver that treats any `<image href>` it
+cannot parse as a `data:` URL as a **filesystem path**, and with `resources_dir`
+unset — we never set it — an absolute path is used verbatim. The read happens
+*inside usvg*, so the `canonical_base` check in `net.rs` is not on the path and
+cannot help. The bytes are then painted into the output PDF, so this is
+read-and-exfiltrate, not a blind read. Demonstrated against our own tree: a document
+confined to a base directory read a file outside it and rendered its contents, plain
+CLI, no flags. Four entry paths were unguarded — inline `<svg>`, `<img src>` / any
+net-provider payload, CSS `background-image: url()`, and list markers.
+
+Three things to carry forward:
+
+- **A regex over the payload is not a fix.** The `<image>` can arrive inside escaped
+  text or CDATA (Blitz re-serializes with `outer_html()`, which writes text verbatim,
+  so escaped markup becomes real markup on the second pass), inside gzip (SVGZ), or
+  behind a leading comment or DOCTYPE that defeats extension and magic sniffing.
+  Upstream's answer is scan → cut → re-scan → reject if still dirty.
+- **Blitz hands usvg anything it cannot decode as a raster**, whatever the extension.
+  A `.css` or extensionless `<link>` target is an SVG parse vector.
+- **The Worker path is immune by accident.** On `wasm32-unknown-unknown` `std::fs`
+  returns `Unsupported`, so `path.exists()` is false and usvg bails before reading.
+  No `cfg` in the fix is what closes it — a move to `wasm32-wasip1`/`wasip2` reopens
+  it instantly. And the SVGZ decompression bomb is target-independent, so Workers are
+  immune to the disclosure but **exposed to the DoS**, where memory exhaustion hits a
+  hard isolate cap.
+
+#### Raikiri is a second backend, walled off from us
+
+Landed 2026-09-27 onward: `crates/fulgur-raikiri` (a complete independent layout
+backend, Raikiri for layout + Krilla for paint, no Blitz fallback) and
+`crates/fulgur-dev` (an unpublished CLI that renders through either backend for
+comparison). Both are `publish = false`, `release = false`, and excluded from fmt,
+clippy, nextest and coverage in every CI cell, behind their own non-required
+workflow. `cargo test -p fulgur` does not pull them in and the `fulgur` facade's
+public API is unchanged.
+
+It already beats Blitz on paged media — 116 WPT `css-page` passes against Blitz's 84,
+with 50 passing only on Raikiri — so expect upstream's attention to keep moving there.
+Multicol is still weak.
+
+One structural consequence for us: tagged-PDF classification moved **out of
+`fulgur-blitz` into `fulgur-core`** (`fulgur-core/src/tagging.rs`, new) so both
+backends share it. `PdfTag`, `SemanticEntry` and `classify_element` now live there,
+re-exported from `fulgur-blitz::tagging` via a glob, so source compatibility holds —
+but a fork patch against those definitions must now target `fulgur-core`.
+
+#### Dependency PRs that would undercut our measurements
+
+Open and unmerged as of 2026-10-21, both of which land directly under fixes of ours:
+
+- **#747 parley 0.6 → 0.11.1.** Repro 10's fix exists *because* parley 0.6 has no
+  strut and no `vertical-align` (`extract_strut_style` / `resolve_strut` /
+  `align_inline_boxes`). Five minor versions could make it redundant, wrong, or both.
+- **#748 taffy 0.9.2 → 0.14.0.** Repro 12's whole premise is that Taffy resolves
+  absolute insets against the immediate parent.
+
+Re-measure both repros against the real references before merging either bump.
 
 Paged.js is not a design reference for pagination features: 0.4.3's only table-aware code
 propagates `break-inside: avoid` from `<tbody>`/`<thead>`, and it has no repeat concept at
@@ -246,8 +328,25 @@ repeat theads. WeasyPrint's `layout/table.py` is the reference worth reading.
 `cargo test -p fulgur --lib` was **2014 passed / 0 failed** at fork point (`682bcbf3`).
 The "~340 unit tests" figure in Common Commands above is long stale. `cargo test -p fulgur`
 adds ~30 integration binaries — 2468 passing at the fork point, 2585 as of repros
-10-12, and **2618 / 0 failed / 7 ignored** after adopting upstream's repeating-header
+10-12, and 2618 / 0 failed / 7 ignored after adopting upstream's repeating-header
 stack (its probe suites come with it).
+
+Since the `fulgur` → `fulgur-core` + `fulgur-blitz` split, count all three together;
+`-p fulgur` alone now measures only the facade's integration tests and badly
+understates the suite:
+
+| revision | `-p fulgur -p fulgur-blitz -p fulgur-core` | `-p fulgur-cli` |
+|---|---|---|
+| after the GCPM work (2026-09-11) | 2753 / 0 / 10 | 57 / 0 |
+| **after the 2026-10-21 upstream sync** | **3003 / 0 / 10** (67 binaries) | **59 / 0** |
+
+**`examples_determinism` does not validate the committed example PDFs.** Its 10 tests
+render each example *twice* and compare the two runs to each other, so they prove
+determinism and nothing more — a committed `examples/**/index.pdf` that no longer
+matches the code passes this suite happily. After a sync, regenerate the examples in
+the pinned container and `git status` them; that diff is the only thing that tells you
+which committed PDFs your code still reproduces. (Measured 2026-10-21: 15 of 20 upstream
+regenerations reproduced byte-exactly under our code, 5 did not.)
 
 **`fulgur-vrt` needs `ubuntu:24.04` with `fonts-dejavu-core` 2.37-8** — that is the only
 environment its byte-exact goldens reproduce in. Measured:
