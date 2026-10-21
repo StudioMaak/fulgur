@@ -1894,9 +1894,7 @@ fn count_red_fill_ops(pdf: &[u8]) -> usize {
     let doc = lopdf::Document::load_mem(pdf).expect("PDF must parse");
     let mut count = 0;
     for (_, page_id) in doc.get_pages() {
-        let bytes = doc
-            .get_page_content(page_id)
-            .expect("page content stream readable");
+        let bytes = doc.get_page_content(page_id);
         count += count_red_in_content(&bytes);
     }
     for obj in doc.objects.values() {
@@ -3097,9 +3095,7 @@ fn multicol_inline_root_split_skips_slices_outside_current_page() {
     // `needs_partition = false`) on Linux 2026-05-03: the sweep fails
     // with "page 2: Tm at y=126.1, outside [-25, 125]".
     for (&page_num, &page_id) in &pages {
-        let bytes = doc
-            .get_page_content(page_id)
-            .expect("page content stream readable");
+        let bytes = doc.get_page_content(page_id);
         let content =
             lopdf::content::Content::decode(&bytes).expect("page content stream decodable");
         for op in &content.operations {
@@ -3219,6 +3215,46 @@ fn pdf_ua_without_title_returns_error() {
 }
 
 #[test]
+fn pdf_ua_without_language_returns_error() {
+    // PDF/UA-1 requires a document language. Neither config.lang nor
+    // <html lang> is provided, and Krilla does not validate this, so the
+    // engine rejects the render itself.
+    let error = Engine::builder()
+        .pdf_ua(true)
+        .title("T")
+        .build()
+        .render("<html><body><p>World</p></body></html>")
+        .unwrap_err();
+    assert!(error.to_string().contains("document language"), "{error}");
+}
+
+#[test]
+fn pdf_ua_treats_a_blank_language_as_unset() {
+    let engine = Engine::builder().pdf_ua(true).title("T").lang(" ").build();
+    let error = engine
+        .render("<html><body><p>World</p></body></html>")
+        .unwrap_err();
+    assert!(error.to_string().contains("document language"), "{error}");
+    let pdf = engine
+        .render("<html lang=\"de\"><body><h1>Heading</h1><p>World</p></body></html>")
+        .expect("<html lang> must replace a blank configured language");
+    assert!(String::from_utf8_lossy(&pdf).contains("/Lang (de)"));
+}
+
+#[test]
+fn pdf_ua_takes_the_language_from_html_lang() {
+    let pdf = Engine::builder()
+        .pdf_ua(true)
+        .title("T")
+        .build()
+        // ASCII text: CJK glyphs would need a font that not every CI host
+        // has, and a missing glyph fails PDF/UA validation on its own.
+        .render("<html lang=\"ja\"><body><h1>Heading</h1><p>Body</p></body></html>")
+        .expect("pdf_ua with <html lang> must succeed");
+    assert!(String::from_utf8_lossy(&pdf).contains("/Lang (ja)"));
+}
+
+#[test]
 fn pdf_ua_with_html_title_succeeds() {
     // PDF/UA-1 smoke: <title> in HTML head provides the document title,
     // satisfying krilla's UA1 requirement without explicit config.title.
@@ -3272,27 +3308,6 @@ fn pdf_ua_with_explicit_title_succeeds() {
         .build()
         .render(html)
         .expect("pdf_ua with explicit title must succeed");
-
-    assert!(!pdf.is_empty());
-}
-
-#[test]
-fn pdf_ua_without_lang_succeeds() {
-    // PDF/UA-1 strongly recommends lang but does NOT hard-fail
-    // when absent (krilla UA1 prohibits(NoDocumentLanguage) = false).
-    // Without lang, /Lang is absent from the catalog — semantically
-    // incomplete but valid per krilla's enforcement.
-    let html = r#"<!DOCTYPE html>
-<html>
-<head><title>No Lang</title></head>
-<body><h1>Hello</h1><p>World</p></body>
-</html>"#;
-
-    let pdf = Engine::builder()
-        .pdf_ua(true)
-        .build()
-        .render(html)
-        .expect("pdf_ua without lang must succeed");
 
     assert!(!pdf.is_empty());
 }

@@ -22,18 +22,23 @@ cssparser = "0.37"
 krilla = "0.7.0"
 krilla-svg = "0.7.0"
 usvg = "0.45"
+# Same version usvg 0.45 decodes image hrefs with; the SVG sanitizer in
+# `svg.rs` must classify `data:` URLs exactly the way usvg does.
+data-url = "0.3"
+# Bounded SVGZ decompression in the SVG sanitizer (usvg's is unbounded).
+flate2 = "1.1.9"
 blitz-html = "0.2"
 blitz-dom = "0.2"
 blitz-traits = "0.2"
 taffy = "0.9"
 parley = "0.6"
-skrifa = "0.45"
+skrifa = "0.47"
 stylo = "0.8.0"
 thiserror = "2"
 minijinja = { version = "=2.24.0", features = ["unstable_machinery"] }
 serde_json = "1"
 log = "0.4"
-lopdf = "0.42.0"
+lopdf = "0.45"
 unicode-segmentation = "1.13"
 unicode-properties = "0.1"
 # Force-enable `image`'s `png` feature so PNG decoding (used by blitz-dom for
