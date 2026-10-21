@@ -5412,6 +5412,34 @@ mod tests {
     }
 
     #[test]
+    fn build_static_content_css_serializes_selectors_and_escapes() {
+        let mappings = vec![
+            StaticContentMapping {
+                parsed: ParsedSelector::Tag("DIV".into()),
+                pseudo: PseudoElement::Before,
+                text: "[x]".into(),
+            },
+            StaticContentMapping {
+                parsed: ParsedSelector::Class("note".into()),
+                pseudo: PseudoElement::After,
+                // A `"` and a `\` must be CSS-escaped so the injected rule
+                // is well-formed and cannot break out of the string.
+                text: "a\"b\\c".into(),
+            },
+            StaticContentMapping {
+                parsed: ParsedSelector::Id("foo".into()),
+                pseudo: PseudoElement::Before,
+                text: "y".into(),
+            },
+        ];
+        let css = build_static_content_css(&mappings);
+        assert_eq!(
+            css,
+            r#"div::before{content:"[x]"}.note::after{content:"a\"b\\c"}#foo::before{content:"y"}"#
+        );
+    }
+
+    #[test]
     fn build_static_content_css_empty_for_no_mappings() {
         assert!(build_static_content_css(&[]).is_empty());
     }
