@@ -414,6 +414,11 @@ therefore history — the runner image's default font should no longer reach the
 output. Unverified whether `debian:bookworm` now reproduces too; keep using the
 `ubuntu:24.04` recipe until someone measures it. `FONTCONFIG_FILE` must be absolute.
 
+**The Noto pin does not make VRT pass on macOS.** Measured 2026-11-11 at `2c4565cb`
+with an absolute `FONTCONFIG_FILE`: **30 of 65 fixtures differ**. That is the same
+no-op as above. macOS does not resolve fonts through fontconfig, so the pin never
+reaches it. Container-only still stands.
+
 To run VRT (~2 min, mostly the build):
 
 ```bash
