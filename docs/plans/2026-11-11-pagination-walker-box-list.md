@@ -64,6 +64,7 @@ Each step lands on its own and keeps the suite green. Each one also reports its 
    - Expected wins: bugs 1-3 and the flex/grid overlap cases.
    - Folds in the held-back fix on local branch `wip/first-child-occupied`: a container's first child never moves to the next page, so a table's first row in the last few px of a page is drawn past the bottom. In this model "something is already on this page" is just `prev_end > page top`. Add the reviewer's repros as matrix cases before touching it. The branch's naive flag pushed a short stretched flex/grid cell a page on (81pt gap), and gave a blank first page when only padding is above a container. Its four rewritten `*_cosplit_*` tests lost their fulgur-ysms guard; don't reuse them.
    - Gate: matrix promotes those cases to `Pass`, suite green, and every moved fixture explained.
+   - **Done 2026-11-12** on `paperworx/walker-place-by-prev`; see *Step 2 as built* below.
 3. **Body-level margin after a zero-height break (bug 4).** Small once step 1 exposes `margin_top` and `gap_before` on the box that actually follows the break.
 4. **Optional: one walker.** Merge body and nested into one function parameterised by `capacity(page)`. This removes the gate drift the map found:
    - multicol with `column-span:all` recurses only at body level;
@@ -126,3 +127,50 @@ Remaining known bugs in the matrix:
 - body-level `margin-bottom` (bug 4), 6 rows;
 - `margin-top` dropped, 10 rows;
 - float layout, 6 rows.
+
+## Step 2 as built (2026-11-12)
+
+Branch `paperworx/walker-place-by-prev`, on top of the phase A matrix rows.
+
+**Placement.** `page_taffy_origin`, `origin_pending_target_y` and `origin_pending_same_row` are gone. The nested walker keeps one `PrevBox { bottom, end, split }` and places a box at `prev.end + (top - prev.bottom)`. A `display: none` child is never the previous box. Rows come from the `flow_rows` pre-pass, and `RowState` snapshots and restores the `PrevBox`. `running_store` is untouched and stays the source of truth for running elements.
+
+**First child.** The held-back first-child fix landed as a spec rule rather than a flag. css-break-3 §3.1 has no break point between a container's top and its first child, so the walker that has a box above the container decides: `leading_unbreakable_extent` measures how far down the container's first unbreakable content reaches, and if that does not fit, the container moves whole, padding included. Deeper levels never guess. What counts as unbreakable:
+
+- a paragraph's first `orphans` lines (the whole paragraph when it is too short to split);
+- the cells of the topmost row, picked by geometry and not by DOM order;
+- a replaced element;
+- nothing, for an empty box with a height.
+
+**Deliberate differences from before**, each matching the body walker or a reference:
+
+- A sibling after a box that crossed a page keeps its gap to it.
+- The row after a co-split flex/grid row keeps the row gap.
+- A multi-line paragraph's `break-after` preserves the next box's margin.
+
+**Gates.**
+
+- Suite: 3060 / 0 / 10. CLI: 59 / 0.
+- Matrix: `table-body`, `table-section`, `block-body` and `block-section` promoted to Pass. The flex/grid and padding guards stay Pass. Fourteen new shapes measured on Prince 17 and Chrome 157: ten Pass, four KnownBug.
+- Fixtures: 2 of 98 CLI renders moved (65 VRT fixtures, 21 examples, 12 repros), both to where Prince puts them. VRT in `ubuntu:24.04` named exactly the one golden.
+  - `gcpm/string-set`: "Filler 7" was drawn at 782.2pt, below the content box (781.9pt). It now opens page 2 at 81.8pt; Prince has 81.7pt.
+  - `examples/transform`: section 5's row was drawn past the page bottom with its labels missing. It is now on page 2 with its labels, as in Prince.
+- Review: two independent adversarial reviews, one reading the diff and one rendering 304 shapes against the references. Against the baseline, no shape lost words, 24 show words the baseline dropped, and none has more text near the page bottom.
+
+**Known bugs the matrix now records.**
+
+- **Unsplit leaf** (`pad-leaf-*`, `pad-body-padding.second`, `lead-empty-*`): a box with a height whose content fits is sliced in place by both references. Here it overflows or moves whole.
+- **Negative margin after a split box** (`neg-split-*`): Chrome puts the sibling back on the page the split box started on. Here it stays where the split box ended.
+- **Row end** (`flex-body.after`, `grid-body.after`): a split cell's last `margin-bottom` is dropped.
+
+**Left for later steps**, from the review:
+
+- "A box is above this one on this page" is still a hand-maintained `box_placed_on`. It should be derived from a `PrevBox` that carries its page, which is also what the negative-margin case needs.
+- The move-whole decision is written once per walker, with different capacity and multicol rules. Step 4 should merge them.
+- `at_page_top` and `margin_after_forced_break` are one state held as two flags. Folding them into `PrevBox` belongs with step 3, since it changes the body-level margin.
+
+**Found on the way, not pagination.**
+
+- Blitz ignores the `width` / `height` attributes of an inline `<svg style="display:block">`: it is laid out about 300px tall. CSS sizing works.
+- A `column-reverse` flex whose items are block containers is walked in DOM order and drawn past the page bottom, before and after this step.
+- A container holding a running element or a `string-set` heading near the bottom of a page leaves the next page empty and puts its content one page later. Prince does not.
+- Headings do not keep with the next block (`break-after: avoid`), which is the rest of the difference to Prince in `examples/transform`.
