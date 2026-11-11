@@ -18,20 +18,20 @@ impl ReplacedResolver for RedPixels {
         &self,
         _request: ResolverRequest<'_>,
     ) -> std::result::Result<ResolvedIntrinsic, ResolverError> {
-        Ok(ResolvedIntrinsic {
-            intrinsic: IntrinsicBox::new(4.0, 2.0),
-            disposition: ResolveDisposition::Ok,
-        })
+        Ok(ResolvedIntrinsic::new(
+            IntrinsicBox::new(4.0, 2.0),
+            ResolveDisposition::Ok,
+        ))
     }
 }
 
 #[test]
 fn legacy_pages_keep_raster_pixels_and_own_opacity_and_allow_no_source() {
-    let pixels = RedPixels(Arc::new(DecodedImage {
-        width: 4,
-        height: 2,
-        rgba: [255, 0, 0, 255].repeat(8),
-    }));
+    let pixels = RedPixels(Arc::new(DecodedImage::new(
+        4,
+        2,
+        [255, 0, 0, 255].repeat(8),
+    )));
     let resources = RenderResources::new()
         .replaced_resolver(&pixels)
         .image_pixel_source(&pixels);
@@ -52,9 +52,9 @@ fn legacy_pages_keep_raster_pixels_and_own_opacity_and_allow_no_source() {
     for with_source in [false, true] {
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(
             with_source
                 .then(|| resources.image_pixel_source_ref())
@@ -131,11 +131,11 @@ fn legacy_pages_keep_raster_pixels_and_own_opacity_and_allow_no_source() {
 
 #[test]
 fn ordered_marker_events_can_be_rendered_without_a_pixel_provider() {
-    let pixels = RedPixels(Arc::new(DecodedImage {
-        width: 4,
-        height: 2,
-        rgba: [255, 0, 0, 255].repeat(8),
-    }));
+    let pixels = RedPixels(Arc::new(DecodedImage::new(
+        4,
+        2,
+        [255, 0, 0, 255].repeat(8),
+    )));
     let resources = RenderResources::new().image_pixel_source(&pixels);
     let document = raikiri_html::parse_html_with_resources(
         &b"<style>@page{size:100px 100px;margin:0}body{margin:0}ul{margin:0;padding:0}li{margin-left:20px;opacity:.5;list-style-image:url(https://images.test/marker.png)}</style><ul><li></li></ul>"[..],
@@ -162,9 +162,9 @@ fn ordered_marker_events_can_be_rendered_without_a_pixel_provider() {
     for with_source in [false, true] {
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(
             with_source
                 .then(|| resources.image_pixel_source_ref())
@@ -224,11 +224,11 @@ impl ImagePixelSource for SizedPixels {
     }
 
     fn intrinsic_size(&self, _url: &url::Url) -> Option<raikiri_traits::ImageIntrinsicSize> {
-        Some(raikiri_traits::ImageIntrinsicSize {
-            width: Some(4.0),
-            height: Some(2.0),
-            aspect_ratio: Some(2.0),
-        })
+        Some(raikiri_traits::ImageIntrinsicSize::new(
+            Some(4.0),
+            Some(2.0),
+            Some(2.0),
+        ))
     }
 }
 
@@ -254,9 +254,9 @@ fn background_url_skips_missing_sources_and_unusable_pixels() {
         let page = layout.page(0).unwrap();
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(
             with_source
                 .then(|| resources.image_pixel_source_ref())
@@ -291,19 +291,11 @@ fn background_url_skips_missing_sources_and_unusable_pixels() {
             })
             .count()
     };
-    let red = DecodedImage {
-        width: 4,
-        height: 2,
-        rgba: [255, 0, 0, 255].repeat(8),
-    };
+    let red = DecodedImage::new(4, 2, [255, 0, 0, 255].repeat(8));
     assert_eq!(images(Some(red.clone()), true), 1);
     assert_eq!(images(Some(red), false), 0);
     assert_eq!(images(None, true), 0);
-    let truncated = DecodedImage {
-        width: 4,
-        height: 2,
-        rgba: vec![0; 4],
-    };
+    let truncated = DecodedImage::new(4, 2, vec![0; 4]);
     assert_eq!(images(Some(truncated), true), 0);
 }
 
@@ -351,11 +343,11 @@ fn generated_image_layout(pixels: &RedPixels, css: &str) -> raikiri_html::Docume
 }
 
 fn red_8x4() -> RedPixels {
-    RedPixels(Arc::new(DecodedImage {
-        width: 8,
-        height: 4,
-        rgba: [255, 0, 0, 255].repeat(32),
-    }))
+    RedPixels(Arc::new(DecodedImage::new(
+        8,
+        4,
+        [255, 0, 0, 255].repeat(32),
+    )))
 }
 
 #[test]
@@ -379,9 +371,9 @@ fn ordered_generated_image_events_draw_the_content_image() {
     for with_source in [false, true] {
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(
             with_source
                 .then(|| source.image_pixel_source_ref())
@@ -435,9 +427,9 @@ fn legacy_pages_draw_generated_images_with_their_owner_opacity() {
     let source = RenderResources::new().image_pixel_source(&pixels);
     let mut pdf = krilla::Document::new();
     let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = pdf_page.surface();
+    let mut surface = Surface::new(pdf_page.surface());
     let mut fonts = FontCache::default();
-    let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+    let mut svg = svg::SvgCache::default();
     let mut raster = raster::RasterCache::for_tests(source.image_pixel_source_ref());
     paint_legacy(
         &mut surface,
@@ -479,9 +471,9 @@ fn legacy_pages_draw_generated_images_inside_their_transforms() {
         let source = RenderResources::new().image_pixel_source(&pixels);
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(source.image_pixel_source_ref());
         let runs = page.text_runs();
         paint_legacy(
@@ -520,7 +512,7 @@ fn legacy_pages_draw_generated_images_inside_their_transforms() {
     let page = layout.page(0).unwrap();
     let mut pdf = krilla::Document::new();
     let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = pdf_page.surface();
+    let mut surface = Surface::new(pdf_page.surface());
     let runs = page.text_runs();
     paint_legacy(
         &mut surface,
@@ -528,7 +520,7 @@ fn legacy_pages_draw_generated_images_inside_their_transforms() {
         &page.paint_order_for_text_runs(&runs),
         &runs,
         &mut FontCache::default(),
-        &mut svg::SvgCache::new(crate::RenderOptions::default()),
+        &mut svg::SvgCache::default(),
         &mut raster::RasterCache::for_tests(None),
         &mut crate::tagging::Tags::disabled(),
         None,
@@ -551,5 +543,110 @@ fn legacy_pages_draw_generated_images_inside_their_transforms() {
             plain[4] + 10.0,
             plain[5] - 6.0
         ]
+    );
+}
+
+/// A source that has the picture only as a scene, and one that Krilla cannot
+/// draw faithfully: its glyph is stretched and stroked.
+struct SceneOnly;
+
+impl ImagePixelSource for SceneOnly {
+    fn get_decoded(&self, _url: &url::Url) -> Option<Arc<DecodedImage>> {
+        None
+    }
+
+    fn intrinsic_size(&self, _url: &url::Url) -> Option<raikiri_traits::ImageIntrinsicSize> {
+        Some(raikiri_traits::ImageIntrinsicSize::new(
+            Some(20.0),
+            Some(20.0),
+            Some(1.0),
+        ))
+    }
+
+    fn get_vector(
+        &self,
+        _url: &url::Url,
+        _request: &raikiri_traits::ImageVectorRequest,
+    ) -> Option<Arc<raikiri_traits::vector::VectorImage>> {
+        use raikiri_traits::vector::{FontFace, Glyph, Node, Paint, Stroke, TextRun, VectorImage};
+        use raikiri_traits::{PaintColor, PaintTransform};
+        let data: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(vec![0u8; 16]);
+        let glyph = Glyph::new(
+            FontFace::new(data, 0),
+            1,
+            "a",
+            PaintTransform::new(2.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+        );
+        let mut run = TextRun::new(10.0, vec![glyph]);
+        run.stroke = Some(Stroke::new(
+            Paint::Color(PaintColor::new(0.0, 0.0, 0.0, 1.0)),
+            1.0,
+        ));
+        let mut scene = VectorImage::new((20.0, 20.0));
+        scene.root.children.push(Node::Text(run));
+        Some(Arc::new(scene))
+    }
+}
+
+impl ReplacedResolver for SceneOnly {
+    fn resolve(
+        &self,
+        _request: ResolverRequest<'_>,
+    ) -> std::result::Result<ResolvedIntrinsic, ResolverError> {
+        Ok(ResolvedIntrinsic::new(
+            IntrinsicBox::new(20.0, 20.0),
+            ResolveDisposition::Ok,
+        ))
+    }
+}
+
+#[test]
+fn an_img_whose_scene_cannot_be_drawn_and_has_no_pixels_draws_nothing() {
+    let source = SceneOnly;
+    let resources = RenderResources::new()
+        .replaced_resolver(&source)
+        .image_pixel_source(&source);
+    let document = raikiri_html::parse_html_with_resources(
+        &b"<style>@page{size:100px 100px;margin:0}body{margin:0}img{display:block;width:20px;height:20px}</style><img src='https://images.test/scene.svg'>"[..],
+        &resources,
+    )
+    .unwrap();
+    let LayoutStatus::Completed(layout) = raikiri_html::layout(
+        &document,
+        PageDefaults::default(),
+        LayoutConfig::default(),
+        LayoutOptions::new().resources(&resources),
+    )
+    .unwrap() else {
+        panic!("completed layout")
+    };
+    let page = layout.page(0).unwrap();
+    let mut pdf = krilla::Document::new();
+    let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
+    let mut surface = Surface::new(pdf_page.surface());
+    let mut fonts = FontCache::default();
+    let mut svg = svg::SvgCache::default();
+    let mut raster = raster::RasterCache::for_tests(resources.image_pixel_source_ref());
+    paint_legacy(
+        &mut surface,
+        &page,
+        &page.paint_order(),
+        &page.text_runs(),
+        &mut fonts,
+        &mut svg,
+        &mut raster,
+        &mut crate::tagging::Tags::disabled(),
+        None,
+    )
+    .unwrap();
+    surface.finish();
+    pdf_page.finish();
+    let (images, operations) = images_and_draws(&pdf.finish().unwrap());
+    assert!(images.is_empty());
+    assert!(
+        operations.iter().all(|operation| !matches!(
+            operation.operator.as_str(),
+            "Do" | "Tj" | "TJ" | "S" | "f"
+        ))
     );
 }

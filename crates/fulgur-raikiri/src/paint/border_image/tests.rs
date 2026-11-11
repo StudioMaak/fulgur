@@ -15,11 +15,11 @@ impl ImagePixelSource for RedPixels {
 }
 
 fn red() -> RedPixels {
-    RedPixels(Arc::new(DecodedImage {
-        width: 9,
-        height: 9,
-        rgba: [255, 0, 0, 255].repeat(81),
-    }))
+    RedPixels(Arc::new(DecodedImage::new(
+        9,
+        9,
+        [255, 0, 0, 255].repeat(81),
+    )))
 }
 
 /// The computed style of the `<div>` in a document styled by `css`.
@@ -57,7 +57,7 @@ fn paint_pdf(
 ) -> (bool, lopdf::Document) {
     let mut pdf = krilla::Document::new();
     let mut page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = page.surface();
+    let mut surface = Surface::new(page.surface());
     let mut raster = raster::RasterCache::for_tests(source);
     let drawn = paint(
         &mut surface,
@@ -160,11 +160,11 @@ impl ImagePixelSource for Undecodable {
         None
     }
     fn intrinsic_size(&self, _url: &url::Url) -> Option<raikiri_traits::ImageIntrinsicSize> {
-        Some(raikiri_traits::ImageIntrinsicSize {
-            width: Some(9.0),
-            height: Some(9.0),
-            aspect_ratio: None,
-        })
+        Some(raikiri_traits::ImageIntrinsicSize::new(
+            Some(9.0),
+            Some(9.0),
+            None,
+        ))
     }
 }
 
@@ -216,11 +216,4 @@ fn spaced_gradient_tiles_fill_a_pattern_with_gaps() {
     let (drawn, parsed) = paint_pdf(&style, None, Slice::default());
     assert!(drawn);
     assert!(count(&parsed, b"Pattern") > 0);
-}
-
-#[test]
-fn uniform_steps_need_evenly_spaced_edges() {
-    assert_eq!(uniform_step(&[5.0]), Some(0.0));
-    assert_eq!(uniform_step(&[0.0, 2.0, 4.0]), Some(2.0));
-    assert_eq!(uniform_step(&[0.0, 2.0, 5.0]), None);
 }

@@ -246,7 +246,6 @@ fn bookmark_collection_is_discarded_on_abort_or_observer_error() {
                     &Config::builder().bookmarks(true).build(),
                     collector,
                     &url::Url::parse("file:///input.html").unwrap(),
-                    &RenderOptions::default(),
                 )
             });
         assert!(matches!(result, Err(Error::Layout(_))));
@@ -267,14 +266,7 @@ fn bookmark_with_layout_discards_already_aborted_result() {
             .signal(Some(controller.signal.clone()))
             .build(),
         |status, resources, collector, document_url| {
-            draw(
-                status,
-                resources,
-                &config,
-                collector,
-                document_url,
-                &RenderOptions::default(),
-            )
+            draw(status, resources, &config, collector, document_url)
         },
     );
     assert!(matches!(result, Err(Error::Layout(_))));
@@ -293,6 +285,7 @@ fn bookmark_bundle_defaults_yield_to_author_style() {
         &RenderOptions {
             assets: Some(&bundle),
             system_fonts: true,
+            ..Default::default()
         },
     )
     .unwrap();
@@ -310,6 +303,20 @@ fn bookmark_bundle_defaults_yield_to_author_style() {
 fn bookmark_follows_a_transformed_heading() {
     let (_dir, path) = input(&format!(
         "{BOOK_CSS}<h1 style='transform:translate(10px,20px)'>A</h1>"
+    ));
+    let bytes = render(&path, &Config::builder().bookmarks(true).build()).unwrap();
+    let pdf = lopdf::Document::load_mem(&bytes).unwrap();
+    let items = outline_children(&pdf, outline_root(&pdf));
+    let dest = outline_destination(&pdf, items[0]);
+    assert_eq!(dest[2].as_float().unwrap(), 7.5);
+    assert_eq!(dest[3].as_float().unwrap(), 135.0);
+}
+
+// A transform on the root element moves the headings with the rest of the page.
+#[test]
+fn bookmark_follows_the_root_transform() {
+    let (_dir, path) = input(&format!(
+        "{BOOK_CSS}<style>html {{transform:translate(10px,20px)}}</style><h1>A</h1>"
     ));
     let bytes = render(&path, &Config::builder().bookmarks(true).build()).unwrap();
     let pdf = lopdf::Document::load_mem(&bytes).unwrap();

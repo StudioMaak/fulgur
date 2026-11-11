@@ -6,6 +6,7 @@
 
 use fulgur_core::units::F32Units;
 use fulgur_core::{AssetBundle, Config, Error, Result};
+pub use raikiri_html::SvgRendering;
 use raikiri_html::{
     LayoutConfig, LayoutOptions, LayoutStatus, PageDefaults, RenderResources, layout,
     parse_html_with_resources,
@@ -26,6 +27,12 @@ pub struct RenderOptions<'a> {
     pub assets: Option<&'a AssetBundle>,
     /// Whether host-dependent system font fallback is enabled.
     pub system_fonts: bool,
+    /// How an SVG picture is drawn when its element declares no
+    /// `--raikiri-svg-rendering`. Vector, unless set.
+    pub svg_rendering: SvgRendering,
+    /// Device pixels per CSS pixel of an SVG drawn as pixels. One, unless set;
+    /// a value that is not finite and greater than zero is ignored.
+    pub svg_raster_scale: f32,
 }
 
 impl Default for RenderOptions<'_> {
@@ -33,6 +40,8 @@ impl Default for RenderOptions<'_> {
         Self {
             assets: None,
             system_fonts: true,
+            svg_rendering: SvgRendering::default(),
+            svg_raster_scale: 1.0,
         }
     }
 }
@@ -104,7 +113,7 @@ fn render_source(
         options,
         LayoutConfig::default(),
         |status, resources, collector, document_url| {
-            draw(status, resources, config, collector, document_url, options)
+            draw(status, resources, config, collector, document_url)
         },
     )
 }
@@ -157,7 +166,6 @@ fn draw(
     config: &Config,
     collector: bookmarks::BookmarkCollector,
     document_url: &url::Url,
-    options: &RenderOptions<'_>,
 ) -> Result<Vec<u8>> {
     // `LayoutStatus` is non-exhaustive; anything but a completed layout,
     // including an abort, leaves no pages to draw.
@@ -174,7 +182,7 @@ fn draw(
     };
     let outline = want_bookmarks.then_some(bookmarks.outline);
     let (pdf, rotations) =
-        paint::paint_document(&document, resources, config, outline, document_url, options)?;
+        paint::paint_document(&document, resources, config, outline, document_url)?;
     rotations.apply(bookmarks::apply_open_state(pdf, &bookmarks.open)?)
 }
 
@@ -211,7 +219,10 @@ fn with_layout<T>(
             Vec::new()
         };
         let mut collector = bookmarks::BookmarkCollector::default();
-        let mut layout_options = LayoutOptions::new().resources(resources);
+        let mut layout_options = LayoutOptions::new()
+            .resources(resources)
+            .svg_rendering(options.svg_rendering)
+            .svg_raster_scale(options.svg_raster_scale);
         if config.effective_bookmarks() {
             layout_options = layout_options.consumer_properties(&registrations, &mut collector);
         }
@@ -242,9 +253,18 @@ fn with_resources<T>(
     let mut resources = RenderResources::new()
         .replaced_resolver(&resolver)
         .image_pixel_source(&images)
+        .stylesheet(DEFAULT_FONT_STYLESHEET)
         .stylesheet(page_stylesheet(config))
         .network_provider(&network)
-        .base_url(document_url.clone());
+        .base_url(document_url.clone())
+        // Browsers snap a used border width to whole CSS pixels (CSS Values 4,
+        // "snap a length as a border width"): `1pt` is `1px`, and `thin` is
+        // `1px`. Without a scale Raikiri keeps the fractional width, which makes
+        // every bordered box slightly taller than in Chromium and moves page
+        // breaks. The scale is 1.0 because Chromium's print layout uses one
+        // device pixel per CSS pixel; layout, painting and streaming all build
+        // their resources here, so they agree on the snapped widths.
+        .border_width_device_scale(Some(1.0));
     if config.effective_bookmarks() {
         resources = resources.stylesheet(bookmarks::heading_stylesheet());
     }
@@ -258,6 +278,22 @@ fn with_resources<T>(
     }
     consume(&resources, &document_url)
 }
+
+/// Fulgur's default typeface, the generic `sans-serif` family, as a
+/// user-origin rule on the root element.
+///
+/// The initial `font-family` is up to the user agent (CSS Fonts 4 §2.1).
+/// Raikiri starts from `serif` like browsers do, while the Blitz backend
+/// starts from `sans-serif`; this keeps text the document does not style
+/// in the same family with either engine. Set on the root, it also reaches
+/// the page context and its margin boxes, which inherit from the root
+/// element (CSS Paged Media 3 §6). Every author declaration beats it, and
+/// user-agent rules on descendants such as `pre` still apply to them.
+///
+/// Bundled stylesheets share the user origin, so the rule sits in the first
+/// anonymous layer with zero specificity: any bundled rule for the root,
+/// unlayered or in a later layer, still wins (CSS Cascade 5 §6.4).
+const DEFAULT_FONT_STYLESHEET: &str = "@layer { :where(html) { font-family: sans-serif } }";
 
 /// The configured page size as the page box Raikiri uses wherever CSS leaves
 /// the size to the user agent.
