@@ -894,17 +894,21 @@ impl<'a> PaginationLayoutTree<'a> {
                     })
                 });
             let avoid_fits_whole_page = avoid_inside && child_h <= self.page_height_px + 1.0;
+            // These two walk the whole subtree and do not depend on where
+            // the child sits, so they are asked once.
+            let may_recurse = has_splittable_children && (!is_multicol || multicol_has_span_all);
+            let breaks_below = may_recurse
+                && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
+                    || has_page_name_change_below(
+                        self.doc,
+                        child_id,
+                        self.used_page_names.as_ref(),
+                        0,
+                    ));
             let needs_recursion_at = |page_index: u32, cursor_y: f32| {
                 let available_strip = (capacity(page_index) - cursor_y).max(0.0);
-                has_splittable_children
-                    && (!is_multicol || multicol_has_span_all)
-                    && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
-                        || has_page_name_change_below(
-                            self.doc,
-                            child_id,
-                            self.used_page_names.as_ref(),
-                            0,
-                        )
+                may_recurse
+                    && (breaks_below
                         || (!avoid_fits_whole_page
                             && would_split_block_subtree(
                                 self.doc,
@@ -924,9 +928,12 @@ impl<'a> PaginationLayoutTree<'a> {
             // A multicol container only gets here with a `column-span: all`
             // child, and then it is fragmented around its spanners, which
             // `leading_unbreakable_extent` does not model: left as it was.
+            // The extent never exceeds the child's height, so a child that
+            // fits whole needs no measuring.
             if needs_recursion
                 && !is_multicol
                 && box_placed_on == Some(page_index)
+                && cursor_y + child_h > capacity(page_index)
                 && cursor_y + leading_unbreakable_extent(self.doc, self.column_styles, child_id, 0)
                     > capacity(page_index)
             {
@@ -1507,6 +1514,15 @@ fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
         .collect()
 }
 
+/// Two flex / grid items are in the same row when one starts more than
+/// this far above the other's bottom edge, in CSS px.
+const ROW_TOLERANCE_PX: f32 = 0.5;
+
+/// fulgur-2m6w: a non-finite Taffy height (`+inf` / `NaN`) counts as zero.
+fn finite_or_zero(height: f32) -> f32 {
+    if height.is_finite() { height } else { 0.0 }
+}
+
 /// CSS 3 Fragmentation default for `orphans`.
 const ORPHANS_MIN: usize = 2;
 /// CSS 3 Fragmentation default for `widows`.
@@ -1545,11 +1561,7 @@ fn leading_unbreakable_extent(
         return 0.0;
     };
     let layout = node.final_layout;
-    let height = if layout.size.height.is_finite() {
-        layout.size.height.max(0.0)
-    } else {
-        0.0
-    };
+    let height = finite_or_zero(layout.size.height).max(0.0);
     if depth >= crate::MAX_DOM_DEPTH {
         return height;
     }
@@ -1584,10 +1596,8 @@ fn leading_unbreakable_extent(
     }
     // The first row is picked by geometry, not DOM order: `column-reverse`
     // and explicitly placed grid items put a later child at the top.
-    let boxes: Vec<FlowItem> = flow_items(doc, node_id)
-        .into_iter()
-        .filter(|item| item.kind == FlowKind::Box && item.height.is_finite() && item.height > 0.0)
-        .collect();
+    let mut boxes = flow_items(doc, node_id);
+    boxes.retain(|item| item.kind == FlowKind::Box && item.height.is_finite() && item.height > 0.0);
     let Some(first) = boxes.iter().min_by(|a, b| a.top.total_cmp(&b.top)) else {
         // Nothing in flow with a height. A replaced element or a bare text
         // run is whole; an empty box with a height has nothing unbreakable.
@@ -1597,7 +1607,7 @@ fn leading_unbreakable_extent(
             0.0
         };
     };
-    let first_row_bottom = first.top + first.height - 0.5;
+    let first_row_bottom = first.top + first.height - ROW_TOLERANCE_PX;
     boxes
         .iter()
         .filter(|item| item.top < first_row_bottom)
@@ -2014,8 +2024,15 @@ struct RowState {
 }
 
 impl RowState {
-    /// Records where a cell's box ended, once the cell is placed.
-    fn note_box_end(&mut self, page_index: u32, prev: PrevBox) {
+    /// Records where a cell ended, once it is placed: `cursor_y` is the
+    /// lowest point its content reached, `prev` its box.
+    fn note_end(&mut self, page_index: u32, cursor_y: f32, prev: PrevBox) {
+        if page_index > self.max_end_page
+            || (page_index == self.max_end_page && cursor_y > self.max_end_cursor_y)
+        {
+            self.max_end_page = page_index;
+            self.max_end_cursor_y = cursor_y;
+        }
         if page_index > self.box_end_page
             || (page_index == self.box_end_page && prev.end > self.box_end)
         {
@@ -2071,13 +2088,9 @@ fn flow_rows(items: &[FlowItem]) -> Vec<Option<usize>> {
             if item.kind == FlowKind::Marker {
                 return None;
             }
-            let h = if item.height.is_finite() {
-                item.height
-            } else {
-                0.0
-            };
+            let h = finite_or_zero(item.height);
             match row_bottom {
-                Some(bottom) if item.top < bottom - 0.5 => {
+                Some(bottom) if item.top < bottom - ROW_TOLERANCE_PX => {
                     row_bottom = Some(bottom.max(item.top + h));
                 }
                 Some(_) => {
@@ -3089,8 +3102,7 @@ fn fragment_block_subtree_inner(
         // come from `flow_rows`; a box-less child is in none and leaves the
         // open row alone.
         if let Some(row) = row {
-            if row_state.as_ref().is_some_and(|rs| rs.row == row) {
-                let rs = row_state.as_ref().unwrap();
+            if let Some(rs) = row_state.as_ref().filter(|rs| rs.row == row) {
                 if rs.crossed_by_recursion {
                     // Co-split: a previous cell in this row crossed a page
                     // boundary via recursion. Restore to the row-start state
@@ -3622,13 +3634,7 @@ fn fragment_block_subtree_inner(
                 margin_after_forced_break = true;
             }
             if let Some(ref mut rs) = row_state {
-                if page_index > rs.max_end_page
-                    || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-                {
-                    rs.max_end_page = page_index;
-                    rs.max_end_cursor_y = cursor_y;
-                }
-                rs.note_box_end(page_index, prev);
+                rs.note_end(page_index, cursor_y, prev);
             }
             continue;
         }
@@ -3658,12 +3664,16 @@ fn fragment_block_subtree_inner(
         // before branch above leaves a sliver of its background behind
         // on the current page instead of moving the whole box.
         let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
+        // These two walk the whole subtree and do not depend on where the
+        // child sits, so they are asked once.
+        let may_recurse = !child.children.is_empty() && !is_multicol;
+        let breaks_below = may_recurse
+            && (has_forced_break_below(doc, child_id, column_styles, 0)
+                || has_page_name_change_below(doc, child_id, used_page_names, 0));
         let needs_recursion_at = |cursor_y: f32| {
             let available_strip = (page_height_px - cursor_y).max(0.0);
-            !child.children.is_empty()
-                && !is_multicol
-                && (has_forced_break_below(doc, child_id, column_styles, 0)
-                    || has_page_name_change_below(doc, child_id, used_page_names, 0)
+            may_recurse
+                && (breaks_below
                     || (!avoid_fits_whole_page
                         && would_split_block_subtree(
                             doc,
@@ -3686,8 +3696,11 @@ fn fragment_block_subtree_inner(
             Some(rs) => rs.start_box_placed_on == Some(page_index),
             None => box_placed_on == Some(page_index),
         };
+        // The extent never exceeds the child's height, so a child that fits
+        // whole needs no measuring.
         if needs_recursion
             && below_sibling
+            && child_page_y + child_h > page_height_px
             && child_page_y + leading_unbreakable_extent(doc, column_styles, child_id, depth + 1)
                 > page_height_px
         {
@@ -3918,13 +3931,7 @@ fn fragment_block_subtree_inner(
                 prev_used_page = Some(used_end.clone());
             }
             if let Some(ref mut rs) = row_state {
-                if page_index > rs.max_end_page
-                    || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-                {
-                    rs.max_end_page = page_index;
-                    rs.max_end_cursor_y = cursor_y;
-                }
-                rs.note_box_end(page_index, prev);
+                rs.note_end(page_index, cursor_y, prev);
             }
             continue;
         }
@@ -4027,13 +4034,7 @@ fn fragment_block_subtree_inner(
             prev_used_page = Some(used_end.clone());
         }
         if let Some(ref mut rs) = row_state {
-            if page_index > rs.max_end_page
-                || (page_index == rs.max_end_page && cursor_y > rs.max_end_cursor_y)
-            {
-                rs.max_end_page = page_index;
-                rs.max_end_cursor_y = cursor_y;
-            }
-            rs.note_box_end(page_index, prev);
+            rs.note_end(page_index, cursor_y, prev);
         }
     }
 
