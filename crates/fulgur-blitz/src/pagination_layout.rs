@@ -1360,22 +1360,6 @@ fn record_subtree_descendants(
     }
 }
 
-/// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
-/// gate — true if walking `parent_id`'s direct children would cross
-/// a page boundary at `available_h`.
-///
-/// Cheaper-than-real `fragment_block_subtree` simulator: same gap /
-/// OOF / whitespace skips, but no fragment emission. Returns `true`
-/// on the first overflow detected. Lets the caller decide "should I
-/// recurse here?" without paying the cost of recursion when recursion
-/// would not actually split — distinguishing "recurse and split"
-/// (within-child) from "push child whole / emit whole" (at-index or
-/// no split).
-///
-/// `available_h` is the strip height left below the parent's entry
-/// cursor on the current page. `page_h_px` lets the simulator detect
-/// grandchildren taller than a full page (which would themselves
-/// recurse and therefore split, regardless of `available_h`).
 /// Whether a [`FlowItem`] generates a box.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlowKind {
@@ -1459,6 +1443,22 @@ fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
         .collect()
 }
 
+/// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
+/// gate — true if walking `parent_id`'s direct children would cross
+/// a page boundary at `available_h`.
+///
+/// Cheaper-than-real `fragment_block_subtree` simulator: same gap /
+/// OOF / whitespace skips, but no fragment emission. Returns `true`
+/// on the first overflow detected. Lets the caller decide "should I
+/// recurse here?" without paying the cost of recursion when recursion
+/// would not actually split — distinguishing "recurse and split"
+/// (within-child) from "push child whole / emit whole" (at-index or
+/// no split).
+///
+/// `available_h` is the strip height left below the parent's entry
+/// cursor on the current page. `page_h_px` lets the simulator detect
+/// grandchildren taller than a full page (which would themselves
+/// recurse and therefore split, regardless of `available_h`).
 fn would_split_block_subtree(
     doc: &BaseDocument,
     parent_id: usize,
