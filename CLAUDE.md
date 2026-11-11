@@ -44,8 +44,10 @@ HTML string → Blitz (parse/style/layout) → Drawables / PaginationGeometryTab
 - `crates/fulgur-core/` — Backend-independent parts: `config`, `asset`, `units`, `error`, `image`, `inspect`. Must not depend on Blitz, Stylo, Taffy, Parley, or Raikiri
 - `crates/fulgur-blitz/` — The current Blitz-based pipeline (parse, layout, pagination, drawables, PDF rendering, GCPM, templates)
 - `crates/fulgur-cli/` — CLI binary using clap
+- `crates/fulgur-raikiri/` — The Raikiri backend. Published in the `core` version group, and depends on the crates.io releases of `raikiri-html`, `raikiri-net` and `raikiri-traits` (no git, path or `[patch]` dependency on Raikiri). Nothing else that is published depends on it yet; the facade, CLI and bindings still use Blitz only
+- `crates/fulgur-dev/` — Unpublished development CLI that can select either backend (`--engine raikiri`)
 
-The contract between layout backends is "HTML + assets + config → PDF bytes"; backends do not share an intermediate representation. A Raikiri backend will be added later as an unpublished crate, so published crates must not depend on Raikiri.
+The contract between layout backends is "HTML + assets + config → PDF bytes"; backends do not share an intermediate representation. `fulgur-core` stays backend-independent. A Raikiri update is an ordinary dependency bump of the `raikiri-*` version requirements in `crates/fulgur-raikiri/Cargo.toml`.
 
 ### Key Modules (fulgur-blitz unless noted)
 
@@ -254,6 +256,29 @@ Three mechanical traps these syncs exposed, all worth repeating next time:
   **After a sync, diff the test inventory, not just the build:**
   `git diff <premerge>..HEAD -- '*.rs' | grep "^-.*fn .*("` and read what left.
 
+#### Upstream sync, 2026-11-11
+
+99 commits since `efb88937`, merged at `bd6222fe`. The Blitz library diff is nine
+files, and eight are test-only. The one behaviour change is **`bd59747c`
+(breaking): `@page` margin boxes resolve `counter()` / `counters()` for `page` and
+`pages` only, and every other name to 0** — matching Chromium and Raikiri; the
+documented route to a chapter number in a header is `string-set` + `string()`.
+paperworx templates use no document counters in margin boxes (searched), and none
+of our GCPM patches touch `gcpm/counter.rs`, so nothing of ours moved. Blast radius
+over 86 fixtures and examples: only `gcpm/counter-page-numbers`; vol-kap
+byte-identical.
+
+What it was actually for: the pinned `fonts.conf` stopped including the system
+config and the Blitz goldens were re-cut on bundled Noto (see *Baselines*).
+Upstream also now **publishes `fulgur-raikiri`** (`deed6d26`); the "walled off"
+section below predates that.
+
+Trap hit: every binary conflict (22 goldens, 3 example PDFs) was a fixture the fork
+had already re-blessed for its own fixes. Taking upstream's copy makes VRT fail on
+exactly those 22; regenerate them in the container (`FULGUR_VRT_UPDATE=failing`)
+rather than keeping ours, which carry the old fonts. The forced-break margin policy
+did not re-conflict: upstream touched `pagination_layout.rs` only in a doc comment.
+
 #### usvg reads local files, and our base-path confinement never sees it
 
 Closed upstream 2026-10-21 (`0b167cad`, `234ee3d3`, `80b129f6`, `87bfffb2`,
@@ -290,10 +315,21 @@ Three things to carry forward:
 Landed 2026-09-27 onward: `crates/fulgur-raikiri` (a complete independent layout
 backend, Raikiri for layout + Krilla for paint, no Blitz fallback) and
 `crates/fulgur-dev` (an unpublished CLI that renders through either backend for
-comparison). Both are `publish = false`, `release = false`, and excluded from fmt,
-clippy, nextest and coverage in every CI cell, behind their own non-required
-workflow. `cargo test -p fulgur` does not pull them in and the `fulgur` facade's
-public API is unchanged.
+comparison).
+
+**Since `deed6d26` (taken in the 2026-11-11 sync) `fulgur-raikiri` is published.** It
+depends on the crates.io `raikiri-*` 0.0.6 crates and is released in the same version
+group as `fulgur-core` / `fulgur-blitz`. `fulgur-dev` stays `publish = false`. What has
+*not* changed for us:
+
+- The `fulgur` facade and `fulgur-cli` still do not depend on it. Only `fulgur-dev`,
+  and `fulgur-vrt` / `fulgur-wpt` behind an optional `raikiri` feature, pull it in.
+  `cargo test -p fulgur` does not build it.
+- CI still excludes both crates from fmt, clippy, nextest and coverage in `ci.yml`.
+  They run in the separate, non-required `raikiri.yml`.
+
+So publishing makes Raikiri a real release artefact upstream, and a signal of where
+upstream is heading. It is not a dependency of anything we ship.
 
 It already beats Blitz on paged media — 116 WPT `css-page` passes against Blitz's 84,
 with 50 passing only on Raikiri — so expect upstream's attention to keep moving there.
@@ -338,7 +374,9 @@ understates the suite:
 | revision | `-p fulgur -p fulgur-blitz -p fulgur-core` | `-p fulgur-cli` |
 |---|---|---|
 | after the GCPM work (2026-09-11) | 2753 / 0 / 10 | 57 / 0 |
-| **after the 2026-10-21 upstream sync** | **3003 / 0 / 10** (67 binaries) | **59 / 0** |
+| after the 2026-10-21 upstream sync | 3003 / 0 / 10 (67 binaries) | 59 / 0 |
+| pagination fixes + break matrix (`28db2b60`) | 3008 / 0 / 10 (69 binaries) | 59 / 0 |
+| **after the 2026-11-11 upstream sync** | **3035 / 0 / 10** (69 binaries) | **59 / 0** |
 
 **`examples_determinism` does not validate the committed example PDFs.** Its 10 tests
 render each example *twice* and compare the two runs to each other, so they prove
@@ -365,11 +403,21 @@ residual.
 
 `FONTCONFIG_FILE` does not save you here — it is a **proven no-op on macOS** (rendering is
 byte-identical with and without it), because fontconfig is not macOS's font mechanism.
-Note also that the goldens embed **DejaVuSans**, not the bundled Noto Sans the pinned
-`fonts.conf` asks for, so VRT's determinism actually rests on the runner image's default
-font rather than on the bundled set. A runner image bump would break every text fixture at
-once. `gcpm_snapshot.rs` shows the robust alternative: it injects Noto via
+`gcpm_snapshot.rs` shows the robust alternative: it injects Noto via
 `AssetBundle::add_font_file`, and its 19 byte-exact goldens pass unmodified on macOS.
+
+**Since the 2026-11-11 sync the goldens embed the bundled Noto set, not DejaVu.**
+Upstream's `b9537fb2` dropped the `/etc/fonts` include from `fonts.conf`, so only
+`examples/.fonts` is visible, and `75e5f70d` re-cut the goldens on it (verified with
+`pdffonts`: NotoSans / NotoSansMono only). The DejaVu package-revision table above is
+therefore history — the runner image's default font should no longer reach the
+output. Unverified whether `debian:bookworm` now reproduces too; keep using the
+`ubuntu:24.04` recipe until someone measures it. `FONTCONFIG_FILE` must be absolute.
+
+**The Noto pin does not make VRT pass on macOS.** Measured 2026-11-11 at `2c4565cb`
+with an absolute `FONTCONFIG_FILE`: **30 of 65 fixtures differ**. That is the same
+no-op as above. macOS does not resolve fonts through fontconfig, so the pin never
+reaches it. Container-only still stands.
 
 To run VRT (~2 min, mostly the build):
 

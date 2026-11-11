@@ -22,9 +22,9 @@ fn legacy_pages_keep_inline_svg_root_opacity() {
     let page = layout.page(0).unwrap();
     let mut pdf = krilla::Document::new();
     let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = pdf_page.surface();
+    let mut surface = Surface::new(pdf_page.surface());
     let mut fonts = FontCache::default();
-    let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+    let mut svg = svg::SvgCache::default();
     let mut raster = raster::RasterCache::for_tests(resources.image_pixel_source_ref());
     paint_legacy(
         &mut surface,
@@ -69,9 +69,9 @@ fn legacy_pages_keep_inline_svg_vectors() {
     let page = layout.page(0).unwrap();
     let mut pdf = krilla::Document::new();
     let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = pdf_page.surface();
+    let mut surface = Surface::new(pdf_page.surface());
     let mut fonts = FontCache::default();
-    let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+    let mut svg = svg::SvgCache::default();
     let mut raster = raster::RasterCache::for_tests(resources.image_pixel_source_ref());
     paint_legacy(
         &mut surface,
@@ -150,14 +150,14 @@ fn producer_fragmentainer_clip_is_applied_before_its_opacity_group() {
     ];
     let mut pdf = krilla::Document::new();
     let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-    let mut surface = pdf_page.surface();
+    let mut surface = Surface::new(pdf_page.surface());
     paint_ordered(
         &mut surface,
         &page,
         &events,
         &[],
         &mut FontCache::default(),
-        &mut svg::SvgCache::new(crate::RenderOptions::default()),
+        &mut svg::SvgCache::default(),
         &mut raster::RasterCache::for_tests(resources.image_pixel_source_ref()),
         &mut crate::tagging::Tags::disabled(),
         None,
@@ -264,9 +264,9 @@ fn legacy_pages_skip_the_background_given_to_the_canvas() {
     let fill_count = |canvas_owner: Option<NodeId>| {
         let mut pdf = krilla::Document::new();
         let mut pdf_page = pdf.start_page_with(PageSettings::from_wh(100.0, 100.0).unwrap());
-        let mut surface = pdf_page.surface();
+        let mut surface = Surface::new(pdf_page.surface());
         let mut fonts = FontCache::default();
-        let mut svg = svg::SvgCache::new(crate::RenderOptions::default());
+        let mut svg = svg::SvgCache::default();
         let mut raster = raster::RasterCache::for_tests(resources.image_pixel_source_ref());
         paint_legacy(
             &mut surface,
@@ -316,4 +316,53 @@ fn a_root_without_a_box_gives_no_canvas() {
     };
     let page = layout.page(0).expect("a page");
     assert!(canvas::owner(&page).is_none());
+}
+
+/// Whether `got` is the same stretch of events as `want`.
+fn same_events(got: &[PaintEvent<'_>], want: &[PaintEvent<'_>]) -> bool {
+    got.len() == want.len() && std::ptr::eq(got.as_ptr(), want.as_ptr())
+}
+
+#[test]
+fn the_root_transform_wrapper_of_a_paint_order_is_left_to_the_caller() {
+    let root = PaintTransform::translate(40.0, 30.0);
+    let own = PaintTransform::translate(5.0, 5.0);
+    let events = [
+        PaintEvent::PushTransform(root),
+        PaintEvent::PushTransform(own),
+        PaintEvent::PopTransform,
+        PaintEvent::PopTransform,
+    ];
+    // The wrapper is dropped, and the transforms nested in it stay.
+    assert!(same_events(
+        inside_root_transform(&events, RootSpace::Moved(root)),
+        &events[1..3]
+    ));
+    // Without a root transform to open, nothing is dropped.
+    assert!(same_events(
+        inside_root_transform(&events, RootSpace::Plain),
+        &events
+    ));
+    // A wrapper that is another transform is an element's own.
+    assert!(same_events(
+        inside_root_transform(&events, RootSpace::Moved(own)),
+        &events
+    ));
+    // The first transform closes before the end: siblings, not a wrapper.
+    let siblings = [
+        PaintEvent::PushTransform(root),
+        PaintEvent::PopTransform,
+        PaintEvent::PushTransform(root),
+        PaintEvent::PopTransform,
+    ];
+    assert!(same_events(
+        inside_root_transform(&siblings, RootSpace::Moved(root)),
+        &siblings
+    ));
+    // A paint order that does not wrap the document is used as it is.
+    let bare = [PaintEvent::PushOpacity(0.5), PaintEvent::PopOpacity];
+    assert!(same_events(
+        inside_root_transform(&bare, RootSpace::Moved(root)),
+        &bare
+    ));
 }

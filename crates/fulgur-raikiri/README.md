@@ -1,6 +1,6 @@
 # fulgur-raikiri
 
-Unpublished Raikiri backend for Fulgur development.
+Raikiri backend for Fulgur, under development.
 
 The backend accepts an HTML file path, or an HTML string with an optional base
 directory, and a `fulgur_core::Config`, and returns
@@ -22,16 +22,15 @@ Bundle CSS is registered as user stylesheets in order. Fonts use core asset
 loading (including WOFF2 decoding), then their family names are extracted
 and registered with Raikiri. Parsing, layout, and painting retain the same
 resources and local-file provider. Disabling system fonts requires a bundled
-font. Invalid fonts and TTC/OTC collections return an asset error. Each bundle
-image is a file at the URL its name resolves to against the base directory
-(`img/logo.png`), or at its name when that is an absolute URL; HTML without a
-base directory is `about:blank`, so only absolute-URL names apply to it.
+font. Invalid fonts return an asset error. Every face of a TTC/OTC collection
+is registered under the family name it records. Each bundle image is a file at
+the URL its name resolves to against the base directory (`img/logo.png`), or at
+its name when that is an absolute URL; HTML without a base directory is
+`about:blank`, so only absolute-URL names apply to it.
 Documents reach bundle images with browser URL resolution: `<img src>`
 against the document base URL, `url()` in a linked or imported stylesheet
 against that stylesheet's URL. Bundle images are served ahead of the files in
-the directory, for any resource kind. The pinned font
-API cannot select a collection face; use
-individual TTF/OTF fonts or WOFF2.
+the directory, for any resource kind.
 Bundle CSS has document URL provenance; linked stylesheet imports retain
 stylesheet URL provenance.
 
@@ -57,8 +56,9 @@ under the original page and removed. Delivered pages never change, so
 element that starts after the first page was painted. The development CLI
 selects it with `--engine raikiri --stream`.
 
-Raikiri is a Git dependency pinned to a specific revision. This crate is not
-used by Fulgur's published facade, CLI, or bindings.
+Raikiri comes from its crates.io releases (`raikiri-html`, `raikiri-net`,
+`raikiri-traits`). This crate is published, but Fulgur's facade, CLI, and
+bindings do not use it yet.
 
 PDF metadata supports title, repeated authors and keywords, description,
 language, creator, producer, and creation date. The development CLI exposes
@@ -141,11 +141,18 @@ ownership, ancestor clipping, and item opacity. Missing marker sources retain
 text fallback, and explicit `::marker` content takes priority. Image bundle URLs
 remain unsupported.
 
-Inline SVG is drawn as PDF vector content through Krilla SVG, including paths,
-gradients, and selectable text. Its viewport uses Raikiri's resolved content box,
-including border, padding, fixed repeats, and page cuts. SVG fonts follow the
-same bundled-font and system-font options as the HTML text. Resolved root font
-sizes and complete family candidate lists preserve relative sizing and fallback.
+Inline SVG is drawn as PDF vector content from the scene that Raikiri builds
+for it: paths, strokes with dashes, linear and radial gradients, clip paths,
+opacity groups, and selectable text. A clip of several shapes is drawn through
+a mask. Its viewport uses Raikiri's resolved content box, including border,
+padding, fixed repeats, and page cuts. SVG text is set in the faces the page was
+laid out with, so it follows the same bundled-font and system-font options as
+the HTML text and shares its embedded fonts. Resolved root font sizes and
+complete family candidate lists preserve relative sizing and fallback. An SVG
+that uses what the scene leaves out (masks and patterns), that goes over a
+budget of the scene, or that strokes text under a transform that is not a
+rotation and a uniform scale, is drawn from its parsed tree through Krilla SVG
+instead.
 Parent and SVG-root
 opacity composite once while explicit inherited descendant opacity is retained.
 Source preparation preserves selector matches before rewriting the root viewport

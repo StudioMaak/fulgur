@@ -226,6 +226,9 @@ jobs:
     if: github.event.pull_request.stack == null || github.event.pull_request.stack.base.ref == github.event.pull_request.base.ref || github.event.pull_request.stack.position == github.event.pull_request.stack.size
     name: Visual Regression Tests
     runs-on: ubuntu-latest
+    # A normal run takes a few minutes; without a limit a stalled step holds
+    # the runner until the 6-hour job ceiling.
+    timeout-minutes: 45
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
@@ -239,6 +242,7 @@ jobs:
           swap-storage: false
       - uses: actions/checkout@v7
       - name: Install poppler-utils
+        timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y poppler-utils mold
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -275,6 +279,9 @@ jobs:
     if: github.event.pull_request.stack == null || github.event.pull_request.stack.base.ref == github.event.pull_request.base.ref || github.event.pull_request.stack.position == github.event.pull_request.stack.size
     name: wpt / ${{ matrix.phase }}
     runs-on: ubuntu-latest
+    # Backstop for a hung phase (wpt / bugs once ran ~5h20m before being
+    # cancelled). The reftest step has its own, tighter timeout below.
+    timeout-minutes: 45
     # WPT reftests are a reporting channel, not a blocker on PRs.
     # Regressions surface via the step summary and target/wpt-report artifacts.
     continue-on-error: true
@@ -369,6 +376,10 @@ jobs:
       - name: Fetch WPT subset
         run: scripts/wpt/fetch.sh
       - name: Run ${{ matrix.phase }} reftests
+        # Healthy phases finish in under ~10 minutes including the build.
+        # Step-level (not just job-level) so the always() summary/upload
+        # steps below still run after a hang.
+        timeout-minutes: 30
         env:
           FULGUR_REVISION: ${{ github.sha }}
           # Tells the integration test to panic (rather than silently skip)

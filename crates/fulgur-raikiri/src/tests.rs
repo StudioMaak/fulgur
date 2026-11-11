@@ -72,6 +72,85 @@ fn explicit_break_creates_second_page() {
 }
 
 #[test]
+fn border_widths_snap_to_whole_css_pixels() {
+    // Browsers floor a used border width to whole CSS pixels and keep one pixel
+    // for any visible border, so `1pt` (1.333px) is `1px`, `0.5pt` is `1px`,
+    // `1.5pt` (2px) is `2px`, `thin` is `1px` and `2.4px` is `2px`.
+    let cases = [
+        ("a", "border:1pt solid", 12.0),
+        ("b", "border:0.5pt solid", 12.0),
+        ("c", "border:1.5pt solid", 14.0),
+        ("d", "border:thin solid", 12.0),
+        ("e", "border:2.4px solid", 14.0),
+        // A sub-pixel width still shows one pixel, but no border style or a
+        // zero width leaves nothing to snap.
+        ("f", "border:0.1px solid", 12.0),
+        ("g", "border:0 solid", 10.0),
+        ("h", "border:5px none", 10.0),
+    ];
+    let boxes: String = cases
+        .iter()
+        .map(|(id, border, _)| {
+            format!("<div id={id} style='{border}; width:10px; height:10px'></div>")
+        })
+        .collect();
+    let (_dir, path) = input(&format!("{CSS}{boxes}"));
+    let result = completed(&path);
+    let page = result.page(0).unwrap();
+    for (id, border, outer) in cases {
+        let fragment = page
+            .fragments()
+            .find(|f| page.dom().attr(f.node(), "id") == Some(id))
+            .unwrap_or_else(|| panic!("no fragment for #{id}"));
+        let rect = fragment.rect();
+        assert_eq!((rect.width, rect.height), (outer, outer), "{border}");
+    }
+}
+
+/// Three cards of 53px (a 21px line, 15px padding above and below, and `1pt`
+/// borders that snap to 1px) end at 159px of the 160px page content, and a
+/// heading forces a second page. With the fractional 1.333px borders the cards
+/// would be 53.67px high and end at 161px, so the third would not fit and
+/// would move to a second page of its own, leaving the heading on a third.
+fn bordered_cards() -> String {
+    let cards: String = (1..=3)
+        .map(|n| format!("<div class=card><p>Card {n}</p></div>"))
+        .collect();
+    format!(
+        "{CSS}<style>\
+         .card {{ border: 1pt solid; padding: 15px 0 }}\
+         .card p {{ height: auto; line-height: 21px }}\
+         h2 {{ margin: 0; break-before: page }}\
+         </style>{cards}<h2>Next</h2>"
+    )
+}
+
+#[test]
+fn bordered_cards_break_pages_like_a_browser() {
+    let (_dir, path) = input(&bordered_cards());
+    let result = completed(&path);
+    assert_eq!(result.page_count(), 2);
+    let page = result.page(0).unwrap();
+    let cards_on_first_page = page
+        .fragments()
+        .filter(|f| page.dom().attr(f.node(), "class") == Some("card"))
+        .count();
+    assert_eq!(cards_on_first_page, 3);
+}
+
+#[test]
+fn bordered_cards_make_the_same_pdf_pages_when_batched_and_streamed() {
+    let (_dir, path) = input(&bordered_cards());
+    let batch = render(&path, &Config::default()).expect("batch PDF");
+    let streamed = render_streaming(&path, &Config::default(), &RenderOptions::default())
+        .expect("streamed PDF");
+    for pdf in [batch, streamed] {
+        let pdf = lopdf::Document::load_mem(&pdf).expect("a readable PDF");
+        assert_eq!(pdf.get_pages().len(), 2);
+    }
+}
+
+#[test]
 fn hidden_element_has_no_fragment() {
     let (_dir, path) = input("<div id=hidden style='display:none'>Hidden</div><p>Visible</p>");
     let result = completed(&path);
@@ -103,7 +182,6 @@ fn already_aborted_layout_returns_aborted() {
             &Config::default(),
             bookmarks::BookmarkCollector::default(),
             &url::Url::from_file_path(path.canonicalize().unwrap()).unwrap(),
-            &RenderOptions::default(),
         ),
         Err(Error::Layout(_))
     ));
@@ -331,6 +409,13 @@ fn operations_with(
     let (_dir, path) = input(html);
     let bytes = render_with_options(&path, &Config::default(), options).expect("PDF bytes");
     let pdf = lopdf::Document::load_mem(&bytes).expect("a readable PDF");
+    let operations = operations_of(&pdf);
+    (pdf, operations)
+}
+
+/// The drawing operations of every content stream of `pdf`: page contents
+/// and Form XObjects.
+pub(crate) fn operations_of(pdf: &lopdf::Document) -> Vec<lopdf::content::Operation> {
     let mut operations = Vec::new();
     for page in pdf.get_pages().values() {
         let content = pdf.get_page_content(*page);
@@ -357,10 +442,10 @@ fn operations_with(
             );
         }
     }
-    (pdf, operations)
+    operations
 }
 
-fn count(operations: &[lopdf::content::Operation], operator: &str) -> usize {
+pub(crate) fn count(operations: &[lopdf::content::Operation], operator: &str) -> usize {
     operations
         .iter()
         .filter(|operation| operation.operator == operator)
@@ -369,7 +454,7 @@ fn count(operations: &[lopdf::content::Operation], operator: &str) -> usize {
 
 /// Whether any dictionary in the document, at any depth, has
 /// `/ShadingType shading_type`.
-fn has_shading(pdf: &lopdf::Document, shading_type: i64) -> bool {
+pub(crate) fn has_shading(pdf: &lopdf::Document, shading_type: i64) -> bool {
     fn in_dict(dict: &lopdf::Dictionary, shading_type: i64) -> bool {
         dict.iter().any(|(key, value)| {
             (key == b"ShadingType" && value.as_i64().is_ok_and(|t| t == shading_type))
@@ -816,6 +901,11 @@ fn linear_gradient_stop_positions_move_the_shading_ends() {
     let colors = stop_colors(&pdf, shadings(&pdf)[0]);
     assert_eq!(colors.first(), Some(&[255, 0, 0]));
     assert_eq!(colors.last(), Some(&[0, 0, 255]));
+    // A calc() of a percentage and a length: 10% + 20px and 90% - 20px.
+    let (_, _, coords) = gradient_box(
+        "background-image: linear-gradient(to right, red calc(10% + 20px), blue calc(90% - 20px))",
+    );
+    assert_close(&coords.unwrap(), &[66.0, 35.0, 234.0, 35.0]);
 }
 
 #[test]
@@ -912,6 +1002,10 @@ fn radial_gradient_explicit_sizes_and_positions() {
     let (coords, scale) = radial("radial-gradient(50% 25%, red, blue)");
     assert_eq!(coords[5], 130.0);
     assert!((scale - 7.5 / 130.0).abs() < 1e-4);
+    // A calc() radius adds its length to the percentage of the box.
+    let (coords, scale) = radial("radial-gradient(calc(10% + 10px) calc(50% + 5px), red, blue)");
+    assert_eq!(coords[5], 36.0);
+    assert!((scale - 20.0 / 36.0).abs() < 1e-4);
     // Offsets from the right and bottom edges.
     let (coords, _) = radial("radial-gradient(at right 10px bottom 5px, red, blue)");
     assert_close(&coords[..2], &[270.0, 45.0]);
@@ -1282,32 +1376,40 @@ fn double_border_fallback_uses_each_side_width() {
 
 #[test]
 fn body_overflow_clips_when_the_root_overflow_is_not_visible() {
-    let html = |root: &str| {
+    let html = |root: &str, height: &str| {
         format!(
             "<style>@page {{ size: 300px 200px; margin: 20px }} html {{ {root} }} \
-             body {{ margin: 0; border: 5px solid black; overflow: hidden }}</style>\
+             body {{ margin: 0; border: 5px solid black; overflow: hidden; {height} }}</style>\
              <p style=\"background-color: blue; height: 100px\"></p>"
         )
     };
     // With a visible root, the body's overflow goes to the page.
-    let (_, propagated) = operations(&html(""));
+    let (_, propagated) = operations(&html("", ""));
     assert_eq!(count(&propagated, "W"), 0);
     // Otherwise the root's goes to the page and the body clips its own
     // content to its padding box: its border box inset by the border.
-    let (_, clipped) = operations(&html("overflow: hidden"));
-    let (_dir, path) = input(&html("overflow: hidden"));
-    let layout = completed(&path);
-    let page = layout.page(0).unwrap();
-    let body = page
-        .fragments()
-        .find(|f| page.dom().local_name(f.node()) == Some("body"))
-        .unwrap()
-        .paint_rect();
+    let body_and_clip = |height: &str| {
+        let (_, clipped) = operations(&html("overflow: hidden", height));
+        let (_dir, path) = input(&html("overflow: hidden", height));
+        let layout = completed(&path);
+        let page = layout.page(0).unwrap();
+        let body = page
+            .fragments()
+            .find(|f| page.dom().local_name(f.node()) == Some("body"))
+            .unwrap()
+            .paint_rect();
+        (body, clip_bounds(&clipped))
+    };
+    // The body is as tall as its 100px content plus its two 5px borders.
+    let (body, clip) = body_and_clip("");
+    assert_eq!(body, raikiri_html::PaintRect::new(20.0, 20.0, 260.0, 110.0));
+    assert_eq!(clip, [[25.0, 25.0, 275.0, 125.0]]);
+    // A body taller than the page area (160px): the page cuts the visible
+    // fragment, while the overflow clip keeps the whole padding box below the
+    // page cut.
+    let (body, clip) = body_and_clip("height: 200px");
     assert_eq!(body, raikiri_html::PaintRect::new(20.0, 20.0, 260.0, 160.0));
-    // The body's content-box minimum is 160px; its two 5px borders make
-    // the whole box 170px tall. The page cuts the visible fragment, while
-    // the overflow clip keeps the whole padding box below the page cut.
-    assert_eq!(clip_bounds(&clipped), [[25.0, 25.0, 275.0, 185.0]]);
+    assert_eq!(clip, [[25.0, 25.0, 275.0, 225.0]]);
 }
 
 /// Decoded operations of one page's content stream.
@@ -1499,17 +1601,12 @@ fn local_files_get_a_content_type_from_their_extension() {
 
 fn get(provider: &files::BaseDirectoryProvider, url: &str) -> std::result::Result<(), String> {
     use raikiri_traits::ResourceKind;
-    use raikiri_traits::net::{Body, Method, NetworkProvider, Request};
+    use raikiri_traits::net::{NetworkProvider, Request};
     provider
-        .fetch_one_hop(Request {
-            url: url::Url::parse(url).unwrap(),
-            method: Method::Get,
-            content_type: None,
-            headers: Vec::new(),
-            body: Body::Empty,
-            signal: None,
-            kind: ResourceKind::ExternalStylesheet,
-        })
+        .fetch_one_hop(Request::new(
+            url::Url::parse(url).unwrap(),
+            ResourceKind::ExternalStylesheet,
+        ))
         .map(drop)
         .map_err(|error| error.to_string())
 }
@@ -1667,10 +1764,11 @@ fn a_corner_with_one_zero_inner_radius_is_square() {
 fn background_clip_text_paints_inside_the_glyphs() {
     let (pdf, text_ops) = operations(&format!(
         "{CSS}<p style=\"background-image: linear-gradient(red, blue); \
-         background-clip: text; color: transparent\">Hi</p>"
+         background-clip: text; color: transparent\">Ho</p>"
     ));
     assert!(has_shading(&pdf, 2));
-    // The gradient fills glyph outlines (curves), not the 260 x 30 box.
+    // The gradient fills glyph outlines (the curves of the `o` in any
+    // typeface), not the 260 x 30 box.
     let fill = text_ops.iter().position(|op| op.operator == "f").unwrap();
     let path = &text_ops[..fill];
     let start = path.iter().position(|op| op.operator == "m").unwrap();
@@ -1745,6 +1843,8 @@ mod text_shadow_tests;
 mod box_shadow_tests;
 
 mod canvas_tests;
+
+mod svg_image_tests;
 
 #[test]
 fn margin_boxes_draw_their_backgrounds_borders_and_text_on_each_page() {
@@ -1856,4 +1956,174 @@ fn rotated_boxes_draw_their_background_and_text_turned() {
     assert!(texts.iter().copied().any(turned), "{texts:?}");
     let text = pdf.extract_text(&[1]).unwrap();
     assert!(text.contains("turned"), "{text}");
+}
+
+/// The `font-family` list of the element with `id`, as written in CSS.
+fn families(page: &raikiri_html::Page<'_>, id: &str) -> Vec<String> {
+    let node = page
+        .fragments()
+        .map(|f| f.node())
+        .find(|&node| page.dom().attr(node, "id") == Some(id))
+        .unwrap_or_else(|| panic!("no fragment for #{id}"));
+    let computed = page.computed(node).expect("computed values");
+    computed.font_family.iter().map(|f| f.to_string()).collect()
+}
+
+#[test]
+fn unstyled_text_and_margin_boxes_default_to_sans_serif() {
+    let (_dir, path) = input(
+        "<style>@page { size: 300px 200px; margin: 40px; @top-center { content: 'Head' } } \
+         body { margin: 0 }</style>\
+         <p id=plain>plain</p><pre id=code>code</pre>",
+    );
+    let result = completed(&path);
+    let page = result.page(0).unwrap();
+    assert_eq!(families(&page, "plain"), ["sans-serif"]);
+    // The user agent's own rules on descendants still apply.
+    assert_eq!(families(&page, "code"), ["monospace"]);
+    // Margin boxes inherit from the page context, which inherits from the
+    // root element.
+    let style = page.page_style();
+    let rule = style.margin_boxes().first().expect("a margin box rule");
+    let margin_box = style.margin_box_style(rule, None);
+    let names: Vec<String> = margin_box
+        .font_family
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    assert_eq!(names, ["sans-serif"]);
+}
+
+#[test]
+fn author_font_family_beats_the_default() {
+    let (_dir, path) = input(
+        "<style>html { font-family: serif } body { margin: 0 } \
+         #own { font-family: 'Custom', monospace }</style>\
+         <p id=inherited>a</p><p id=own>b</p>",
+    );
+    let result = completed(&path);
+    let page = result.page(0).unwrap();
+    assert_eq!(families(&page, "inherited"), ["serif"]);
+    assert_eq!(families(&page, "own"), ["Custom", "monospace"]);
+}
+
+#[test]
+fn bundled_css_beats_the_default_in_a_layer_or_at_zero_specificity() {
+    for css in [
+        "@layer theme { html { font-family: serif } }",
+        ":where(html) { font-family: serif }",
+        "html { font-family: serif }",
+    ] {
+        let (_dir, path) = input("<p id=plain>plain</p>");
+        let mut bundle = fulgur_core::AssetBundle::new();
+        bundle.add_css(css);
+        let options = RenderOptions {
+            assets: Some(&bundle),
+            system_fonts: true,
+            ..Default::default()
+        };
+        let names = with_layout(
+            Source::File(&path),
+            &Config::default(),
+            &options,
+            LayoutConfig::default(),
+            |status, _, _, _| {
+                let LayoutStatus::Completed(result) = status else {
+                    panic!("expected a completed layout");
+                };
+                Ok(families(&result.page(0).unwrap(), "plain"))
+            },
+        )
+        .unwrap();
+        assert_eq!(names, ["serif"], "{css}");
+    }
+}
+
+/// The `(XStep, YStep)` of every tiling pattern (`PatternType 1`) in `pdf`.
+fn tiling_steps(pdf: &lopdf::Document) -> Vec<(f32, f32)> {
+    pdf.objects
+        .values()
+        .filter_map(|object| object.as_stream().ok())
+        .filter(|stream| {
+            stream
+                .dict
+                .get(b"PatternType")
+                .is_ok_and(|kind| kind.as_i64().is_ok_and(|kind| kind == 1))
+        })
+        .map(|stream| {
+            let step = |key: &[u8]| stream.dict.get(key).unwrap().as_float().unwrap();
+            (step(b"XStep"), step(b"YStep"))
+        })
+        .collect()
+}
+
+#[test]
+fn gradient_layers_tile_at_their_background_size() {
+    // One gradient per 20 x 10 tile, repeated through a tiling pattern
+    // instead of being stretched over the 260 x 30 box.
+    let (pdf, _, coords) = gradient_box(
+        "background-image: linear-gradient(to right, red, blue); background-size: 20px 10px",
+    );
+    assert_close(&coords.unwrap(), &[0.0, 5.0, 20.0, 5.0]);
+    assert_eq!(tiling_steps(&pdf), [(20.0, 10.0)]);
+    // `space` leaves a gap between tiles, which the pattern cell holds:
+    // five 50px tiles in 260px are 52.5px apart.
+    let (pdf, _, _) = gradient_box(
+        "background-image: linear-gradient(red, blue); background-size: 50px 30px; \
+         background-repeat: space no-repeat",
+    );
+    assert_eq!(tiling_steps(&pdf), [(52.5, 30.0)]);
+}
+
+#[test]
+fn a_gradient_tile_that_does_not_repeat_keeps_its_place() {
+    let (pdf, operations, coords) = gradient_box(
+        "background-image: linear-gradient(to right, red, blue); background-size: 50px 10px; \
+         background-position: 100px 10px; background-repeat: no-repeat",
+    );
+    // The box is at (20, 20); the tile at (120, 30) is 50 x 10.
+    assert_close(&coords.unwrap(), &[120.0, 35.0, 170.0, 35.0]);
+    assert!(tiling_steps(&pdf).is_empty());
+    // The box clips the tile, which is filled instead of the whole box.
+    let clips = clip_bounds(&operations);
+    assert!(
+        clips.iter().any(|clip| clip
+            .iter()
+            .zip([20.0, 20.0, 280.0, 50.0])
+            .all(|(a, b)| (a - b).abs() < 0.01)),
+        "{clips:?}"
+    );
+}
+
+#[test]
+fn repeated_gradient_tiles_are_at_least_one_pixel() {
+    let (pdf, _, coords) = gradient_box(
+        "background-image: linear-gradient(to right, red, blue); background-size: 0.25px 10px",
+    );
+    assert_close(&coords.unwrap(), &[0.0, 5.0, 1.0, 5.0]);
+    assert_eq!(tiling_steps(&pdf), [(1.0, 10.0)]);
+}
+
+#[test]
+fn gradient_tile_sizes_resolve_against_the_positioning_area() {
+    // Percentages and `calc()` refer to the 260 x 30 positioning area.
+    for (size, want, step) in [
+        ("25% 50%", [0.0, 7.5, 65.0, 7.5], (65.0, 15.0)),
+        ("calc(10% + 4px) 10px", [0.0, 5.0, 30.0, 5.0], (30.0, 10.0)),
+    ] {
+        let (pdf, _, coords) = gradient_box(&format!(
+            "background-image: linear-gradient(to right, red, blue); background-size: {size}"
+        ));
+        assert_close(&coords.unwrap(), &want);
+        assert_eq!(tiling_steps(&pdf), [step], "{size}");
+    }
+    // A gradient has no ratio to keep, so `contain` and `cover` fill the
+    // area like `auto`.
+    for size in ["contain", "cover"] {
+        let (pdf, _, coords) = gradient_box(&format!(
+            "background-image: linear-gradient(to right, red, blue); background-size: {size}"
+        ));
+        assert_close(&coords.unwrap(), &[20.0, 35.0, 280.0, 35.0]);
+        assert!(tiling_steps(&pdf).is_empty(), "{size}");
+    }
 }
