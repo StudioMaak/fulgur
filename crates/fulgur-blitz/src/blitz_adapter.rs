@@ -2086,6 +2086,20 @@ pub fn element_text(doc: &blitz_dom::BaseDocument, node_id: usize) -> String {
     out
 }
 
+/// True if `node` is a replaced element (CSS Display 3 §2.6): its content
+/// is an image or another external object, not CSS boxes, so it cannot be
+/// fragmented. Matched by tag as well as by loaded image data, because an
+/// `<img>` whose source did not resolve is still replaced.
+pub fn is_replaced_element(node: &Node) -> bool {
+    node.element_data().is_some_and(|elem| {
+        elem.image_data().is_some()
+            || matches!(
+                elem.name.local.as_ref(),
+                "img" | "svg" | "canvas" | "video" | "object" | "embed" | "iframe"
+            )
+    })
+}
+
 /// Extract the parsed `usvg::Tree` from an inline `<svg>` element, if present.
 ///
 /// Blitz parses inline `<svg>` elements during DOM construction (default `svg`

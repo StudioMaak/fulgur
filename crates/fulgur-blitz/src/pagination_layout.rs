@@ -523,6 +523,10 @@ impl<'a> PaginationLayoutTree<'a> {
         // in body's normal-flow height (CSS 2.1 §10.6.3) so per-page
         // walks match the recorded fragment tops.
         let mut prev_bottom_y_in_body: f32 = 0.0;
+        // The page a box with a height was last placed on. Body padding
+        // above the first child moves `cursor_y` off 0 without placing
+        // anything, so `cursor_y > 0.0` cannot stand in for this.
+        let mut box_placed_on: Option<u32> = None;
         // fulgur-uebl: tracks the used page-name of the previously
         // placed in-flow sibling (`Some(Some(name))` named, `Some(None)`
         // auto/unnamed, `None` no previous). When the next sibling's
@@ -796,6 +800,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 cursor_y = new_cursor_y;
                 emitted += frag_count;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                box_placed_on = Some(page_index);
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -888,25 +893,42 @@ impl<'a> PaginationLayoutTree<'a> {
                             .is_some_and(crate::blitz_adapter::has_column_span_all)
                     })
                 });
-            let available_strip = (capacity(page_index) - cursor_y).max(0.0);
             let avoid_fits_whole_page = avoid_inside && child_h <= self.page_height_px + 1.0;
-            let needs_recursion = has_splittable_children
-                && (!is_multicol || multicol_has_span_all)
-                && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
-                    || has_page_name_change_below(
-                        self.doc,
-                        child_id,
-                        self.used_page_names.as_ref(),
-                        0,
-                    )
-                    || (!avoid_fits_whole_page
-                        && would_split_block_subtree(
+            let needs_recursion_at = |page_index: u32, cursor_y: f32| {
+                let available_strip = (capacity(page_index) - cursor_y).max(0.0);
+                has_splittable_children
+                    && (!is_multicol || multicol_has_span_all)
+                    && (has_forced_break_below(self.doc, child_id, self.column_styles, 0)
+                        || has_page_name_change_below(
                             self.doc,
                             child_id,
-                            available_strip,
-                            self.page_height_px,
+                            self.used_page_names.as_ref(),
                             0,
-                        )));
+                        )
+                        || (!avoid_fits_whole_page
+                            && would_split_block_subtree(
+                                self.doc,
+                                child_id,
+                                available_strip,
+                                self.page_height_px,
+                                0,
+                            )))
+            };
+            let mut needs_recursion = needs_recursion_at(page_index, cursor_y);
+            // Entering the child in place puts its leading content on this
+            // page. When that does not fit and a box is already above it,
+            // the break goes before the child (class A): there is no break
+            // point between a container's top and its first child. See
+            // `leading_unbreakable_extent`.
+            if needs_recursion
+                && box_placed_on == Some(page_index)
+                && cursor_y + leading_unbreakable_extent(self.doc, self.column_styles, child_id, 0)
+                    > capacity(page_index)
+            {
+                page_index += 1;
+                cursor_y = 0.0;
+                needs_recursion = needs_recursion_at(page_index, cursor_y);
+            }
             if needs_recursion {
                 let child_x_in_body = body_x + layout.location.x;
                 let (new_page, new_cursor) = fragment_block_subtree(
@@ -928,6 +950,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 cursor_y = new_cursor;
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                box_placed_on = Some(page_index);
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -1112,6 +1135,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
+                box_placed_on = Some(page_index);
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -1165,6 +1189,7 @@ impl<'a> PaginationLayoutTree<'a> {
             cursor_y += child_h;
             emitted += 1;
             prev_bottom_y_in_body = this_top_in_body + child_h;
+            box_placed_on = Some(page_index);
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
@@ -1473,6 +1498,89 @@ fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
             })
         })
         .collect()
+}
+
+/// How far below `node_id`'s top edge its first unbreakable content
+/// reaches, in CSS px.
+///
+/// css-break-3 §3.1 allows a break between sibling boxes (class A) and
+/// between line boxes (class B), but not between a container's top edge
+/// and its first child: padding and border are not a class C gap. So when
+/// a box's leading content does not fit the rest of the page, the break
+/// goes before the nearest ancestor that has a sibling above it, and that
+/// ancestor moves whole, padding included. The walker that sees that
+/// sibling asks this before entering the box in place.
+///
+/// - An inline root: the bottom of its first line.
+/// - A container: the furthest any box of its first row reaches, each
+///   measured the same way (one box in block flow, the parallel cells of
+///   a flex / grid / table row).
+/// - Anything that cannot be broken (`break-inside: avoid`, a transform,
+///   a multicol container, a replaced element): its full height.
+/// - A box with no in-flow content: 0, it can be sliced anywhere.
+fn leading_unbreakable_extent(
+    doc: &BaseDocument,
+    column_styles: Option<&crate::column_css::ColumnStyleTable>,
+    node_id: usize,
+    depth: usize,
+) -> f32 {
+    let Some(node) = doc.get_node(node_id) else {
+        return 0.0;
+    };
+    let layout = node.final_layout;
+    let height = if layout.size.height.is_finite() {
+        layout.size.height.max(0.0)
+    } else {
+        0.0
+    };
+    if depth >= crate::MAX_DOM_DEPTH {
+        return height;
+    }
+    let avoid_inside = column_styles
+        .and_then(|t| t.get(&node_id))
+        .is_some_and(|p| {
+            matches!(
+                p.break_inside,
+                Some(crate::draw_primitives::BreakInside::Avoid)
+            )
+        });
+    let has_transform = node
+        .primary_styles()
+        .is_some_and(|s| !s.get_box().transform.0.is_empty());
+    if avoid_inside || has_transform || crate::blitz_adapter::is_multicol_container(node) {
+        return height;
+    }
+    if let Some(&(_, first_line_bottom)) = collect_inline_line_metrics(node).first() {
+        return (layout.padding.top + layout.border.top + first_line_bottom).clamp(0.0, height);
+    }
+    let items = flow_items(doc, node_id);
+    let rows = flow_rows(&items);
+    let has_height = |item: &FlowItem| {
+        item.kind == FlowKind::Box && item.height.is_finite() && item.height > 0.0
+    };
+    let Some(first_row) = items
+        .iter()
+        .zip(&rows)
+        .find(|(item, _)| has_height(item))
+        .map(|(_, row)| *row)
+    else {
+        // Nothing in flow with a height. A replaced element or a bare text
+        // run is whole; an empty box with a height can be sliced anywhere.
+        return if crate::blitz_adapter::is_replaced_element(node) || node.element_data().is_none() {
+            height
+        } else {
+            0.0
+        };
+    };
+    items
+        .iter()
+        .zip(&rows)
+        .filter(|(item, row)| **row == first_row && has_height(item))
+        .map(|(item, _)| {
+            item.top + leading_unbreakable_extent(doc, column_styles, item.node, depth + 1)
+        })
+        .fold(0.0_f32, f32::max)
+        .clamp(0.0, height)
 }
 
 /// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
@@ -1852,6 +1960,7 @@ struct RowState {
     start_cursor_y: f32,
     start_page_start_y: f32,
     start_prev: PrevBox,
+    start_box_placed_on: Option<u32>,
     start_at_page_top: bool,
     start_margin_after_forced_break: bool,
     start_initial_page_occupied: bool,
@@ -2807,6 +2916,10 @@ fn fragment_block_subtree_inner(
     // `fragment_pagination_root`, whose zero-height children `continue`
     // before the gap fold.
     let mut margin_after_forced_break = false;
+    // The page this walker last placed a box with a height on: on that
+    // page the next child has a sibling above it, i.e. a class A break
+    // point before it.
+    let mut box_placed_on: Option<u32> = None;
     // fulgur-uebl: tracks the previous in-flow sibling's used page-name
     // for implicit forced-break detection; see `fragment_pagination_root`
     // for the rationale and the outer-Option semantics.
@@ -2933,6 +3046,7 @@ fn fragment_block_subtree_inner(
                     cursor_y = rs.start_cursor_y;
                     page_start_y = rs.start_page_start_y;
                     prev = rs.start_prev;
+                    box_placed_on = rs.start_box_placed_on;
                     at_page_top = rs.start_at_page_top;
                     margin_after_forced_break = rs.start_margin_after_forced_break;
                     initial_page_occupied = rs.start_initial_page_occupied;
@@ -2959,6 +3073,7 @@ fn fragment_block_subtree_inner(
                     start_cursor_y: cursor_y,
                     start_page_start_y: page_start_y,
                     start_prev: prev,
+                    start_box_placed_on: box_placed_on,
                     start_at_page_top: at_page_top,
                     start_margin_after_forced_break: margin_after_forced_break,
                     start_initial_page_occupied: initial_page_occupied,
@@ -3413,6 +3528,7 @@ fn fragment_block_subtree_inner(
                 new_cursor_y
             };
             initial_page_occupied = false;
+            box_placed_on = Some(page_index);
             if !is_float {
                 prev_used_page = Some(used_end.clone());
             }
@@ -3459,7 +3575,6 @@ fn fragment_block_subtree_inner(
         // against the "parent CSS height > children sum" case where
         // recursion would emit a parent fragment shorter than
         // expected.
-        let available_strip = (page_height_px - cursor_y).max(0.0);
         // fulgur-7hf5: see body-direct branch — multicol containers
         // are atomic from the fragmenter's perspective.
         let is_multicol = crate::blitz_adapter::is_multicol_container(child);
@@ -3472,18 +3587,62 @@ fn fragment_block_subtree_inner(
         // before branch above leaves a sliver of its background behind
         // on the current page instead of moving the whole box.
         let avoid_fits_whole_page = avoid_inside && child_h <= page_height_px + 1.0;
-        let needs_recursion = !child.children.is_empty()
-            && !is_multicol
-            && (has_forced_break_below(doc, child_id, column_styles, 0)
-                || has_page_name_change_below(doc, child_id, used_page_names, 0)
-                || (!avoid_fits_whole_page
-                    && would_split_block_subtree(
-                        doc,
-                        child_id,
-                        available_strip,
-                        page_height_px,
-                        0,
-                    )));
+        let needs_recursion_at = |cursor_y: f32| {
+            let available_strip = (page_height_px - cursor_y).max(0.0);
+            !child.children.is_empty()
+                && !is_multicol
+                && (has_forced_break_below(doc, child_id, column_styles, 0)
+                    || has_page_name_change_below(doc, child_id, used_page_names, 0)
+                    || (!avoid_fits_whole_page
+                        && would_split_block_subtree(
+                            doc,
+                            child_id,
+                            available_strip,
+                            page_height_px,
+                            0,
+                        )))
+        };
+        let mut needs_recursion = needs_recursion_at(cursor_y);
+        // Entering the child in place puts its leading content on this
+        // page. When that does not fit and this walker already placed a box
+        // above it on this page, the break goes before the child (class A)
+        // and the child moves whole: there is no break point between a
+        // container's top and its first child. See
+        // `leading_unbreakable_extent`. In a flex / grid row "above" is
+        // judged where the row started, since the row's earlier cells sit
+        // beside this one.
+        let below_sibling = match row_state.as_ref() {
+            Some(rs) => rs.start_box_placed_on == Some(page_index),
+            None => box_placed_on == Some(page_index),
+        };
+        if needs_recursion
+            && below_sibling
+            && child_page_y + leading_unbreakable_extent(doc, column_styles, child_id, depth + 1)
+                > page_height_px
+        {
+            let should_emit = row_state
+                .as_mut()
+                .map(|rs| rs.emitted_parent_pages.insert(page_index))
+                .unwrap_or(true);
+            if should_emit {
+                geometry
+                    .entry(parent_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index,
+                        x: parent_x_in_body.as_px(),
+                        y: page_start_y.as_px(),
+                        width: parent_w.as_px(),
+                        height: (cursor_y - page_start_y).as_px(),
+                    });
+            }
+            page_index += 1;
+            cursor_y = 0.0;
+            page_start_y = 0.0;
+            child_page_y = 0.0;
+            needs_recursion = needs_recursion_at(cursor_y);
+        }
         if needs_recursion {
             let occupied_before_recursion = initial_page_occupied;
             let row_started_on_occupied_strip = row_state
@@ -3662,6 +3821,7 @@ fn fragment_block_subtree_inner(
                 };
             }
 
+            box_placed_on = Some(page_index);
             // Honour `break-after: page` after recursion.
             if break_after_page {
                 geometry
@@ -3767,6 +3927,7 @@ fn fragment_block_subtree_inner(
             bottom: this_top_in_parent + child_h,
             end: child_page_y + child_h,
         };
+        box_placed_on = Some(page_index);
 
         // Honour `break-after: page` after the child fragment lands
         // (and the descendant walk records same-page entries).
@@ -10382,6 +10543,34 @@ h2 { string-set: chapter-title content(text); }
         assert!(
             max_page.is_some_and(|p| p >= 2),
             "abs div at top:1600px with 800px pages should land on page 2; max_page={max_page:?}"
+        );
+    }
+
+    #[test]
+    fn flow_rows_groups_parallel_boxes_and_skips_markers() {
+        let item = |kind, top: f32, height: f32| super::FlowItem {
+            node: 0,
+            kind,
+            top,
+            height,
+        };
+        let b = super::FlowKind::Box;
+        let m = super::FlowKind::Marker;
+        let items = [
+            item(b, 0.0, 40.0),
+            // Box-less: Taffy reports it at y=0, but it is in no row.
+            item(m, 0.0, 0.0),
+            // Shorter cell beside the first one.
+            item(b, 0.0, 20.0),
+            // Starts where the tallest cell of row 0 ends.
+            item(b, 40.0, 10.0),
+            // A zero-height box at the row's bottom edge opens its own row.
+            item(b, 50.0, 0.0),
+            item(b, 50.0, f32::INFINITY),
+        ];
+        assert_eq!(
+            super::flow_rows(&items),
+            vec![Some(0), None, Some(0), Some(1), Some(2), Some(3)]
         );
     }
 

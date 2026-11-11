@@ -676,18 +676,34 @@ const fn shape(
     }
 }
 
-const FIRST_CHILD: Status = KnownBug("first child never moves");
-
 /// Measured on Prince 17 and Chrome 157, which agree to 0.1pt on every row.
 #[rustfmt::skip]
 const SHAPES: &[Shape] = &[
     // (a) The first row / first child starts 10px above the content-box
-    // bottom and must open page 2. Today it is drawn at p1 255pt, past the
-    // bottom.
-    shape("table-body", "prince", &[("ROW1", 2, 38.7), ("ROW2", 2, 68.7)], FIRST_CHILD),
-    shape("table-section", "prince", &[("ROW1", 2, 38.7), ("ROW2", 2, 68.7)], FIRST_CHILD),
-    shape("block-body", "prince", &[("FIRST", 2, 38.7), ("SECOND", 2, 53.7)], FIRST_CHILD),
-    shape("block-section", "prince", &[("FIRST", 2, 38.7), ("SECOND", 2, 53.7)], FIRST_CHILD),
+    // bottom and must open page 2: its first line does not fit, and there
+    // is no break point between a container's top and its first child, so
+    // the container moves whole. Before walker step 2 it was drawn at p1
+    // 255pt, past the bottom.
+    shape("table-body", "prince", &[("ROW1", 2, 38.7), ("ROW2", 2, 68.7)], Pass),
+    shape("table-section", "prince", &[("ROW1", 2, 38.7), ("ROW2", 2, 68.7)], Pass),
+    shape("block-body", "prince", &[("FIRST", 2, 38.7), ("SECOND", 2, 53.7)], Pass),
+    shape("block-section", "prince", &[("FIRST", 2, 38.7), ("SECOND", 2, 53.7)], Pass),
+    // The same rule one step out: what moves is the whole container, so its
+    // padding goes with it, however deep the first line sits, and a row's
+    // parallel cells move together. A replaced first child is whole.
+    shape("lead-pad-body", "prince", &[("FIRST", 2, 53.7)], Pass),
+    shape("lead-pad-section", "prince", &[("FIRST", 2, 53.7)], Pass),
+    shape("lead-nest-body", "prince", &[("FIRST", 2, 42.4)], Pass),
+    shape("lead-nest-section", "prince", &[("FIRST", 2, 42.4)], Pass),
+    shape("lead-row-body", "chrome", &[("LEFT", 2, 38.6), ("RIGHT", 2, 38.6)], Pass),
+    shape("lead-row-section", "chrome", &[("LEFT", 2, 38.6), ("RIGHT", 2, 38.6)], Pass),
+    shape("lead-svg-body", "prince", &[("AFTER", 2, 68.7)], Pass),
+    shape("lead-svg-section", "prince", &[("AFTER", 2, 68.7)], Pass),
+    // An empty box with a height has no unbreakable content: both
+    // references slice it 20px / 20px in place. It does stay on page 1
+    // here, but whole, so AFTER opens p2 20px early (37.5pt).
+    shape("lead-empty-body", "prince", &[("AFTER", 2, 53.7)], KnownBug("leaf block overflows instead of splitting")),
+    shape("lead-empty-section", "prince", &[("AFTER", 2, 53.7)], KnownBug("leaf block overflows instead of splitting")),
     // (b) A row whose tall left cell crosses the page: the short stretched
     // right cell stays at the row's top on page 1. The naive fix moved
     // RIGHT to p2.
@@ -710,7 +726,7 @@ const SHAPES: &[Shape] = &[
     shape("pad-body-padding.first", "prince", &[("FIRST", 1, 53.7)], Pass),
     // Both references split the leaf; today it is drawn whole past the
     // bottom, so SECOND opens p2 10px early (37.5pt).
-    shape("pad-body-padding.second", "prince", &[("SECOND", 2, 46.2)], FIRST_CHILD),
+    shape("pad-body-padding.second", "prince", &[("SECOND", 2, 46.2)], KnownBug("leaf block overflows instead of splitting")),
     // A childless leaf that does not fit is moved whole instead of split,
     // even when only padding is above it: page 1 is left blank today.
     shape("pad-leaf-body", "prince", &[("FIRST", 1, 53.7), ("SECOND", 2, 46.2)], KnownBug("leaf block moves instead of splitting")),
@@ -791,7 +807,31 @@ fn shape_body(shape: &str) -> String {
     .join("\n");
     let pad_lines = pad(&format!("<div>\n{fifteen}\n</div>"));
     let leaf = "<div style=\"height:290px\">FIRST</div>\n<div class=\"m\">SECOND</div>";
+    let first = r#"<div class="m">FIRST</div>"#;
+    let lead_pad = format!("<div style=\"padding-top:20px\">\n{first}\n</div>");
+    let lead_nest =
+        format!("<div><div style=\"padding-top:5px\"><div>\n{first}\n</div></div></div>");
+    let lead_row = concat!(
+        "<div style=\"display:flex\">\n",
+        "<div style=\"width:150px\"><div class=\"m\">LEFT</div></div>\n",
+        "<div style=\"width:150px\"><div class=\"m\">RIGHT</div></div>\n",
+        "</div>"
+    );
+    let lead_svg = format!(
+        "<div>\n<svg style=\"display:block;width:40px;height:40px\"><rect width=\"40\" height=\"40\"/></svg>\n{after}\n</div>"
+    );
+    let lead_empty = format!("<div>\n<div style=\"height:40px\"></div>\n{after}\n</div>");
     match shape {
+        "lead-pad-body" => format!("{}\n{lead_pad}", top(290)),
+        "lead-pad-section" => section(format!("{}\n{lead_pad}", top(290))),
+        "lead-nest-body" => format!("{}\n{lead_nest}", top(290)),
+        "lead-nest-section" => section(format!("{}\n{lead_nest}", top(290))),
+        "lead-row-body" => format!("{}\n{lead_row}", top(290)),
+        "lead-row-section" => section(format!("{}\n{lead_row}", top(290))),
+        "lead-svg-body" => format!("{}\n{lead_svg}", top(280)),
+        "lead-svg-section" => section(format!("{}\n{lead_svg}", top(280))),
+        "lead-empty-body" => format!("{}\n{lead_empty}", top(280)),
+        "lead-empty-section" => section(format!("{}\n{lead_empty}", top(280))),
         "table-body" => format!("{}\n{table}", top(290)),
         "table-section" => section(format!("{}\n{table}", top(290))),
         "block-body" => format!("{}\n{block}", top(290)),
