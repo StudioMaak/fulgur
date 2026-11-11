@@ -33,28 +33,27 @@ struct Word {
 }
 
 /// Words with their page (1-based) and bbox bottom in pt, via `pdftotext
-/// -bbox`. `None` when pdftotext is not installed, so the test skips. On Linux
-/// under `CI`, where ci.yml installs poppler-utils, a missing pdftotext fails
-/// instead; the macOS and Windows CI cells have no poppler and skip.
+/// -bbox`. `None` (the test skips) when poppler's pdftotext is not available.
 fn words(pdf: &[u8]) -> Option<Vec<Word>> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.pdf");
     std::fs::write(&path, pdf).unwrap();
+    // Only poppler's pdftotext has `-bbox`; the Windows CI cell ships xpdf's,
+    // which rejects it (exit 99). Skip whenever bbox output is unavailable,
+    // except on Linux CI, where ci.yml installs poppler-utils and a skip would
+    // hide a lost regression check.
+    let required = cfg!(target_os = "linux") && std::env::var_os("CI").is_some();
     let out = match std::process::Command::new("pdftotext")
         .arg("-bbox")
         .arg(&path)
         .arg("-")
         .output()
     {
-        Ok(out) => out,
-        Err(e) if cfg!(target_os = "linux") && std::env::var_os("CI").is_some() => {
-            panic!(
-                "pdftotext is required on Linux CI (ci.yml installs poppler-utils there only): {e}"
-            )
-        }
-        Err(_) => return None,
+        Ok(out) if out.status.success() => out,
+        Ok(out) if required => panic!("pdftotext -bbox failed on Linux CI: {out:?}"),
+        Err(e) if required => panic!("pdftotext is required on Linux CI: {e}"),
+        _ => return None,
     };
-    assert!(out.status.success(), "pdftotext failed: {out:?}");
     let html = String::from_utf8(out.stdout).unwrap();
     let mut page = 0;
     let mut words = Vec::new();
