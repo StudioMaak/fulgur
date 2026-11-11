@@ -10,7 +10,7 @@ Four bugs in a row came from one mechanism, and each fix was a local rule guesse
 |---|---|---|---|
 | 1 | forced break, then a `display:none` / running sibling, then content (vol-kap) | content placed at its unbroken offset: pushed a page on, or painted below the page | defer the re-anchor past zero-height children (`16451d6d`) |
 | 2 | forced break, then a real zero-height box with `margin-bottom` | the margin is dropped (39.6pt vs Prince 61.2pt) | defer only past `display:none` (fix3, on fork PR #6) |
-| 3 | forced break inside flex/grid, then a `display:none` sibling | content drawn on top of earlier content on the same page | none; fix3 makes this worse than base |
+| 3 | zero-height forced break inside a flex column or grid | next item drawn on top of earlier content on the same page | fold the break's page advance into `RowState.max_end_*` (fix4, on fork PR #6) |
 | 4 | `margin-bottom` on a zero-height box after a forced break, at body level | margin dropped | none; pre-existing in every version |
 
 The cause is the nested walker's model, not any one of these rules. `fragment_block_subtree_inner` places a child at `page_start_y + (location.y - page_taffy_origin)`. That is, it reconstructs page positions from one Taffy offset that must be re-picked after every break. It is re-picked from "whichever child comes next", deferred through `origin_pending_target_y` and `origin_pending_same_row`. `page_taffy_origin` has 7 assignment sites, the two pending fields 12, and `page_start_y` 14. Every special case (box-less child, zero-height box, flex row, inline split, recursion crossing a page) shifts the offset for everything after it.
@@ -88,7 +88,12 @@ The table-repeat path (`fragment_repeating_table`) feeds `_inner` cell-level chi
 
 - **Size.** `_inner` is 1103 lines, the body walker 801. The test module has 163 tests, 106 of which call a walker and many of which assert exact coordinates. Some of those assertions encode today's behaviour, not the spec's. Each changed assertion needs a reference measurement, not a rewrite to match the new output; that was the trap with the withdrawn `*_cosplit_*` rewrite.
 - **Fork divergence.** This is fork-only now. Upstream made no commits to `pagination_layout.rs` in the last sync window, so the conflict risk is low today. Upstream's effort is moving to the Raikiri backend, so this invests in the Blitz path upstream may leave.
-- **Unexplained: the flex/grid overlap.** The zero-height break-after branch does advance `page_index` (a blank trailing page appears), yet the next item is painted on the previous page. Either the flex path places it before the break takes effect, or paint ignores the item's own fragment. Find out at the start of step 2: if it is the paint side, step 2 alone won't fix it.
+- **Explained: the flex/grid overlap (bug 3) was walker-side, not paint.**
+  - In a flex column or grid every item opens a new `RowState` row.
+  - The zero-height break-after branch advanced `page_index`, but hit `continue` before the `max_end_*` update.
+  - The next item's new-row branch then restored the earlier page, and the pending re-anchor placed it at y=0 there.
+  - Render painted it faithfully from that wrong fragment.
+  - Fixed locally in fix4. Step 2 would make the shape impossible to write.
 
 ## Out of scope (found on the way, tracked here)
 
@@ -101,12 +106,23 @@ Step 0 lands now, on fork PR #6. Steps 1-4 wait until #5 and #6 are merged. Upst
 
 ## Interim state (decided 2026-11-11)
 
-Fork PR #6 carries fix3, which fixes bug 2 and matches Prince on 12 more matrix cases than fix2only. **Known gap:** it turns a flex/grid + forced break + `display:none` case from "break ignored" into "overlap" (ZZZ at 39.6pt on top of AAA, against 84.6pt on base). The vol-kap filing does not hit that shape, and step 2 is what fixes it.
+Fork PR #6 carries fix3 and fix4:
 
-Gates at fix3:
+- **fix3** fixes bug 2. It matches Prince on 12 more matrix cases than fix2only.
+- **fix4** fixes bug 3. 80 of the 84 flex/grid overlap rows now match the reference (Chrome) and are promoted to Pass. The other 4 are `margin-top` cases and carry the separate "mt30 margin-top dropped" label, like their body/section/nest2 siblings.
 
-- `cargo test -p fulgur -p fulgur-blitz -p fulgur-core`: 3006 / 0 / 10.
+The earlier known gap, where fix3 turned a flex/grid + `display:none` case into an overlap, is closed.
+
+Gates at fix4:
+
+- `cargo test -p fulgur -p fulgur-blitz -p fulgur-core`: 3009 / 0 / 10.
 - CLI tests: 59 / 0.
 - clippy and fmt: clean.
-- Fixtures: 0 of 86 moved against fix2only.
-- vol-kap: 67 pages, 0 lines past a page bottom, both headings present.
+- Fixtures: 0 of 86 moved against fix3.
+- vol-kap: 67 pages, 0 lines past a page bottom, both headings present. The output is byte-identical to fix3.
+
+Remaining known bugs in the matrix:
+
+- body-level `margin-bottom` (bug 4), 6 rows;
+- `margin-top` dropped, 10 rows;
+- float layout, 6 rows.
