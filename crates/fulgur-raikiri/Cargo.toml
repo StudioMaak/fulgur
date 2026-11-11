@@ -1,0 +1,29 @@
+[package]
+name = "fulgur-raikiri"
+version = "0.0.0"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Raikiri layout backend under development for fulgur"
+readme = "README.md"
+
+[dependencies]
+krilla = "0.7.0"
+krilla-svg = "0.7.0"
+usvg = "0.45"
+tiny-skia = "0.12"
+skrifa = "0.47"
+fulgur-core = { path = "../fulgur-core" }
+raikiri-html = { git = "https://github.com/fulgur-rs/raikiri", rev = "c18dff6156e0298a17220d07badbdd22daf35a24" }
+raikiri-net = { git = "https://github.com/fulgur-rs/raikiri", rev = "c18dff6156e0298a17220d07badbdd22daf35a24" }
+raikiri-traits = { git = "https://github.com/fulgur-rs/raikiri", rev = "c18dff6156e0298a17220d07badbdd22daf35a24" }
+url = "2.5"
+percent-encoding = "2"
+flpdf = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+lopdf = "0.45"
