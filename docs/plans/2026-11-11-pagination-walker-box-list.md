@@ -52,7 +52,7 @@ Bugs 1-4 cannot be written in this model. A box-less node is never "the previous
 
 Each step lands on its own and keeps the suite green. Each one also reports its blast radius: CLI render of every VRT manifest fixture and every example, byte-diffed against the previous step.
 
-0. **A checked-in break matrix.** Move the matrix into `crates/fulgur/tests/break_matrix.rs`. The expected page and y come from the reference engines and are written down as literals, never recomputed. Cases that fail today are `#[ignore]`d with the bug number, so every later step can un-ignore what it fixes.
+0. **A checked-in break matrix.** Move the matrix into `crates/fulgur/tests/break_matrix.rs`. The expected page and y come from the reference engines and are written down as literals, never recomputed. Cases that fail today are marked `KnownBug("<label>")`. A known bug that starts matching fails the test until its row is promoted to `Pass`, so every later step has to record what it fixes.
    - Where the references disagree (decided 2026-11-11):
      - Flex/grid forced breaks: follow Chrome and honour the break. Prince ignores it.
      - A zero-height box's `margin-top` after a forced break: follow Chrome and keep it. Prince drops it but keeps `margin-bottom`, which is inconsistent for a margin that collapses through.
@@ -63,7 +63,7 @@ Each step lands on its own and keeps the suite green. Each one also reports its 
 2. **The nested walker places by previous box.** Replace `page_taffy_origin`, `origin_pending_target_y` and `origin_pending_same_row` with `prev_end` + `gap_before`, matching the body walker. Rebuild `RowState` on the pre-computed rows.
    - Expected wins: bugs 1-3 and the flex/grid overlap cases.
    - Folds in the held-back fix on local branch `wip/first-child-occupied`: a container's first child never moves to the next page, so a table's first row in the last few px of a page is drawn past the bottom. In this model "something is already on this page" is just `prev_end > page top`. Add the reviewer's repros as matrix cases before touching it. The branch's naive flag pushed a short stretched flex/grid cell a page on (81pt gap), and gave a blank first page when only padding is above a container. Its four rewritten `*_cosplit_*` tests lost their fulgur-ysms guard; don't reuse them.
-   - Gate: matrix un-ignores those cases, suite green, and every moved fixture explained.
+   - Gate: matrix promotes those cases to `Pass`, suite green, and every moved fixture explained.
 3. **Body-level margin after a zero-height break (bug 4).** Small once step 1 exposes `margin_top` and `gap_before` on the box that actually follows the break.
 4. **Optional: one walker.** Merge body and nested into one function parameterised by `capacity(page)`. This removes the gate drift the map found:
    - multicol with `column-span:all` recurses only at body level;
