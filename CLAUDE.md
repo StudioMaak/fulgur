@@ -315,10 +315,21 @@ Three things to carry forward:
 Landed 2026-09-27 onward: `crates/fulgur-raikiri` (a complete independent layout
 backend, Raikiri for layout + Krilla for paint, no Blitz fallback) and
 `crates/fulgur-dev` (an unpublished CLI that renders through either backend for
-comparison). Both are `publish = false`, `release = false`, and excluded from fmt,
-clippy, nextest and coverage in every CI cell, behind their own non-required
-workflow. `cargo test -p fulgur` does not pull them in and the `fulgur` facade's
-public API is unchanged.
+comparison).
+
+**Since `deed6d26` (taken in the 2026-11-11 sync) `fulgur-raikiri` is published.** It
+depends on the crates.io `raikiri-*` 0.0.6 crates and is released in the same version
+group as `fulgur-core` / `fulgur-blitz`. `fulgur-dev` stays `publish = false`. What has
+*not* changed for us:
+
+- The `fulgur` facade and `fulgur-cli` still do not depend on it. Only `fulgur-dev`,
+  and `fulgur-vrt` / `fulgur-wpt` behind an optional `raikiri` feature, pull it in.
+  `cargo test -p fulgur` does not build it.
+- CI still excludes both crates from fmt, clippy, nextest and coverage in `ci.yml`.
+  They run in the separate, non-required `raikiri.yml`.
+
+So publishing makes Raikiri a real release artefact upstream, and a signal of where
+upstream is heading. It is not a dependency of anything we ship.
 
 It already beats Blitz on paged media — 116 WPT `css-page` passes against Blitz's 84,
 with 50 passing only on Raikiri — so expect upstream's attention to keep moving there.
