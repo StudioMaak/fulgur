@@ -33,17 +33,22 @@ struct Word {
 }
 
 /// Words with their page (1-based) and bbox bottom in pt, via `pdftotext
-/// -bbox`. `None` when pdftotext is not installed; CI has poppler-utils.
+/// -bbox`. `None` when pdftotext is not installed locally; under `CI` a
+/// missing pdftotext fails the test instead of silently skipping it.
 fn words(pdf: &[u8]) -> Option<Vec<Word>> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.pdf");
     std::fs::write(&path, pdf).unwrap();
-    let out = std::process::Command::new("pdftotext")
+    let out = match std::process::Command::new("pdftotext")
         .arg("-bbox")
         .arg(&path)
         .arg("-")
         .output()
-        .ok()?;
+    {
+        Ok(out) => out,
+        Err(e) if std::env::var_os("CI").is_some() => panic!("pdftotext is required in CI: {e}"),
+        Err(_) => return None,
+    };
     assert!(out.status.success(), "pdftotext failed: {out:?}");
     let html = String::from_utf8(out.stdout).unwrap();
     let mut page = 0;

@@ -2894,14 +2894,15 @@ fn fragment_block_subtree_inner(
             }
         }
 
-        // A zero-height child keeps the re-anchor pending: it is placed at
-        // `cursor_y` below, not via the origin, and a box-less one
-        // (`display: none`, a running element) reports Taffy y=0 — taking
-        // the re-anchor there would place the next real child at its
-        // unbroken offset on the new page.
-        if child_h > 0.0
-            && let Some(mut target_y) = origin_pending_target_y.take()
-        {
+        // A box-less child (`display: none`, which includes running elements
+        // after GCPM rewrites them) keeps the re-anchor pending: Taffy
+        // reports it at y=0, so taking the re-anchor there would place the
+        // next real child at its unbroken offset on the new page. A real
+        // zero-height box does take it, so its successor keeps its offset.
+        let boxless = child
+            .primary_styles()
+            .is_some_and(|s| s.clone_display().is_none());
+        if !boxless && let Some(mut target_y) = origin_pending_target_y.take() {
             if let Some((row_top, row_bottom, same_row_y)) = origin_pending_same_row.take()
                 && this_top_in_parent < row_bottom - 0.5
             {
@@ -5830,6 +5831,29 @@ mod tests {
             .map(|f| (f.page_index, f.y.to_f32()))
             .collect();
         assert_eq!(placed, vec![(1, 0.0)], "lead must open page 1");
+    }
+
+    /// A real zero-height box after the break does have a box, and so does
+    /// take the re-anchor: the next child keeps its offset from it (here the
+    /// 30px margin). Prince places the next child 30px down too.
+    #[test]
+    fn zero_height_box_after_forced_break_keeps_offset_to_next_sibling() {
+        let html = r#"<html><body style="margin:0"><section>
+              <div style="height:60px"></div>
+              <div style="height:0; break-after:page"></div>
+              <div style="height:0; margin-bottom:30px"></div>
+              <div id="lead" style="height:10px"></div>
+            </section></body></html>"#;
+        let mut doc = parse(html, 600.0);
+        let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+        let table = super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+        let lead = find_by_id(&doc, "lead").expect("lead");
+        let placed: Vec<(u32, f32)> = table[&lead]
+            .fragments
+            .iter()
+            .map(|f| (f.page_index, f.y.to_f32()))
+            .collect();
+        assert_eq!(placed, vec![(1, 30.0)], "lead keeps the 30px margin");
     }
 
     /// Find the first element node carrying `id="<id>"`.
