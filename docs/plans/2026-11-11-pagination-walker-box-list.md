@@ -27,8 +27,8 @@ The body walker (`fragment_pagination_root`) does not have this problem. It alre
 | version | matches Prince (all 210) | misses outside flex/grid (126) |
 |---|---|---|
 | base `cd9d9583` | 94 | 32 |
-| fix2only (PR #6 today) | 102 | 24 |
-| fix3 (display:none only) | 114 | 12 |
+| fix2only (`16451d6d`) | 102 | 24 |
+| fix3 (display:none only, `c29d4d0d`, PR #6) | 114 | 12 |
 
 fix3's remaining misses outside flex/grid are bug 4 (6 cases) and floats (6 cases). The float misses are a layout issue, not a pagination one: ZZZ goes below a float instead of beside it, even with no break at all. No version painted text past the content box in any case.
 
@@ -56,7 +56,7 @@ Each step lands on its own and keeps the suite green. Each one also reports its 
    - Decide the two cases where the references disagree, here and once:
      - Flex/grid forced breaks: follow Chrome. Prince ignores the break.
      - A zero-height box's `margin-top` after a forced break: follow Chrome and keep it. Prince drops it but keeps `margin-bottom`, which is inconsistent for a margin that collapses through.
-   - Also fix the CodeRabbit point here: tests that shell out to `pdftotext` fail when `CI` is set instead of silently passing.
+   - Use the same `pdftotext` helper as `content_past_page_bottom.rs`: it skips locally when pdftotext is missing and fails under `CI`.
 1. **The flow-list pre-pass, with no behaviour change.** Add `flow_items(doc, parent) -> Vec<FlowItem>`. Have the body walker, the nested walker, `would_split_block_subtree` and `has_page_name_change_below` iterate it instead of the raw children.
    - Gate: 0 fixtures moved, suite unchanged, matrix unchanged.
 2. **The nested walker places by previous box.** Replace `page_taffy_origin`, `origin_pending_target_y` and `origin_pending_same_row` with `prev_end` + `gap_before`, matching the body walker. Rebuild `RowState` on the pre-computed rows.
