@@ -53,14 +53,16 @@ Bugs 1-4 cannot be written in this model. A box-less node is never "the previous
 Each step lands on its own and keeps the suite green. Each one also reports its blast radius: CLI render of every VRT manifest fixture and every example, byte-diffed against the previous step.
 
 0. **A checked-in break matrix.** Move the matrix into `crates/fulgur/tests/break_matrix.rs`. The expected page and y come from the reference engines and are written down as literals, never recomputed. Cases that fail today are `#[ignore]`d with the bug number, so every later step can un-ignore what it fixes.
-   - Decide the two cases where the references disagree, here and once:
-     - Flex/grid forced breaks: follow Chrome. Prince ignores the break.
+   - Where the references disagree (decided 2026-11-11):
+     - Flex/grid forced breaks: follow Chrome and honour the break. Prince ignores it.
      - A zero-height box's `margin-top` after a forced break: follow Chrome and keep it. Prince drops it but keeps `margin-bottom`, which is inconsistent for a margin that collapses through.
+     - Running elements: Chrome does not implement them, so expect the same position as the `display:none` case.
    - Use the same `pdftotext` helper as `content_past_page_bottom.rs`: it skips locally when pdftotext is missing and fails under `CI`.
 1. **The flow-list pre-pass, with no behaviour change.** Add `flow_items(doc, parent) -> Vec<FlowItem>`. Have the body walker, the nested walker, `would_split_block_subtree` and `has_page_name_change_below` iterate it instead of the raw children.
    - Gate: 0 fixtures moved, suite unchanged, matrix unchanged.
 2. **The nested walker places by previous box.** Replace `page_taffy_origin`, `origin_pending_target_y` and `origin_pending_same_row` with `prev_end` + `gap_before`, matching the body walker. Rebuild `RowState` on the pre-computed rows.
    - Expected wins: bugs 1-3 and the flex/grid overlap cases.
+   - Folds in the held-back fix on local branch `wip/first-child-occupied`: a container's first child never moves to the next page, so a table's first row in the last few px of a page is drawn past the bottom. In this model "something is already on this page" is just `prev_end > page top`. Add the reviewer's repros as matrix cases before touching it. The branch's naive flag pushed a short stretched flex/grid cell a page on (81pt gap), and gave a blank first page when only padding is above a container. Its four rewritten `*_cosplit_*` tests lost their fulgur-ysms guard; don't reuse them.
    - Gate: matrix un-ignores those cases, suite green, and every moved fixture explained.
 3. **Body-level margin after a zero-height break (bug 4).** Small once step 1 exposes `margin_top` and `gap_before` on the box that actually follows the break.
 4. **Optional: one walker.** Merge body and nested into one function parameterised by `capacity(page)`. This removes the gate drift the map found:
@@ -87,6 +89,15 @@ The table-repeat path (`fragment_repeating_table`) feeds `_inner` cell-level chi
 - **Size.** `_inner` is 1103 lines, the body walker 801. The test module has 163 tests, 106 of which call a walker and many of which assert exact coordinates. Some of those assertions encode today's behaviour, not the spec's. Each changed assertion needs a reference measurement, not a rewrite to match the new output; that was the trap with the withdrawn `*_cosplit_*` rewrite.
 - **Fork divergence.** This is fork-only now. Upstream made no commits to `pagination_layout.rs` in the last sync window, so the conflict risk is low today. Upstream's effort is moving to the Raikiri backend, so this invests in the Blitz path upstream may leave.
 - **Unexplained: the flex/grid overlap.** The zero-height break-after branch does advance `page_index` (a blank trailing page appears), yet the next item is painted on the previous page. Either the flex path places it before the break takes effect, or paint ignores the item's own fragment. Find out at the start of step 2: if it is the paint side, step 2 alone won't fix it.
+
+## Out of scope (found on the way, tracked here)
+
+- **Floats.** Content after a left float goes below it instead of beside it, with no break involved (ZZZ at 92.1pt vs Prince and Chrome beside the float). This is a layout or paint issue, not pagination. It shows up as 6 matrix misses.
+- **Flex rows with multi-line paragraph cells** lose or desync lines when the row crosses a page, before and after every fix here.
+
+## Timing (decided 2026-11-11)
+
+Step 0 lands now, on fork PR #6. Steps 1-4 wait until #5 and #6 are merged. Upstream #959 is closed: no upstream PRs for now.
 
 ## Interim state (decided 2026-11-11)
 
