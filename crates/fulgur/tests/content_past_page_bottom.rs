@@ -33,8 +33,9 @@ struct Word {
 }
 
 /// Words with their page (1-based) and bbox bottom in pt, via `pdftotext
-/// -bbox`. `None` when pdftotext is not installed locally; under `CI` a
-/// missing pdftotext fails the test instead of silently skipping it.
+/// -bbox`. `None` when pdftotext is not installed, so the test skips. On Linux
+/// under `CI`, where ci.yml installs poppler-utils, a missing pdftotext fails
+/// instead; the macOS and Windows CI cells have no poppler and skip.
 fn words(pdf: &[u8]) -> Option<Vec<Word>> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("out.pdf");
@@ -46,7 +47,11 @@ fn words(pdf: &[u8]) -> Option<Vec<Word>> {
         .output()
     {
         Ok(out) => out,
-        Err(e) if std::env::var_os("CI").is_some() => panic!("pdftotext is required in CI: {e}"),
+        Err(e) if cfg!(target_os = "linux") && std::env::var_os("CI").is_some() => {
+            panic!(
+                "pdftotext is required on Linux CI (ci.yml installs poppler-utils there only): {e}"
+            )
+        }
         Err(_) => return None,
     };
     assert!(out.status.success(), "pdftotext failed: {out:?}");
