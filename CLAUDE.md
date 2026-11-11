@@ -256,6 +256,29 @@ Three mechanical traps these syncs exposed, all worth repeating next time:
   **After a sync, diff the test inventory, not just the build:**
   `git diff <premerge>..HEAD -- '*.rs' | grep "^-.*fn .*("` and read what left.
 
+#### Upstream sync, 2026-11-11
+
+99 commits since `efb88937`, merged at `bd6222fe`. The Blitz library diff is nine
+files, and eight are test-only. The one behaviour change is **`bd59747c`
+(breaking): `@page` margin boxes resolve `counter()` / `counters()` for `page` and
+`pages` only, and every other name to 0** — matching Chromium and Raikiri; the
+documented route to a chapter number in a header is `string-set` + `string()`.
+paperworx templates use no document counters in margin boxes (searched), and none
+of our GCPM patches touch `gcpm/counter.rs`, so nothing of ours moved. Blast radius
+over 86 fixtures and examples: only `gcpm/counter-page-numbers`; vol-kap
+byte-identical.
+
+What it was actually for: the pinned `fonts.conf` stopped including the system
+config and the Blitz goldens were re-cut on bundled Noto (see *Baselines*).
+Upstream also now **publishes `fulgur-raikiri`** (`deed6d26`); the "walled off"
+section below predates that.
+
+Trap hit: every binary conflict (22 goldens, 3 example PDFs) was a fixture the fork
+had already re-blessed for its own fixes. Taking upstream's copy makes VRT fail on
+exactly those 22; regenerate them in the container (`FULGUR_VRT_UPDATE=failing`)
+rather than keeping ours, which carry the old fonts. The forced-break margin policy
+did not re-conflict: upstream touched `pagination_layout.rs` only in a doc comment.
+
 #### usvg reads local files, and our base-path confinement never sees it
 
 Closed upstream 2026-10-21 (`0b167cad`, `234ee3d3`, `80b129f6`, `87bfffb2`,
@@ -340,7 +363,9 @@ understates the suite:
 | revision | `-p fulgur -p fulgur-blitz -p fulgur-core` | `-p fulgur-cli` |
 |---|---|---|
 | after the GCPM work (2026-09-11) | 2753 / 0 / 10 | 57 / 0 |
-| **after the 2026-10-21 upstream sync** | **3003 / 0 / 10** (67 binaries) | **59 / 0** |
+| after the 2026-10-21 upstream sync | 3003 / 0 / 10 (67 binaries) | 59 / 0 |
+| pagination fixes + break matrix (`28db2b60`) | 3008 / 0 / 10 (69 binaries) | 59 / 0 |
+| **after the 2026-11-11 upstream sync** | **3035 / 0 / 10** (69 binaries) | **59 / 0** |
 
 **`examples_determinism` does not validate the committed example PDFs.** Its 10 tests
 render each example *twice* and compare the two runs to each other, so they prove
@@ -367,11 +392,16 @@ residual.
 
 `FONTCONFIG_FILE` does not save you here — it is a **proven no-op on macOS** (rendering is
 byte-identical with and without it), because fontconfig is not macOS's font mechanism.
-Note also that the goldens embed **DejaVuSans**, not the bundled Noto Sans the pinned
-`fonts.conf` asks for, so VRT's determinism actually rests on the runner image's default
-font rather than on the bundled set. A runner image bump would break every text fixture at
-once. `gcpm_snapshot.rs` shows the robust alternative: it injects Noto via
+`gcpm_snapshot.rs` shows the robust alternative: it injects Noto via
 `AssetBundle::add_font_file`, and its 19 byte-exact goldens pass unmodified on macOS.
+
+**Since the 2026-11-11 sync the goldens embed the bundled Noto set, not DejaVu.**
+Upstream's `b9537fb2` dropped the `/etc/fonts` include from `fonts.conf`, so only
+`examples/.fonts` is visible, and `75e5f70d` re-cut the goldens on it (verified with
+`pdffonts`: NotoSans / NotoSansMono only). The DejaVu package-revision table above is
+therefore history — the runner image's default font should no longer reach the
+output. Unverified whether `debian:bookworm` now reproduces too; keep using the
+`ubuntu:24.04` recipe until someone measures it. `FONTCONFIG_FILE` must be absolute.
 
 To run VRT (~2 min, mostly the build):
 
