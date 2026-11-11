@@ -506,6 +506,7 @@ impl Engine {
                 if let Some(map) = anchor_map {
                     pass = pass.with_anchor_map(map.clone());
                 }
+                pass = pass.with_running_nodes(running_store.node_ids().collect());
                 crate::blitz_adapter::apply_single_pass(&pass, &mut doc, &ctx);
                 let snapshots = pass.take_node_snapshots();
                 let (ops, css) = pass.into_parts();
