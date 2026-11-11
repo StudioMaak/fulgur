@@ -1851,23 +1851,81 @@ struct RowState {
     start_page: u32,
     start_cursor_y: f32,
     start_page_start_y: f32,
-    start_page_taffy_origin: f32,
+    start_prev: PrevBox,
+    start_at_page_top: bool,
+    start_margin_after_forced_break: bool,
     start_initial_page_occupied: bool,
     started_on_occupied_strip: bool,
     max_end_page: u32,
     max_end_cursor_y: f32,
-    /// Taffy `location.y` of the first cell in this row (reserved for future use).
-    _row_top: f32,
-    /// Max `location.y + height` seen across cells in this row.
-    row_bottom: f32,
+    /// The cell that reached `max_end_*`: the next row is placed after it.
+    max_end_prev: PrevBox,
+    /// This row's index in [`flow_rows`].
+    row: usize,
     /// Pages for which a parent fragment has already been emitted this row,
     /// to avoid duplicate entries when multiple cells cross the same boundary.
     emitted_parent_pages: BTreeSet<u32>,
     /// True when at least one cell in this row has crossed a page boundary via
     /// recursion. Only in this case do subsequent same-row cells need the full
-    /// state-restore (co-split); non-recursion page advances are already handled
-    /// by the existing `origin_pending_same_row` mechanism.
+    /// state-restore (co-split); after a non-recursion page advance the later
+    /// cells simply continue from the cell that moved.
     crossed_by_recursion: bool,
+}
+
+/// The box a walker placed last, in both coordinate systems: `bottom` is
+/// its Taffy parent-relative bottom edge, `end` the page-local y where it
+/// ended on the current page. The next box goes at [`PrevBox::place`], so
+/// the inter-box gap (collapsed margins, flex/grid gaps, the parent's
+/// padding before its first child) comes from Taffy and the position from
+/// what was actually placed. Same model as `fragment_pagination_root`'s
+/// `cursor_y + gap`.
+#[derive(Clone, Copy, Debug)]
+struct PrevBox {
+    bottom: f32,
+    end: f32,
+}
+
+impl PrevBox {
+    /// Page-local y for a box whose Taffy parent-relative top is `top`.
+    /// The gap may be negative (overlapping siblings, a later cell of the
+    /// same flex/grid row), which places the box back up beside or over
+    /// the previous one, exactly as Taffy laid it out.
+    fn place(self, top: f32) -> f32 {
+        self.end + (top - self.bottom)
+    }
+}
+
+/// The flex/grid row of each item in `items`: `None` for a
+/// [`FlowKind::Marker`], which has no box and so sits in no row. A box
+/// opens a new row when its top is at or below the lowest bottom seen in
+/// the current row (0.5px tolerance).
+fn flow_rows(items: &[FlowItem]) -> Vec<Option<usize>> {
+    let mut row = 0usize;
+    let mut row_bottom: Option<f32> = None;
+    items
+        .iter()
+        .map(|item| {
+            if item.kind == FlowKind::Marker {
+                return None;
+            }
+            let h = if item.height.is_finite() {
+                item.height
+            } else {
+                0.0
+            };
+            match row_bottom {
+                Some(bottom) if item.top < bottom - 0.5 => {
+                    row_bottom = Some(bottom.max(item.top + h));
+                }
+                Some(_) => {
+                    row += 1;
+                    row_bottom = Some(item.top + h);
+                }
+                None => row_bottom = Some(item.top + h),
+            }
+            Some(row)
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -2730,28 +2788,24 @@ fn fragment_block_subtree_inner(
     // starts. We close one parent fragment and start a new one each
     // time we cross a page boundary.
     let mut page_start_y = cursor_in;
-    // fulgur-kv0r: parent-relative y of the first in-flow child on
-    // the current page strip. Taffy's `layout.location.y` is in the
-    // parent's full coordinate system (same value across page
-    // splits); each child's page-local y becomes
-    // `page_start_y + (this_top_in_parent - page_taffy_origin)`,
-    // which gives:
-    // - block siblings: sequential placement (same as cursor-advance)
-    // - grid / flex parallel siblings: same y (Taffy reports same
-    //   `location.y` for cards in the same row, so the offset
-    //   collapses to the row's first y).
-    let mut page_taffy_origin = initial_taffy_origin;
-    let mut origin_pending_target_y: Option<f32> = None;
-    let mut origin_pending_same_row: Option<(f32, f32, f32)> = None;
-    // Set by every `break-after: page` advance below, consumed by the next
-    // child that generates a box on the new strip. It is deliberately NOT
-    // folded into `origin_pending_target_y`: that value is computed at the
-    // break, where the box whose margin §5.4 preserves is not yet known,
-    // and it is consumed by zero-height children — a `display: none`
-    // sibling generates no box, so it is not "the box after the break".
-    // This one is consumed past the `child_h <= 0.0` branch instead, which
-    // mirrors `fragment_pagination_root`, whose zero-height children
-    // `continue` before the gap fold for the same reason.
+    // The previous box. Before the first child it is the parent's own
+    // start: `initial_taffy_origin` (0 for a plain container, so the first
+    // child's `location.y` is the parent's padding + border) maps to
+    // `cursor_in`.
+    let mut prev = PrevBox {
+        bottom: initial_taffy_origin,
+        end: cursor_in,
+    };
+    // Set by every forced page advance that leaves the *next* box to open
+    // the new page (`break-after: page`); that box goes at the page top
+    // instead of after `prev`. A `display: none` sibling generates no box,
+    // so it does not consume this.
+    let mut at_page_top = false;
+    // Set together with `at_page_top` by a `break-after: page`, consumed by
+    // the next box with a non-zero height: it keeps its own collapsed
+    // block-start margin (css-break-3 §5.4). Mirrors
+    // `fragment_pagination_root`, whose zero-height children `continue`
+    // before the gap fold.
     let mut margin_after_forced_break = false;
     // fulgur-uebl: tracks the previous in-flow sibling's used page-name
     // for implicit forced-break detection; see `fragment_pagination_root`
@@ -2806,7 +2860,12 @@ fn fragment_block_subtree_inner(
         Some(ids) => flow_items_of(doc, ids),
         None => flow_items_of(doc, &flow_child_ids(parent)),
     };
-    for item in items {
+    let rows = if allow_same_row_rebase {
+        flow_rows(&items)
+    } else {
+        vec![None; items.len()]
+    };
+    for (item, row) in items.into_iter().zip(rows) {
         let child_id = item.node;
         let Some(child) = doc.get_node(child_id) else {
             continue;
@@ -2855,62 +2914,43 @@ fn fragment_block_subtree_inner(
             Some(crate::draw_primitives::BreakAfter::Page)
         );
 
-        // Compute Taffy parent-relative top early — both the zero-
-        // height path below and the non-zero path further down use
-        // it (and break-before / break-after rebases the
-        // `page_taffy_origin` against it on page advance).
+        // Taffy parent-relative top.
         let this_top_in_parent = layout.location.y;
 
-        // fulgur-ysms: row-level co-split for flex/grid containers.
-        // Must run BEFORE origin_pending_target_y is consumed so that
-        // restoring page_taffy_origin is consistent.
-        if allow_same_row_rebase {
-            let same_row = row_state
-                .as_ref()
-                .map(|rs| this_top_in_parent < rs.row_bottom - 0.5);
-            match same_row {
-                Some(true) => {
-                    let rs = row_state.as_ref().unwrap();
-                    if rs.crossed_by_recursion {
-                        // Co-split: a previous cell in this row crossed a page
-                        // boundary via recursion. Restore to the row-start state
-                        // so this cell's recursion begins at the same (page,
-                        // cursor) — both cells will independently fragment and
-                        // their results are merged via max_end_*.
-                        //
-                        // Also clear origin_pending_* set by the previous cell's
-                        // recursion: the restored page_taffy_origin is the one
-                        // that puts THIS cell at the correct row-start y, and the
-                        // previous cell's pending origin would incorrectly shift
-                        // page_taffy_origin again.
-                        page_index = rs.start_page;
-                        cursor_y = rs.start_cursor_y;
-                        page_start_y = rs.start_page_start_y;
-                        page_taffy_origin = rs.start_page_taffy_origin;
-                        initial_page_occupied = rs.start_initial_page_occupied;
-                        origin_pending_target_y = None;
-                        origin_pending_same_row = None;
-                    }
-                    // If crossed_by_recursion is false (e.g., a previous cell
-                    // crossed via the non-recursion strip-overflow path), the
-                    // existing origin_pending_same_row mechanism already handles
-                    // correct placement — no additional restore is needed.
+        // fulgur-ysms: row-level co-split for flex/grid containers. Rows
+        // come from `flow_rows`; a box-less child is in none and leaves the
+        // open row alone.
+        if let Some(row) = row {
+            if row_state.as_ref().is_some_and(|rs| rs.row == row) {
+                let rs = row_state.as_ref().unwrap();
+                if rs.crossed_by_recursion {
+                    // Co-split: a previous cell in this row crossed a page
+                    // boundary via recursion. Restore to the row-start state
+                    // so this cell's recursion begins at the same (page,
+                    // cursor) — both cells will independently fragment and
+                    // their results are merged via max_end_*.
+                    page_index = rs.start_page;
+                    cursor_y = rs.start_cursor_y;
+                    page_start_y = rs.start_page_start_y;
+                    prev = rs.start_prev;
+                    at_page_top = rs.start_at_page_top;
+                    margin_after_forced_break = rs.start_margin_after_forced_break;
+                    initial_page_occupied = rs.start_initial_page_occupied;
                 }
-                Some(false) => {
-                    // New row: advance outer cursor to the max end reached
-                    // across all cells in the previous row.
-                    let rs = row_state.take().unwrap();
-                    page_index = rs.max_end_page;
-                    cursor_y = rs.max_end_cursor_y;
-                    if rs.max_end_page > rs.start_page {
-                        page_start_y = 0.0;
-                        origin_pending_target_y = Some(rs.max_end_cursor_y);
-                        origin_pending_same_row = None;
-                    } else {
-                        page_start_y = rs.start_page_start_y;
-                    }
-                }
-                None => {}
+                // Otherwise the cell continues from the previous one: same
+                // row means same Taffy top, so `prev.place` puts it beside
+                // that cell, on whichever page that cell ended up.
+            } else if let Some(rs) = row_state.take() {
+                // New row: continue after the cell that reached furthest in
+                // the previous row.
+                page_index = rs.max_end_page;
+                cursor_y = rs.max_end_cursor_y;
+                prev = rs.max_end_prev;
+                page_start_y = if rs.max_end_page > rs.start_page {
+                    0.0
+                } else {
+                    rs.start_page_start_y
+                };
             }
             if row_state.is_none() {
                 // First cell in a new row: snapshot current state.
@@ -2918,36 +2958,22 @@ fn fragment_block_subtree_inner(
                     start_page: page_index,
                     start_cursor_y: cursor_y,
                     start_page_start_y: page_start_y,
-                    start_page_taffy_origin: page_taffy_origin,
+                    start_prev: prev,
+                    start_at_page_top: at_page_top,
+                    start_margin_after_forced_break: margin_after_forced_break,
                     start_initial_page_occupied: initial_page_occupied,
                     started_on_occupied_strip: initial_page_occupied,
                     max_end_page: page_index,
                     max_end_cursor_y: cursor_y,
-                    _row_top: this_top_in_parent,
-                    row_bottom: this_top_in_parent + child_h,
+                    max_end_prev: prev,
+                    row,
                     emitted_parent_pages: BTreeSet::new(),
                     crossed_by_recursion: false,
                 });
-            } else if let Some(ref mut rs) = row_state {
-                rs.row_bottom = rs.row_bottom.max(this_top_in_parent + child_h);
             }
         }
 
-        // A box-less child (`display: none`, which includes running elements
-        // after GCPM rewrites them) keeps the re-anchor pending: Taffy
-        // reports it at y=0, so taking the re-anchor there would place the
-        // next real child at its unbroken offset on the new page. A real
-        // zero-height box does take it, so its successor keeps its offset.
-        let boxless = item.kind == FlowKind::Marker;
-        if !boxless && let Some(mut target_y) = origin_pending_target_y.take() {
-            if let Some((row_top, row_bottom, same_row_y)) = origin_pending_same_row.take()
-                && this_top_in_parent < row_bottom - 0.5
-            {
-                target_y = same_row_y + (this_top_in_parent - row_top);
-            }
-            page_taffy_origin = this_top_in_parent - (target_y - page_start_y);
-        }
-
+        let is_box = item.kind == FlowKind::Box;
         if child_h <= 0.0 {
             // Phase 2.3 fix: zero-height **element** nodes still
             // need to enter geometry so their counter / string-set
@@ -2972,10 +2998,34 @@ fn fragment_block_subtree_inner(
                 page_index += 1;
                 cursor_y = 0.0;
                 page_start_y = 0.0;
-                // Zero-height break-before: this child IS the first
-                // on the new page — apply origin rebase eagerly.
-                page_taffy_origin = this_top_in_parent;
-                (origin_pending_target_y, origin_pending_same_row) = (None, None);
+                // Zero-height break-before: this child opens the new page.
+                // A box-less one leaves that to the next box.
+                at_page_top = true;
+            }
+            if is_box {
+                // A real zero-height box is placed like any other and is
+                // the previous box for its successor, which so keeps its
+                // gap to it (the box's own `margin-bottom`). A box-less
+                // child (`display: none`, which includes running elements
+                // after GCPM rewrites them) is never the previous box:
+                // Taffy reports it at y=0.
+                let y = if std::mem::take(&mut at_page_top) {
+                    page_start_y
+                } else {
+                    prev.place(this_top_in_parent)
+                };
+                prev = PrevBox {
+                    bottom: this_top_in_parent,
+                    end: y,
+                };
+                // It never moves the row's end, but when the row ends
+                // here it is the box the next row follows.
+                if let Some(ref mut rs) = row_state
+                    && page_index == rs.max_end_page
+                    && cursor_y >= rs.max_end_cursor_y
+                {
+                    rs.max_end_prev = prev;
+                }
             }
             if child.element_data().is_some() {
                 geometry
@@ -3008,9 +3058,8 @@ fn fragment_block_subtree_inner(
                 page_index += 1;
                 cursor_y = 0.0;
                 page_start_y = 0.0;
-                // Zero-height break-after: NEXT child is the first
-                // on the new page — defer origin rebase.
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                // Zero-height break-after: the NEXT box opens the new page.
+                at_page_top = true;
                 margin_after_forced_break = true;
                 // In a flex/grid container the next item opens a new row and
                 // restores `max_end_*`; without this the break's page advance
@@ -3020,6 +3069,7 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
+                    rs.max_end_prev = prev;
                 }
             }
             if !is_float {
@@ -3028,26 +3078,25 @@ fn fragment_block_subtree_inner(
             continue;
         }
 
-        // fulgur-kv0r: place the child at its Taffy-reported parent-
-        // relative y, offset by the parent's start on the current
-        // page (`page_start_y`) and rebased against
-        // `page_taffy_origin` so the first child on each page strip
-        // lands at `page_start_y` regardless of its absolute parent
-        // y. For grid / flex parallel siblings (same `location.y`),
-        // this places them at the same page-local y; for sequential
-        // block flow, it matches Taffy's stacked positions exactly.
-        let mut child_page_y = page_start_y + (this_top_in_parent - page_taffy_origin);
-        // This child is the first box after a forced `break-after`, so it
-        // keeps its own collapsed block-start margin (css-break-3 §5.4).
-        // Taffy folds a margin that collapsed through into its parent, so
-        // `location.y` can be 0 here while `margin.top` still names the
-        // retained value — which is why the margin is read rather than
-        // derived from the sibling gap. `page_taffy_origin` moves with it
-        // so the following siblings keep their spacing.
+        // Place the child after the previous box, keeping Taffy's gap
+        // between the two. For grid / flex parallel siblings (same
+        // `location.y`) the gap is minus the previous cell's height, which
+        // puts them at the same page-local y; for sequential block flow it
+        // matches Taffy's stacked positions exactly. The first box after a
+        // `break-after: page` opens the new page instead.
+        let mut child_page_y = if std::mem::take(&mut at_page_top) {
+            page_start_y
+        } else {
+            prev.place(this_top_in_parent)
+        };
+        // This child is the first box with a height after a forced
+        // `break-after`, so it keeps its own collapsed block-start margin
+        // (css-break-3 §5.4). Taffy folds a margin that collapsed through
+        // into its parent, so `location.y` can be 0 here while `margin.top`
+        // still names the retained value — which is why the margin is read
+        // rather than derived from the sibling gap.
         if std::mem::take(&mut margin_after_forced_break) {
-            let retained = retained_margin_after_forced_break(&layout);
-            page_taffy_origin -= retained;
-            child_page_y += retained;
+            child_page_y += retained_margin_after_forced_break(&layout);
         }
         // Update the cursor only when the child's bottom advances
         // past it. For block flow this matches cursor advancing by
@@ -3075,15 +3124,14 @@ fn fragment_block_subtree_inner(
             page_index += 1;
             page_start_y = 0.0;
             // The breaking child is the first in-flow child on the
-            // new page strip. Rebase the Taffy origin so it lands at
-            // `page_start_y` (= 0) **plus its own block-start margin**:
+            // new page strip. It lands at `page_start_y` (= 0) **plus its
+            // own block-start margin**:
             // css-break-3 §5.4 truncates the margins adjoining the break on
             // the before side (the previous sibling's `margin-bottom`, which
             // is the rest of the inter-child gap) but preserves the ones
             // after it. See `retained_margin_after_forced_break` — the
             // comment this replaces read §5.4 as truncating both sides.
             let retained = retained_margin_after_forced_break(&layout);
-            page_taffy_origin = this_top_in_parent - retained;
             cursor_y = retained;
             child_page_y = retained;
         }
@@ -3191,7 +3239,7 @@ fn fragment_block_subtree_inner(
                             // (`row_state.is_some()`, gated the same way
                             // `should_emit` above is): a later same-row
                             // sibling cell can restore this same page
-                            // (`origin_pending_same_row`) and paint past
+                            // (the row-start restore) and paint past
                             // `cursor_y`, so the parent fragment must
                             // already cover the whole strip to avoid a gap
                             // under that restored content. Outside a row
@@ -3213,16 +3261,8 @@ fn fragment_block_subtree_inner(
                 }
                 page_index += 1;
                 page_start_y = 0.0;
-                // codex P1 (fulgur-2s7p.1 follow-up): this child is
-                // the first in-flow child on the new page strip —
-                // rebase `page_taffy_origin` to its own top, mirroring
-                // `break_before_page`'s rebase above. Without this,
-                // `new_page_index == pre_split_page` below can't tell
-                // this split-before advance happened, so the
-                // same-row / origin-pending bookkeeping is skipped and
-                // the next sibling computes `child_page_y` from the
-                // stale pre-advance origin.
-                page_taffy_origin = this_top_in_parent;
+                // This child is the first in-flow child on the new
+                // page strip.
                 child_page_y = 0.0;
             }
             let pre_split_page = page_index;
@@ -3288,8 +3328,19 @@ fn fragment_block_subtree_inner(
                     }
                 }
                 page_start_y = 0.0;
-                origin_pending_target_y = Some(new_cursor_y);
             }
+            // The next sibling follows this paragraph's box: its Taffy
+            // bottom maps to where the paragraph ended. On the page it
+            // started on that is its full box; after a split it is the end
+            // of its last line.
+            prev = PrevBox {
+                bottom: this_top_in_parent + child_h,
+                end: if new_page_index == pre_split_page {
+                    child_page_y + child_h
+                } else {
+                    new_cursor_y
+                },
+            };
             // CodeRabbit + codex P1: mirror the recursion branch's
             // same-row co-split bookkeeping (fulgur-ysms). Gated on
             // `entry_page_index` (captured before split-before), not
@@ -3299,20 +3350,15 @@ fn fragment_block_subtree_inner(
             // `pre_split_page`) still marks the row as crossed. Without
             // this, a multi-line `<p>` that is a grid/flex row's item
             // and crosses a page boundary — via either path — leaves
-            // `origin_pending_same_row` unset and `row_state`'s
-            // `crossed_by_recursion` false, so the row's *next*
+            // `row_state`'s `crossed_by_recursion` false, so the row's *next*
             // parallel item doesn't restore to the row-start state — it
             // gets placed after this paragraph's last fragment instead
             // of beside it, and the earlier-page row content is lost
             // for that sibling.
-            if new_page_index > entry_page_index {
-                let row_top = this_top_in_parent;
-                let row_bottom = row_top + child_h;
-                origin_pending_same_row =
-                    allow_same_row_rebase.then_some((row_top, row_bottom, 0.0));
-                if let Some(ref mut rs) = row_state {
-                    rs.crossed_by_recursion = true;
-                }
+            if new_page_index > entry_page_index
+                && let Some(ref mut rs) = row_state
+            {
+                rs.crossed_by_recursion = true;
             }
             page_index = new_page_index;
             // codex P2: mirror the recursion branch's fulgur-u0p0
@@ -3332,7 +3378,7 @@ fn fragment_block_subtree_inner(
             // split-before pre-check above fired, `cursor_y` still
             // holds its *stale pre-advance* value (the position before
             // the fresh-page rebase), since that block resets
-            // `page_start_y` / `page_taffy_origin` / `child_page_y` but
+            // `page_start_y` / `child_page_y` but
             // deliberately leaves `cursor_y` untouched (only the
             // grid/flex-row path needs it preserved across the
             // rebase). Taking `.max()` against that stale value here
@@ -3385,7 +3431,8 @@ fn fragment_block_subtree_inner(
                 page_index += 1;
                 cursor_y = 0.0;
                 page_start_y = 0.0;
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                at_page_top = true;
+                margin_after_forced_break = true;
             }
             if let Some(ref mut rs) = row_state {
                 if page_index > rs.max_end_page
@@ -3393,6 +3440,7 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
+                    rs.max_end_prev = prev;
                 }
             }
             continue;
@@ -3595,16 +3643,23 @@ fn fragment_block_subtree_inner(
                     }
                 }
                 page_start_y = 0.0;
-                origin_pending_target_y = Some(cursor_y);
-                let row_top = this_top_in_parent;
-                let row_bottom = row_top + child_h;
-                origin_pending_same_row =
-                    allow_same_row_rebase.then_some((row_top, row_bottom, 0.0));
+                // The next sibling follows where the child's content ended
+                // on the page the recursion left us on.
+                prev = PrevBox {
+                    bottom: this_top_in_parent + child_h,
+                    end: cursor_y,
+                };
                 // fulgur-ysms: mark that this row had a recursion-driven page
                 // cross so subsequent same-row cells know to co-split.
                 if let Some(ref mut rs) = row_state {
                     rs.crossed_by_recursion = true;
                 }
+            } else {
+                // Same page: the child's box ends where Taffy put it.
+                prev = PrevBox {
+                    bottom: this_top_in_parent + child_h,
+                    end: child_page_y + child_h,
+                };
             }
 
             // Honour `break-after: page` after recursion.
@@ -3623,7 +3678,7 @@ fn fragment_block_subtree_inner(
                 page_index += 1;
                 cursor_y = 0.0;
                 page_start_y = 0.0;
-                (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+                at_page_top = true;
                 margin_after_forced_break = true;
             }
             if !is_float {
@@ -3635,6 +3690,7 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
+                    rs.max_end_prev = prev;
                 }
             }
             continue;
@@ -3670,10 +3726,8 @@ fn fragment_block_subtree_inner(
             page_index += 1;
             cursor_y = 0.0;
             page_start_y = 0.0;
-            // Forced to a fresh page: rebase the Taffy origin so the
-            // current child lands at page_start_y. Sequential siblings
-            // then continue from this point.
-            page_taffy_origin = this_top_in_parent;
+            // Moved to a fresh page: the child lands at page_start_y.
+            // Sequential siblings then continue from it.
             child_page_y = 0.0;
         }
         initial_page_occupied = false;
@@ -3709,6 +3763,10 @@ fn fragment_block_subtree_inner(
         // `cursor_y` to `max(cursor_y, child_page_y + child_h)` —
         // the per-row max bottom).
         cursor_y = cursor_y.max(child_page_y + child_h);
+        prev = PrevBox {
+            bottom: this_top_in_parent + child_h,
+            end: child_page_y + child_h,
+        };
 
         // Honour `break-after: page` after the child fragment lands
         // (and the descendant walk records same-page entries).
@@ -3727,7 +3785,7 @@ fn fragment_block_subtree_inner(
             page_index += 1;
             cursor_y = 0.0;
             page_start_y = 0.0;
-            (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
+            at_page_top = true;
             margin_after_forced_break = true;
         }
         if !is_float {
@@ -3739,6 +3797,7 @@ fn fragment_block_subtree_inner(
             {
                 rs.max_end_page = page_index;
                 rs.max_end_cursor_y = cursor_y;
+                rs.max_end_prev = prev;
             }
         }
     }
