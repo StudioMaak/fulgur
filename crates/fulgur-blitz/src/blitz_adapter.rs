@@ -2569,6 +2569,33 @@ fn display_is_none(doc: &HtmlDocument, node_id: usize) -> bool {
         .is_some_and(|s| s.clone_display().is_none())
 }
 
+/// True when `node_id` generates no box because it or an ancestor computed
+/// `display: none` — other than a running element (`is_running`), which GCPM
+/// rewrites to `display: none` but which still carries counters and
+/// bookmarks (Prince 17). Stylo leaves a `display: none` subtree unstyled,
+/// so a descendant is caught through its ancestor, not its own style.
+pub(crate) fn in_display_none_subtree(
+    doc: &blitz_dom::BaseDocument,
+    node_id: usize,
+    is_running: impl Fn(usize) -> bool,
+) -> bool {
+    let mut cur = Some(node_id);
+    for _ in 0..MAX_DOM_DEPTH {
+        let Some(node) = cur.and_then(|id| doc.get_node(id)) else {
+            return false;
+        };
+        if !is_running(node.id)
+            && node
+                .primary_styles()
+                .is_some_and(|s| s.clone_display().is_none())
+        {
+            return true;
+        }
+        cur = node.parent;
+    }
+    false
+}
+
 /// True when the cascade computed a non-`visible` `visibility` (i.e. `hidden`
 /// or `collapse`) for `node_id`. Used to keep a `visibility: hidden` table
 /// from leaking its caption: fulgur already suppresses such a table's cells,
@@ -3341,7 +3368,7 @@ use crate::gcpm::{
     TargetUrl,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn target_href<'a>(
     url: &'a TargetUrl,
@@ -3807,6 +3834,10 @@ pub struct CounterPass {
     /// Set exactly once via [`with_anchor_map`] at construction; never
     /// mutated during `apply`, so no interior mutability is needed.
     anchor_map: Option<crate::gcpm::target_ref::AnchorMap>,
+    /// Running elements: `display: none` after the GCPM rewrite, but their
+    /// counter operations still apply (Prince 17), so the walk does not
+    /// skip them the way it skips any other `display: none` subtree.
+    running_nodes: BTreeSet<usize>,
 }
 
 impl CounterPass {
@@ -3825,7 +3856,14 @@ impl CounterPass {
             record_node_snapshots: false,
             snapshot_entries: std::cell::Cell::new(0),
             anchor_map: None,
+            running_nodes: BTreeSet::new(),
         }
+    }
+
+    /// Supply the running elements' node ids (see `running_nodes`).
+    pub fn with_running_nodes(mut self, nodes: BTreeSet<usize>) -> Self {
+        self.running_nodes = nodes;
+        self
     }
 
     /// Supply the pass-2 cross-reference table built from pass-1 output.
@@ -3880,6 +3918,11 @@ impl DomPass for CounterPass {
         if self.counter_mappings.is_empty() && self.content_mappings.is_empty() {
             return;
         }
+        // The walk skips `display: none` subtrees (CSS Lists 3 §4), which
+        // only the cascade knows: style now, ahead of the engine's own
+        // `resolve()`, which restyles what this pass and later injected CSS
+        // invalidate.
+        doc.resolve_stylist(0.0);
         let root = doc.root_element();
         let root_id = root.id;
         self.walk_tree(doc, root_id, 0);
@@ -3908,6 +3951,12 @@ impl CounterPass {
             };
 
             if is_non_visual_tag(elem.name.local.as_ref()) {
+                return;
+            }
+
+            // CSS Lists 3 §4: an element that generates no box neither
+            // changes counters nor lets its descendants do so.
+            if !self.running_nodes.contains(&node_id) && display_is_none(doc, node_id) {
                 return;
             }
 

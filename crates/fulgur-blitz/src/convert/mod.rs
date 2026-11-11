@@ -167,7 +167,8 @@ pub fn dom_to_drawables(
         debug_print_tree(doc.deref(), root.id, 0);
     }
     convert_node(doc.deref(), root.id, ctx, 0, &mut drawables);
-    drawables.bookmark_anchors = extract_bookmark_anchors(doc, &bookmark_snapshot, ctx.assets);
+    drawables.bookmark_anchors =
+        extract_bookmark_anchors(doc, &bookmark_snapshot, ctx.running_store, ctx.assets);
     drawables.body_offset_pt = extract_body_offset_pt(doc);
     drawables.root_dir_rtl = extract_root_dir_rtl(doc);
     drawables.root_id = Some(root.id);
@@ -253,16 +254,25 @@ pub(super) fn drawables_total_len(out: &crate::drawables::Drawables) -> usize {
 
 /// Build the bookmark anchor map. The `bookmark_by_node` map on
 /// `ConvertContext` is populated upstream (`engine.rs` runs
-/// `BookmarkPass` before `dom_to_drawables`); we only project it into
-/// the `Drawables` shape. The `_doc` / `_assets` arguments are
-/// reserved for future enrichment.
+/// `BookmarkPass` before `dom_to_drawables`, ahead of style resolution);
+/// we project it into the `Drawables` shape, dropping nodes that generate
+/// no box. A `display: none` element and its descendants get no outline
+/// entry (Prince 17), except a running element, which GCPM rewrites to
+/// `display: none` but which Prince still bookmarks. The `_assets`
+/// argument is reserved for future enrichment.
 fn extract_bookmark_anchors(
-    _doc: &HtmlDocument,
+    doc: &HtmlDocument,
     bookmark_by_node: &std::collections::HashMap<usize, crate::blitz_adapter::BookmarkInfo>,
+    running_store: &RunningElementStore,
     _assets: Option<&crate::asset::AssetBundle>,
 ) -> std::collections::BTreeMap<usize, crate::drawables::BookmarkAnchorEntry> {
     let mut out = std::collections::BTreeMap::new();
     for (&node_id, info) in bookmark_by_node {
+        if crate::blitz_adapter::in_display_none_subtree(doc, node_id, |id| {
+            running_store.instance_for_node(id).is_some()
+        }) {
+            continue;
+        }
         out.insert(
             node_id,
             crate::drawables::BookmarkAnchorEntry {
