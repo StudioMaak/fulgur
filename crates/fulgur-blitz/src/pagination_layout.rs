@@ -1261,8 +1261,10 @@ fn subtree_has_rendered_content(doc: &BaseDocument, parent_id: usize, depth: usi
 /// computed by adding the descendant's `final_layout.location` to
 /// the parent's frame.
 ///
-/// Skips zero-size descendants and bails at
-/// [`crate::MAX_DOM_DEPTH`] to keep recursion bounded against
+/// Zero-area element descendants get a zero-size fragment, like the
+/// walkers' zero-height branch, so markers on them (running elements,
+/// `string-set`, counters, bookmarks, anchors) reach the per-page walks.
+/// Bails at [`crate::MAX_DOM_DEPTH`] to keep recursion bounded against
 /// adversarial input.
 ///
 /// Mid-element split inside a body child (a deeply nested element
@@ -1316,21 +1318,51 @@ fn record_subtree_descendants(
         let layout = child.final_layout;
         let h = layout.size.height;
         let w = layout.size.width;
-        // Phase 4 PR 5: zero-size containers (`<tbody>`, `<tr>`,
-        // anonymous boxes) carry no paint payload but DO host visible
-        // descendants (e.g. table cells) that v2 needs in geometry.
-        // Skipping them entirely leaves cells out of `geometry`; the
-        // dispatcher then never finds the cell node_ids and v2 emits
-        // a blank table. Recurse without recording when h/w are
-        // both zero so the descendant cells still register.
+        // Zero-area nodes: `display: none` (which includes running
+        // elements after GCPM rewrites them), empty inline elements, and
+        // zero-size containers (`<tbody>`, `<tr>`, anonymous boxes).
+        //
+        // An element still gets a zero-size fragment, as the walkers'
+        // zero-height branch gives it: without one, a running element or
+        // `string-set` nested in a container that fits its page never
+        // reaches `collect_running_element_states` /
+        // `collect_string_set_states`, and silently drops out of the
+        // margin boxes.
+        //
+        // Phase 4 PR 5: zero-size containers carry no paint payload but
+        // DO host visible descendants (e.g. table cells) that v2 needs
+        // in geometry, so recurse into them. A `display: none` subtree
+        // generates no boxes, so it is not entered — the walkers'
+        // zero-height branch does not enter it either.
         if h <= 0.0 && w <= 0.0 {
+            let child_x = parent_x_in_body + layout.location.x;
+            let child_y = parent_page_y + layout.location.y;
+            if child.element_data().is_some() {
+                geometry
+                    .entry(child_id)
+                    .or_default()
+                    .fragments
+                    .push(Fragment {
+                        page_index,
+                        x: child_x.as_px(),
+                        y: child_y.as_px(),
+                        width: 0.0_f32.as_px(),
+                        height: 0.0_f32.as_px(),
+                    });
+            }
+            if child
+                .primary_styles()
+                .is_some_and(|s| s.clone_display().is_none())
+            {
+                continue;
+            }
             record_subtree_descendants(
                 geometry,
                 doc,
                 child_id,
                 page_index,
-                parent_page_y + layout.location.y,
-                parent_x_in_body + layout.location.x,
+                child_y,
+                child_x,
                 depth + 1,
             );
             continue;
@@ -3942,10 +3974,9 @@ pub struct PageRunningState {
 /// Source-order assumption: `geometry` is a `BTreeMap<usize, ..>` so
 /// iteration is by ascending NodeId. For body's direct children that
 /// matches DOM source order, since Blitz allocates ids sequentially
-/// during parse. Nested string-set declarations (markers attached to
-/// a `<span>` inside a `<p>`) are not in the fragmenter's geometry
-/// table today and so are silently dropped — same scope limitation as
-/// `fragment_pagination_root` itself.
+/// during parse, and nested nodes too: every element below a body
+/// child, including a 0×0 one such as an empty `<span>` inside a `<p>`
+/// or a `display: none` node, carries at least one fragment.
 pub fn collect_string_set_states(
     geometry: &PaginationGeometryTable,
     string_set_by_node: &BTreeMap<usize, Vec<(String, String)>>,
@@ -4050,10 +4081,7 @@ pub fn collect_running_element_states(
 /// Same source-order assumption as
 /// [`collect_string_set_states`]: the per-node counter ops are
 /// applied in the order they appear in the body's children list,
-/// approximated by `BTreeMap<NodeId, _>` iteration. Nested counter
-/// declarations on descendants of body's direct children are not in
-/// the fragmenter's geometry today and are silently dropped — same
-/// scope limitation as `fragment_pagination_root` itself.
+/// approximated by `BTreeMap<NodeId, _>` iteration.
 ///
 /// These are document counter values, which `@page` margin boxes do not
 /// read: they resolve only `page` / `pages` and every other name to 0
