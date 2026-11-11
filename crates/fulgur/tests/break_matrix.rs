@@ -704,6 +704,16 @@ const SHAPES: &[Shape] = &[
     // here, but whole, so AFTER opens p2 20px early (37.5pt).
     shape("lead-empty-body", "prince", &[("AFTER", 2, 53.7)], KnownBug("leaf block overflows instead of splitting")),
     shape("lead-empty-section", "prince", &[("AFTER", 2, 53.7)], KnownBug("leaf block overflows instead of splitting")),
+    // The first row is the topmost one, not the first in the DOM: a
+    // `column-reverse` container is entered and split in place, CC staying
+    // on page 1.
+    shape("lead-colrev-body", "chrome", &[("CC", 1, 173.6), ("AA", 2, 38.6)], Pass),
+    shape("lead-colrev-section", "chrome", &[("CC", 1, 173.6), ("AA", 2, 38.6)], Pass),
+    // A sibling pulled up by a negative margin after a box that split.
+    // Chrome puts it back on page 1, at its unbroken position (Prince drops
+    // it). Here it stays on page 2, where the split box ended.
+    shape("neg-split-body", "chrome", &[("NEG", 1, 248.6)], KnownBug("negative margin after a split box")),
+    shape("neg-split-section", "chrome", &[("NEG", 1, 248.6)], KnownBug("negative margin after a split box")),
     // (b) A row whose tall left cell crosses the page: the short stretched
     // right cell stays at the row's top on page 1. The naive fix moved
     // RIGHT to p2.
@@ -821,7 +831,22 @@ fn shape_body(shape: &str) -> String {
         "<div>\n<svg style=\"display:block;width:40px;height:40px\"><rect width=\"40\" height=\"40\"/></svg>\n{after}\n</div>"
     );
     let lead_empty = format!("<div>\n<div style=\"height:40px\"></div>\n{after}\n</div>");
+    let three = |name: &str| format!("<div>{name}<br>x<br>x</div>");
+    let lead_colrev = format!(
+        "<div style=\"display:flex;flex-direction:column-reverse\">\n{}\n{}\n{}\n</div>",
+        three("AA"),
+        three("BB"),
+        three("CC")
+    );
+    let neg_split = format!(
+        "<div>\n{}\n</div>\n<div class=\"m\" style=\"margin-top:-40px;margin-left:150px\">NEG</div>",
+        lines(6, |i| format!("L{i}")).join("\n")
+    );
     match shape {
+        "lead-colrev-body" => format!("{}\n{lead_colrev}", top(180)),
+        "lead-colrev-section" => section(format!("{}\n{lead_colrev}", top(180))),
+        "neg-split-body" => format!("{}\n{neg_split}", top(200)),
+        "neg-split-section" => section(format!("{}\n{neg_split}", top(200))),
         "lead-pad-body" => format!("{}\n{lead_pad}", top(290)),
         "lead-pad-section" => section(format!("{}\n{lead_pad}", top(290))),
         "lead-nest-body" => format!("{}\n{lead_nest}", top(290)),

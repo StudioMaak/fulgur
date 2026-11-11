@@ -920,7 +920,12 @@ impl<'a> PaginationLayoutTree<'a> {
             // the break goes before the child (class A): there is no break
             // point between a container's top and its first child. See
             // `leading_unbreakable_extent`.
+            //
+            // A multicol container only gets here with a `column-span: all`
+            // child, and then it is fragmented around its spanners, which
+            // `leading_unbreakable_extent` does not model: left as it was.
             if needs_recursion
+                && !is_multicol
                 && box_placed_on == Some(page_index)
                 && cursor_y + leading_unbreakable_extent(self.doc, self.column_styles, child_id, 0)
                     > capacity(page_index)
@@ -1135,7 +1140,9 @@ impl<'a> PaginationLayoutTree<'a> {
                 }
                 emitted += 1;
                 prev_bottom_y_in_body = this_top_in_body + child_h;
-                box_placed_on = Some(page_index);
+                // The collapse path above already stepped onto a page it
+                // placed nothing on.
+                box_placed_on = (!collapse_childless).then_some(page_index);
                 if !is_float {
                     prev_used_page = Some(used_end.clone());
                 }
@@ -1500,6 +1507,11 @@ fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
         .collect()
 }
 
+/// CSS 3 Fragmentation default for `orphans`.
+const ORPHANS_MIN: usize = 2;
+/// CSS 3 Fragmentation default for `widows`.
+const WIDOWS_MIN: usize = 2;
+
 /// How far below `node_id`'s top edge its first unbreakable content
 /// reaches, in CSS px.
 ///
@@ -1511,13 +1523,18 @@ fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
 /// ancestor moves whole, padding included. The walker that sees that
 /// sibling asks this before entering the box in place.
 ///
-/// - An inline root: the bottom of its first line.
+/// - An inline root: the bottom of the last line that must stay before a
+///   break (its first line, or `orphans` lines of a longer paragraph).
 /// - A container: the furthest any box of its first row reaches, each
-///   measured the same way (one box in block flow, the parallel cells of
-///   a flex / grid / table row).
+///   measured the same way. The first row is the topmost box plus every
+///   box that starts beside it: one box in block flow, the parallel cells
+///   of a flex / grid / table row.
 /// - Anything that cannot be broken (`break-inside: avoid`, a transform,
 ///   a multicol container, a replaced element): its full height.
-/// - A box with no in-flow content: 0, it can be sliced anywhere.
+/// - A box with no in-flow content: 0. Both references slice such a box
+///   anywhere. The walkers do not yet (they overflow or move it whole,
+///   the "leaf block" rows in `break_matrix.rs`), but it is not a reason
+///   to move its container.
 fn leading_unbreakable_extent(
     doc: &BaseDocument,
     column_styles: Option<&crate::column_css::ColumnStyleTable>,
@@ -1550,35 +1567,41 @@ fn leading_unbreakable_extent(
     if avoid_inside || has_transform || crate::blitz_adapter::is_multicol_container(node) {
         return height;
     }
-    if let Some(&(_, first_line_bottom)) = collect_inline_line_metrics(node).first() {
-        return (layout.padding.top + layout.border.top + first_line_bottom).clamp(0.0, height);
+    let lines = collect_inline_line_metrics(node);
+    if !lines.is_empty() {
+        // `fragment_inline_root` keeps `ORPHANS_MIN` lines before a break
+        // and `WIDOWS_MIN` after it, and does not split a paragraph too
+        // short for both.
+        let orphans = ORPHANS_MIN.max(1);
+        let leading = if lines.len() == 1 {
+            lines[0].1
+        } else if lines.len() < orphans + WIDOWS_MIN {
+            return height;
+        } else {
+            lines[orphans - 1].1
+        };
+        return (layout.padding.top + layout.border.top + leading).clamp(0.0, height);
     }
-    let items = flow_items(doc, node_id);
-    let rows = flow_rows(&items);
-    let has_height = |item: &FlowItem| {
-        item.kind == FlowKind::Box && item.height.is_finite() && item.height > 0.0
-    };
-    let Some(first_row) = items
-        .iter()
-        .zip(&rows)
-        .find(|(item, _)| has_height(item))
-        .map(|(_, row)| *row)
-    else {
+    // The first row is picked by geometry, not DOM order: `column-reverse`
+    // and explicitly placed grid items put a later child at the top.
+    let boxes: Vec<FlowItem> = flow_items(doc, node_id)
+        .into_iter()
+        .filter(|item| item.kind == FlowKind::Box && item.height.is_finite() && item.height > 0.0)
+        .collect();
+    let Some(first) = boxes.iter().min_by(|a, b| a.top.total_cmp(&b.top)) else {
         // Nothing in flow with a height. A replaced element or a bare text
-        // run is whole; an empty box with a height can be sliced anywhere.
+        // run is whole; an empty box with a height has nothing unbreakable.
         return if crate::blitz_adapter::is_replaced_element(node) || node.element_data().is_none() {
             height
         } else {
             0.0
         };
     };
-    items
+    let first_row_bottom = first.top + first.height - 0.5;
+    boxes
         .iter()
-        .zip(&rows)
-        .filter(|(item, row)| **row == first_row && has_height(item))
-        .map(|(item, _)| {
-            item.top + leading_unbreakable_extent(doc, column_styles, item.node, depth + 1)
-        })
+        .filter(|item| item.top < first_row_bottom)
+        .map(|item| item.top + leading_unbreakable_extent(doc, column_styles, item.node, depth + 1))
         .fold(0.0_f32, f32::max)
         .clamp(0.0, height)
 }
@@ -1967,8 +1990,17 @@ struct RowState {
     started_on_occupied_strip: bool,
     max_end_page: u32,
     max_end_cursor_y: f32,
-    /// The cell that reached `max_end_*`: the next row is placed after it.
-    max_end_prev: PrevBox,
+    /// Max Taffy `location.y + height` across the row's cells so far: the
+    /// row's own bottom edge.
+    row_bottom: f32,
+    /// The furthest any cell's *box* reached: the page-side counterpart of
+    /// `row_bottom`. Not `max_end_cursor_y`, which also follows content
+    /// that overflows its cell (a spanning cell taller than its rows).
+    box_end_page: u32,
+    box_end: f32,
+    /// Set when the row ends at a zero-height box, which is placed without
+    /// moving `max_end_cursor_y`: the next row follows that box.
+    end_zero_box: Option<PrevBox>,
     /// This row's index in [`flow_rows`].
     row: usize,
     /// Pages for which a parent fragment has already been emitted this row,
@@ -1979,6 +2011,19 @@ struct RowState {
     /// state-restore (co-split); after a non-recursion page advance the later
     /// cells simply continue from the cell that moved.
     crossed_by_recursion: bool,
+}
+
+impl RowState {
+    /// Records where a cell's box ended, once the cell is placed.
+    fn note_box_end(&mut self, page_index: u32, prev: PrevBox) {
+        if page_index > self.box_end_page
+            || (page_index == self.box_end_page && prev.end > self.box_end)
+        {
+            self.box_end_page = page_index;
+            self.box_end = prev.end;
+            self.end_zero_box = None;
+        }
+    }
 }
 
 /// The box a walker placed last, in both coordinate systems: `bottom` is
@@ -1992,6 +2037,9 @@ struct RowState {
 struct PrevBox {
     bottom: f32,
     end: f32,
+    /// The box crossed a page, so `end` is where it ended on a later page
+    /// than it started on.
+    split: bool,
 }
 
 impl PrevBox {
@@ -1999,8 +2047,14 @@ impl PrevBox {
     /// The gap may be negative (overlapping siblings, a later cell of the
     /// same flex/grid row), which places the box back up beside or over
     /// the previous one, exactly as Taffy laid it out.
+    ///
+    /// After a `split` box a negative gap is clamped to zero. The reference
+    /// position is back up on the page the split box started on (Chrome
+    /// 157), which this walker cannot reach; without the clamp the box
+    /// would land above the top of the current page and be lost.
     fn place(self, top: f32) -> f32 {
-        self.end + (top - self.bottom)
+        let gap = top - self.bottom;
+        self.end + if self.split { gap.max(0.0) } else { gap }
     }
 }
 
@@ -2904,6 +2958,7 @@ fn fragment_block_subtree_inner(
     let mut prev = PrevBox {
         bottom: initial_taffy_origin,
         end: cursor_in,
+        split: false,
     };
     // Set by every forced page advance that leaves the *next* box to open
     // the new page (`break-after: page`); that box goes at the page top
@@ -3055,16 +3110,26 @@ fn fragment_block_subtree_inner(
                 // row means same Taffy top, so `prev.place` puts it beside
                 // that cell, on whichever page that cell ended up.
             } else if let Some(rs) = row_state.take() {
-                // New row: continue after the cell that reached furthest in
-                // the previous row.
+                // New row: continue after the previous row. Its Taffy bottom
+                // edge maps to the furthest any of its cells' boxes reached,
+                // which need not be the cell with the lowest Taffy bottom
+                // once cells have split or moved independently.
+                let crossed = rs.max_end_page > rs.start_page;
                 page_index = rs.max_end_page;
                 cursor_y = rs.max_end_cursor_y;
-                prev = rs.max_end_prev;
-                page_start_y = if rs.max_end_page > rs.start_page {
-                    0.0
-                } else {
-                    rs.start_page_start_y
-                };
+                if let Some(zero_box) = rs.end_zero_box {
+                    prev = zero_box;
+                } else if rs.box_end.is_finite() && rs.box_end_page == rs.max_end_page {
+                    prev = PrevBox {
+                        bottom: rs.row_bottom,
+                        end: rs.box_end,
+                        split: crossed,
+                    };
+                }
+                // The row placed boxes on the page it ended on, unless it
+                // ended with a forced break onto a page that is still empty.
+                box_placed_on = (rs.max_end_cursor_y > 0.0).then_some(rs.max_end_page);
+                page_start_y = if crossed { 0.0 } else { rs.start_page_start_y };
             }
             if row_state.is_none() {
                 // First cell in a new row: snapshot current state.
@@ -3080,11 +3145,16 @@ fn fragment_block_subtree_inner(
                     started_on_occupied_strip: initial_page_occupied,
                     max_end_page: page_index,
                     max_end_cursor_y: cursor_y,
-                    max_end_prev: prev,
+                    row_bottom: this_top_in_parent + child_h,
+                    box_end_page: page_index,
+                    box_end: f32::NEG_INFINITY,
+                    end_zero_box: None,
                     row,
                     emitted_parent_pages: BTreeSet::new(),
                     crossed_by_recursion: false,
                 });
+            } else if let Some(ref mut rs) = row_state {
+                rs.row_bottom = rs.row_bottom.max(this_top_in_parent + child_h);
             }
         }
 
@@ -3132,6 +3202,7 @@ fn fragment_block_subtree_inner(
                 prev = PrevBox {
                     bottom: this_top_in_parent,
                     end: y,
+                    split: false,
                 };
                 // It never moves the row's end, but when the row ends
                 // here it is the box the next row follows.
@@ -3139,7 +3210,7 @@ fn fragment_block_subtree_inner(
                     && page_index == rs.max_end_page
                     && cursor_y >= rs.max_end_cursor_y
                 {
-                    rs.max_end_prev = prev;
+                    rs.end_zero_box = Some(prev);
                 }
             }
             if child.element_data().is_some() {
@@ -3184,7 +3255,6 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
-                    rs.max_end_prev = prev;
                 }
             }
             if !is_float {
@@ -3455,6 +3525,7 @@ fn fragment_block_subtree_inner(
                 } else {
                     new_cursor_y
                 },
+                split: new_page_index > pre_split_page,
             };
             // CodeRabbit + codex P1: mirror the recursion branch's
             // same-row co-split bookkeeping (fulgur-ysms). Gated on
@@ -3556,8 +3627,8 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
-                    rs.max_end_prev = prev;
                 }
+                rs.note_box_end(page_index, prev);
             }
             continue;
         }
@@ -3807,6 +3878,7 @@ fn fragment_block_subtree_inner(
                 prev = PrevBox {
                     bottom: this_top_in_parent + child_h,
                     end: cursor_y,
+                    split: true,
                 };
                 // fulgur-ysms: mark that this row had a recursion-driven page
                 // cross so subsequent same-row cells know to co-split.
@@ -3818,6 +3890,7 @@ fn fragment_block_subtree_inner(
                 prev = PrevBox {
                     bottom: this_top_in_parent + child_h,
                     end: child_page_y + child_h,
+                    split: false,
                 };
             }
 
@@ -3850,8 +3923,8 @@ fn fragment_block_subtree_inner(
                 {
                     rs.max_end_page = page_index;
                     rs.max_end_cursor_y = cursor_y;
-                    rs.max_end_prev = prev;
                 }
+                rs.note_box_end(page_index, prev);
             }
             continue;
         }
@@ -3926,6 +3999,7 @@ fn fragment_block_subtree_inner(
         prev = PrevBox {
             bottom: this_top_in_parent + child_h,
             end: child_page_y + child_h,
+            split: false,
         };
         box_placed_on = Some(page_index);
 
@@ -3958,8 +4032,8 @@ fn fragment_block_subtree_inner(
             {
                 rs.max_end_page = page_index;
                 rs.max_end_cursor_y = cursor_y;
-                rs.max_end_prev = prev;
             }
+            rs.note_box_end(page_index, prev);
         }
     }
 
@@ -4071,11 +4145,6 @@ fn fragment_inline_root(
     page_height_px: f32,
     line_metrics: &[(f32, f32)],
 ) -> (u32, f32, usize) {
-    /// CSS 3 Fragmentation default for `orphans`.
-    const ORPHANS_MIN: usize = 2;
-    /// CSS 3 Fragmentation default for `widows`.
-    const WIDOWS_MIN: usize = 2;
-
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0);
     }
@@ -8817,10 +8886,11 @@ h2 { string-set: chapter-title content(text); }
     /// `layout.location.y`. Pre-fix, `fragment_block_subtree`
     /// advanced `cursor_y` after each child via `cursor_y += child_h`,
     /// so card 2 (Taffy y=0) was recorded at y=200 (= card 1's
-    /// height) in geometry. Post-fix the loop reads
-    /// `child_page_y = page_start_y + (this_top_in_parent - page_taffy_origin)`
-    /// directly from Taffy, and updates `cursor_y` only as a row's
-    /// max bottom for break / overflow checks.
+    /// height) in geometry. Post-fix the loop places each child from
+    /// its Taffy top (today `PrevBox::place`: the previous box's end
+    /// plus the Taffy gap, which is negative for a cell beside it), and
+    /// updates `cursor_y` only as a row's max bottom for break /
+    /// overflow checks.
     #[test]
     fn fragment_block_subtree_grid_parallel_siblings_share_page_y() {
         // Two cells in a 2-column grid row, each 100px tall and
@@ -9548,6 +9618,10 @@ h2 { string-set: chapter-title content(text); }
     /// lands far past where the paragraph actually ended instead of
     /// immediately after it.
     ///
+    /// (`page_taffy_origin` has since been replaced by `PrevBox`, which
+    /// is set from the paragraph itself and cannot go stale this way.
+    /// The shape stays as a guard; the test keeps its historical name.)
+    ///
     /// Fixture: A (90px) pushes `cursor_y` to 90 on a 100px strip, then
     /// a narrow multi-line `<p>` (one word per line, comfortably under
     /// 100px total) doesn't fit the remaining 10px — triggering
@@ -9683,25 +9757,30 @@ h2 { string-set: chapter-title content(text); }
     /// CodeRabbit review on PR #741 (fulgur-2s7p.1 follow-up): when the
     /// new inline-root split branch's multi-line `<p>` is a grid/flex
     /// row's FIRST cell and crosses a page boundary, it never set
-    /// `origin_pending_same_row` / `row_state.crossed_by_recursion`
+    /// `row_state.crossed_by_recursion`
     /// (the same-row co-split bookkeeping the recursion branch already
     /// has, fulgur-ysms). Later cells in the same row then never
     /// restored to the row-start state — they landed only on the page
     /// the paragraph's tail ended up on, losing their earlier-page row
     /// content entirely.
     ///
-    /// Fixture: 3-column grid row on a 100px strip, 70px into the page
-    /// (matches the sibling `grid_row_recursive_cells_cosplit_across_page_boundary`
-    /// fixture's numbers). Column 1 is a narrow multi-line `<p>` (one
-    /// word per line) tall enough to cross the page boundary — as the
-    /// row's first cell, `cursor_y == page_start_y` so split-before
-    /// doesn't fire and the split runs in place. Columns 2 and 3 must
-    /// still land on page 0 at the row-local y (70).
+    /// Fixture: 3-column grid row on a 100px strip, 50px into the page.
+    /// Column 1 is a narrow multi-line `<p>` (one word per line, 20px
+    /// lines) tall enough to cross the page boundary — as the row's first
+    /// cell, `cursor_y == page_start_y` so split-before doesn't fire and
+    /// the split runs in place. Columns 2 and 3 must still land on page 0
+    /// at the row-local y (50).
+    ///
+    /// The grid used to sit 70px in, leaving room for one line. Orphans
+    /// are 2, so no break is allowed there and the whole grid moves to the
+    /// next page (Chrome 157 does the same); fulgur drew the second line
+    /// past the page bottom. 50px leaves room for the two lines a split
+    /// needs, where Chrome, Prince and fulgur all break after line two.
     #[test]
     fn grid_row_multiline_paragraph_cosplits_with_later_row_siblings() {
         let html = r#"
             <html><body style="margin: 0; padding: 0; font-size: 12px">
-              <div style="height: 70px"></div>
+              <div style="height: 50px"></div>
               <div style="display: grid; grid-template-columns: 60px 60px 60px; width: 180px;">
                 <p id="col_p" style="margin:0; padding:0; line-height:20px; width:20px">one two three four five</p>
                 <div id="col_b" style="height: 10px; width: 60px"></div>
@@ -9741,8 +9820,8 @@ h2 { string-set: chapter-title content(text); }
                     )
                 });
             assert!(
-                (page0.y.to_f32() - 70.0).abs() < 1.0,
-                "{id} must land at the row-local y=70 on page 0: page0={page0:?}"
+                (page0.y.to_f32() - 50.0).abs() < 1.0,
+                "{id} must land at the row-local y=50 on page 0: page0={page0:?}"
             );
         }
     }
