@@ -501,20 +501,15 @@ impl<'a> PaginationLayoutTree<'a> {
         // `dispatch_fragment` skips the paragraph entirely
         // (fulgur-bq6i: examples/wasm-demo lost label / legend / option
         // text content for this exact reason).
-        let children = self
-            .doc
-            .get_node(body_id)
-            .map(|n| {
-                let layout_borrow = n.layout_children.borrow();
-                if let Some(lc) = layout_borrow.as_deref()
-                    && !lc.is_empty()
-                {
-                    lc.to_vec()
-                } else {
-                    n.children.clone()
-                }
-            })
-            .unwrap_or_default();
+        //
+        // `flow_items` also drops pure-whitespace text nodes (same
+        // convention as multicol_layout's `partition_children_into_segments`)
+        // and out-of-flow children: CSS 2.1 §10.6.4 / §9.6, abs/fixed
+        // children do not contribute to their containing block's
+        // normal-flow height, so the fragmenter must not advance cursors
+        // for them. Separate passes (`append_position_fixed_fragments` and
+        // the abs positioning pipeline in `render`) handle them.
+        let items = flow_items(self.doc, body_id);
 
         let mut page_index: u32 = 0;
         let mut cursor_y: f32 = 0.0;
@@ -543,31 +538,11 @@ impl<'a> PaginationLayoutTree<'a> {
         // break. See `retained_margin_after_forced_break`.
         let mut margin_after_forced_break = false;
 
-        for child_id in children {
+        for item in items {
+            let child_id = item.node;
             let Some(child) = self.doc.get_node(child_id) else {
                 continue;
             };
-            // Skip pure-whitespace text nodes — same convention as
-            // multicol_layout's `partition_children_into_segments`.
-            if crate::blitz_adapter::is_whitespace_only_text_node(child) {
-                continue;
-            }
-            // CSS 2.1 §10.6.4 / §9.6: out-of-flow elements
-            // (`position: absolute` / `position: fixed`) do not
-            // contribute to their containing block's normal-flow
-            // height, so the fragmenter must not advance cursors for
-            // them. Abs/fixed children are handled by separate passes
-            // (`append_position_fixed_fragments` and the abs positioning
-            // pipeline in `render`).
-            {
-                use ::style::properties::longhands::position::computed_value::T as Pos;
-                let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                    matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-                });
-                if is_out_of_flow {
-                    continue;
-                }
-            }
             // fulgur-s67g Phase 2.2: skip `position: running()` named
             // children from the body cursor. They are removed from
             // body flow and placed into `@page` margin boxes per page;
@@ -1385,6 +1360,89 @@ fn record_subtree_descendants(
     }
 }
 
+/// Whether a [`FlowItem`] generates a box.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FlowKind {
+    /// Generates a box (possibly zero-height).
+    Box,
+    /// `display: none` per its primary styles: no box, but it may still
+    /// need recording. GCPM rewrites `position: running()` to
+    /// `display: none`, so running elements normally land here too.
+    Marker,
+}
+
+/// One child of a container as the pagination walkers see it.
+///
+/// Built by [`flow_items`] / [`flow_items_of`], which drop missing nodes,
+/// whitespace-only text and `position: absolute | fixed` children once,
+/// for every walker. Everything else (non-element text, floats,
+/// orthogonal flows, zero-height and non-finite heights) is kept, so each
+/// walker still applies its own rules on top.
+#[derive(Clone, Copy, Debug)]
+struct FlowItem {
+    node: usize,
+    kind: FlowKind,
+    /// Taffy `final_layout.location.y`, parent-relative CSS px.
+    top: f32,
+    /// Taffy `final_layout.size.height`, raw: may be zero or non-finite.
+    height: f32,
+}
+
+/// The children a walker iterates for `parent`: `layout_children` when
+/// non-empty (it holds the anonymous block wrappers Stylo synthesizes
+/// around inline-level siblings, CSS 2.1 §9.2.1.1), else DOM `children`.
+fn flow_child_ids(parent: &blitz_dom::Node) -> Vec<usize> {
+    let layout_children = parent.layout_children.borrow();
+    layout_children
+        .as_deref()
+        .filter(|v| !v.is_empty())
+        .map(Vec::from)
+        .unwrap_or_else(|| parent.children.clone())
+}
+
+/// [`FlowItem`]s for `parent`'s [`flow_child_ids`]. Empty when `parent`
+/// is missing.
+fn flow_items(doc: &BaseDocument, parent_id: usize) -> Vec<FlowItem> {
+    doc.get_node(parent_id)
+        .map(|p| flow_items_of(doc, &flow_child_ids(p)))
+        .unwrap_or_default()
+}
+
+/// [`FlowItem`]s for an explicit child list, in order.
+fn flow_items_of(doc: &BaseDocument, child_ids: &[usize]) -> Vec<FlowItem> {
+    use ::style::properties::longhands::position::computed_value::T as Pos;
+    child_ids
+        .iter()
+        .filter_map(|&id| {
+            let child = doc.get_node(id)?;
+            if crate::blitz_adapter::is_whitespace_only_text_node(child) {
+                return None;
+            }
+            // CSS 2.1 §10.6.4: out-of-flow children do not contribute to
+            // their containing block's normal-flow height. Separate passes
+            // (`append_position_fixed_fragments`, the abs pipeline) own them.
+            let styles = child.primary_styles();
+            if styles
+                .as_ref()
+                .is_some_and(|s| matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed))
+            {
+                return None;
+            }
+            let kind = if styles.is_some_and(|s| s.clone_display().is_none()) {
+                FlowKind::Marker
+            } else {
+                FlowKind::Box
+            };
+            Some(FlowItem {
+                node: id,
+                kind,
+                top: child.final_layout.location.y,
+                height: child.final_layout.size.height,
+            })
+        })
+        .collect()
+}
+
 /// fulgur-7hf5 (Phase 3.1.5c): pre-flight check for the recursion
 /// gate — true if walking `parent_id`'s direct children would cross
 /// a page boundary at `available_h`.
@@ -1411,48 +1469,21 @@ fn would_split_block_subtree(
     if depth >= crate::MAX_DOM_DEPTH {
         return false;
     }
-    let Some(parent) = doc.get_node(parent_id) else {
-        return false;
-    };
     let mut cursor: f32 = 0.0;
     let mut prev_bottom: f32 = 0.0;
-    // fulgur-yb27: walk `layout_children` so anonymous block wrappers
-    // Stylo synthesizes around inline-level siblings (CSS 2.1
-    // §9.2.1.1) participate in the cumulative-overflow simulation.
-    // Mirrors the `fragment_block_subtree` walker switch above —
-    // without this, a block whose tail anon block wrapper would
-    // overflow is missed by the preflight, the recursion gate
-    // returns false, and the parent falls back to a single
-    // oversize fragment.
-    let layout_children_borrow = parent.layout_children.borrow();
-    let walk_children: Vec<usize> = layout_children_borrow
-        .as_deref()
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_vec())
-        .unwrap_or_else(|| parent.children.clone());
-    drop(layout_children_borrow);
-    for &child_id in &walk_children {
-        let Some(child) = doc.get_node(child_id) else {
-            continue;
-        };
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
-            continue;
-        }
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_oof = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_oof {
-                continue;
-            }
-        }
-        let layout = child.final_layout;
-        let h = layout.size.height;
+    // fulgur-yb27: walk `layout_children` (via `flow_items`) so anonymous
+    // block wrappers Stylo synthesizes around inline-level siblings (CSS
+    // 2.1 §9.2.1.1) participate in the cumulative-overflow simulation.
+    // Mirrors the `fragment_block_subtree` walker — without this, a block
+    // whose tail anon block wrapper would overflow is missed by the
+    // preflight, the recursion gate returns false, and the parent falls
+    // back to a single oversize fragment.
+    for item in flow_items(doc, parent_id) {
+        let h = item.height;
         if h <= 0.0 {
             continue;
         }
-        let this_top = layout.location.y;
+        let this_top = item.top;
         let gap = (this_top - prev_bottom).max(0.0);
         cursor += gap;
         if cursor + h > available_h {
@@ -1651,16 +1682,16 @@ fn has_page_name_change_below(
     // into each item — only the direct-children comparison is gated.
     let suppress_direct_compare = crate::blitz_adapter::is_flex_or_grid_container_node(node);
     let mut prev_used: Option<Option<String>> = None;
-    for &child_id in &node.children {
+    // DOM `children`, not `layout_children`: anonymous block wrappers have
+    // no used page-name entry, so walking them would change the result.
+    // `flow_items_of` drops whitespace-only text and out-of-flow children —
+    // the same filters as the fragmenter loop, so the predicate matches
+    // what `fragment_block_subtree` would compare.
+    for item in flow_items_of(doc, &node.children) {
+        let child_id = item.node;
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
-        // Skip whitespace-only text and out-of-flow children — same
-        // filters as the fragmenter loop, so the predicate matches
-        // exactly what `fragment_block_subtree` would compare.
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
-            continue;
-        }
         if child.element_data().is_none() {
             continue;
         }
@@ -1669,15 +1700,6 @@ fn has_page_name_change_below(
         // subtree — no comparison, no recursion.
         if crate::blitz_adapter::is_orthogonal_to_parent(node, child) {
             continue;
-        }
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_out_of_flow {
-                continue;
-            }
         }
         // Floats are out of normal flow (CSS 2.1 §9.5) — match
         // `fragment_pagination_root` / `fragment_block_subtree` which
@@ -2745,33 +2767,18 @@ fn fragment_block_subtree_inner(
     // `layout_children` without that fix would lose the parent's
     // pre-recursion-page fragment in mo-006/008 (flex/grid + tall
     // monolithic + trailing inline text).
-    let walk_children = children_override.map(Vec::from).unwrap_or_else(|| {
-        let layout_children_borrow = parent.layout_children.borrow();
-        layout_children_borrow
-            .as_deref()
-            .filter(|v| !v.is_empty())
-            .map(Vec::from)
-            .unwrap_or_else(|| parent.children.clone())
-    });
-    for &child_id in &walk_children {
+    //
+    // `flow_items` drops whitespace-only text and out-of-flow children,
+    // same as `fragment_pagination_root`.
+    let items = match children_override {
+        Some(ids) => flow_items_of(doc, ids),
+        None => flow_items_of(doc, &flow_child_ids(parent)),
+    };
+    for item in items {
+        let child_id = item.node;
         let Some(child) = doc.get_node(child_id) else {
             continue;
         };
-        // Whitespace-only text — same skip as `fragment_pagination_root`.
-        if crate::blitz_adapter::is_whitespace_only_text_node(child) {
-            continue;
-        }
-        // CSS 2.1 §10.6.4: out-of-flow children do not contribute to
-        // their containing block's normal-flow height.
-        {
-            use ::style::properties::longhands::position::computed_value::T as Pos;
-            let is_out_of_flow = child.primary_styles().is_some_and(|s| {
-                matches!(s.get_box().clone_position(), Pos::Absolute | Pos::Fixed)
-            });
-            if is_out_of_flow {
-                continue;
-            }
-        }
         let layout = child.final_layout;
         // fulgur-2m6w: same non-finite guard as `fragment_pagination_root`.
         // A nested child with a non-finite Taffy height (`+inf` / `NaN`, or
@@ -2899,9 +2906,7 @@ fn fragment_block_subtree_inner(
         // reports it at y=0, so taking the re-anchor there would place the
         // next real child at its unbroken offset on the new page. A real
         // zero-height box does take it, so its successor keeps its offset.
-        let boxless = child
-            .primary_styles()
-            .is_some_and(|s| s.clone_display().is_none());
+        let boxless = item.kind == FlowKind::Marker;
         if !boxless && let Some(mut target_y) = origin_pending_target_y.take() {
             if let Some((row_top, row_bottom, same_row_y)) = origin_pending_same_row.take()
                 && this_top_in_parent < row_bottom - 0.5
@@ -5896,6 +5901,65 @@ mod tests {
                 .collect();
             assert_eq!(placed, vec![(1, 0.0)], "{container}: lead must open page 1");
         }
+    }
+
+    /// `flow_items` drops whitespace text and abs/fixed children, keeps
+    /// zero-height boxes and floats as `Box`, and marks `display:none` as
+    /// `Marker`, in source order with the raw Taffy top and height.
+    #[test]
+    fn flow_items_filters_and_classifies_children() {
+        let doc = parse(
+            r#"<html><body style="margin:0"><div id="p">
+                  <div id="a" style="height:10px"></div>
+                  <div id="abs" style="position:absolute; height:5px"></div>
+                  <div id="fix" style="position:fixed; height:5px"></div>
+                  <div id="none" style="display:none"></div>
+                  <div id="zero" style="height:0"></div>
+                  <div id="fl" style="float:left; height:4px; width:4px"></div>
+                  <div id="b" style="height:20px"></div>
+                </div></body></html>"#,
+            600.0,
+        );
+        let id = |s| find_by_id(&doc, s).expect(s);
+        let got: Vec<(usize, FlowKind, f32, f32)> = flow_items(&doc, id("p"))
+            .into_iter()
+            .map(|i| (i.node, i.kind, i.top, i.height))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (id("a"), FlowKind::Box, 0.0, 10.0),
+                (id("none"), FlowKind::Marker, 0.0, 0.0),
+                (id("zero"), FlowKind::Box, 10.0, 0.0),
+                (id("fl"), FlowKind::Box, 10.0, 4.0),
+                // Raw Taffy: the block after the float sits below it, not
+                // beside it (the float layout issue in the walker plan).
+                (id("b"), FlowKind::Box, 14.0, 20.0),
+            ]
+        );
+    }
+
+    /// `flow_items` walks `layout_children`, so the anonymous block wrapping
+    /// inline-level siblings of a block is an item and its inline children
+    /// are not; `flow_items_of(node.children)` walks the DOM instead.
+    #[test]
+    fn flow_items_prefers_layout_children() {
+        let doc = parse(
+            r#"<html><body style="margin:0"><div id="p"><span id="s">x</span><div id="d" style="height:10px"></div></div></body></html>"#,
+            600.0,
+        );
+        let p = find_by_id(&doc, "p").unwrap();
+        let s = find_by_id(&doc, "s").unwrap();
+        let d = find_by_id(&doc, "d").unwrap();
+        let layout: Vec<usize> = flow_items(&doc, p).iter().map(|i| i.node).collect();
+        assert_eq!(layout.len(), 2);
+        assert_ne!(layout[0], s, "anonymous wrapper, not the span itself");
+        assert_eq!(layout[1], d);
+        let dom: Vec<usize> = flow_items_of(&doc, &doc.get_node(p).unwrap().children)
+            .iter()
+            .map(|i| i.node)
+            .collect();
+        assert_eq!(dom, vec![s, d]);
     }
 
     /// Find the first element node carrying `id="<id>"`.
