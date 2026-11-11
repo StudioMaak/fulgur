@@ -2975,6 +2975,15 @@ fn fragment_block_subtree_inner(
                 // on the new page — defer origin rebase.
                 (origin_pending_target_y, origin_pending_same_row) = (Some(page_start_y), None);
                 margin_after_forced_break = true;
+                // In a flex/grid container the next item opens a new row and
+                // restores `max_end_*`; without this the break's page advance
+                // is undone and the item lands on the earlier page.
+                if let Some(ref mut rs) = row_state
+                    && page_index > rs.max_end_page
+                {
+                    rs.max_end_page = page_index;
+                    rs.max_end_cursor_y = cursor_y;
+                }
             }
             if !is_float {
                 prev_used_page = Some(used_end.clone());
@@ -5854,6 +5863,35 @@ mod tests {
             .map(|f| (f.page_index, f.y.to_f32()))
             .collect();
         assert_eq!(placed, vec![(1, 30.0)], "lead keeps the 30px margin");
+    }
+
+    /// In a flex column or grid every item opens a new `RowState` row. A
+    /// zero-height forced break used to leave its page advance out of
+    /// `max_end_*`, so the next row restored the earlier page and the item
+    /// was drawn on top of the content before the break. Chrome places it
+    /// at the top of the next page.
+    #[test]
+    fn zero_height_break_in_flex_column_and_grid_advances_the_page() {
+        for container in ["display:flex; flex-direction:column", "display:grid"] {
+            let html = format!(
+                r#"<html><body style="margin:0"><div style="{container}">
+                  <div style="height:60px"></div>
+                  <div style="height:0; break-after:page"></div>
+                  <div id="lead" style="height:10px"></div>
+                </div></body></html>"#
+            );
+            let mut doc = parse(&html, 600.0);
+            let styles = blitz_adapter::extract_column_style_table(&doc, &[]);
+            let table =
+                super::run_pass_with_break_styles(doc.deref_mut(), 100.0_f32.as_px(), &styles);
+            let lead = find_by_id(&doc, "lead").expect("lead");
+            let placed: Vec<(u32, f32)> = table[&lead]
+                .fragments
+                .iter()
+                .map(|f| (f.page_index, f.y.to_f32()))
+                .collect();
+            assert_eq!(placed, vec![(1, 0.0)], "{container}: lead must open page 1");
+        }
     }
 
     /// Find the first element node carrying `id="<id>"`.
