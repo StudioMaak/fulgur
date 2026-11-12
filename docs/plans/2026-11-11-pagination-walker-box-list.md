@@ -174,3 +174,201 @@ Branch `paperworx/walker-place-by-prev`, on top of the phase A matrix rows.
 - A `column-reverse` flex whose items are block containers is walked in DOM order and drawn past the page bottom, before and after this step.
 - A container holding a running element or a `string-set` heading near the bottom of a page leaves the next page empty and puts its content one page later. Prince does not.
 - Headings do not keep with the next block (`break-after: avoid`), which is the rest of the difference to Prince in `examples/transform`.
+
+## Fragmentation model (design, 2026-11-12)
+
+Written after the paragraph-splitting attempt (branch
+`paperworx/paragraph-split-in-place`, parked, two local commits). That fix
+derived its rule from Chrome probes and matched Chrome on 110 of them, and two
+independent reviewers still found lost lines in paragraphs with padding or an
+inline-block. The same class of finding came back in every review round of
+step 2. This section steps back: what the spec and Chromium do, what the walker
+lacks to do the same, and in which order to add it.
+
+Sources read on 2026-11-12: css-break-3 Editor's Draft (22 Oct 2025),
+css-break-4 (14 Apr 2026), css-tables-3, and Chromium `main` under
+`third_party/blink/renderer/core/layout/`.
+
+### The rules
+
+| # | Rule | Spec | Chromium |
+|---|---|---|---|
+| R1 | Breaks are allowed between siblings (class A), between line boxes (class B), and between a box's content edge and its first or last child only where there is a gap (class C) | css-break-3 §3.3: "Class A: Between sibling boxes", "Class B: Between line boxes inside a block container box" | `CalculateBreakAppealBefore`: no separation from the container means "not a valid break point", appeal `kBreakAppealLastResort` |
+| R2 | A break between lines keeps `orphans` lines before it and `widows` after it, both 2 by default. If that leaves no break point the restriction is dropped | §4.4 rule 3, and "rule 3 is dropped to provide more break points" | `FinalizeForFragmentation`: `line = max(lines - widows, min(lines, orphans))`. Orphans win a tie: three lines of which two fit break 2 / 1 |
+| R3 | `break-inside: avoid` applies to every box except inline-level boxes, so also to table rows, row groups and cells. It is dropped when the box cannot fit a whole page | §3.2, §4.4 | `CalculateBreakAppealInside` gives a break inside the box the appeal `kBreakAppealViolatingBreakAvoid`. The break before the box is better, so the box moves; on a fresh page it breaks inside |
+| R4 | A line box, a replaced element, an inline-block and a scroll container are monolithic: no break inside. Monolithic content that does not fit moves to the next page; at the top of a page it stays and overflows | §4.1 "monolithic: it contains no possible break points" | `LayoutBox::IsMonolithic`; `MovePastBreakpoint` "monolithic content at the beginning of the fragmentainer" |
+| R5 | At a break no border and no padding are drawn (`box-decoration-break: slice`). The top border and padding belong to the first fragment, the bottom ones to the last | §5.4 "no border and no padding are inserted at a break" | `FinishFragmentation`: `sides.block_start = false` on continuations, `sides.block_end = false` when the box breaks |
+| R6 | When the content fits but the bottom padding or border does not, the break moves earlier (lines are pulled over) rather than cutting through the padding. Cutting it is the last resort | — | `FinishFragmentation`: "If we have found a better early break, we should break there. Otherwise mark the break as unappealing" |
+| R7 | A box that breaks fills the rest of the page; what it has used counts towards its `height`, and the rest continues on the next page | §5.3 "its content box extends to fill any remaining fragmentainer extent" | `ConsumedBlockSize` in the break token; `desired = total - previously_consumed` |
+| R8 | Margins next to an unforced break are dropped; after a forced break the following margin is kept | §5.2 | `AdjustMarginsForFragmentation`; "Margins after a forced break should be retained" |
+| R9 | The cells of a table row, and the items of a flex or grid row, are parallel flows: each breaks on its own at the same page boundary, and the row ends where its tallest cell ends | css-tables-3 §6.1 | `table_row_layout_algorithm.cc`: "each cell establishes a parallel flows that needs to be examined separately" |
+| R10 | Every page gets some content | §4.4 "must place at least some content on each fragmentainer" | `MovePastBreakpoint`: "we cannot break before this child, or there'd be no progress" |
+| R11 | Among the possible breaks, take the one with the highest appeal, and among those the one that fits the most content | §4.4 orders which rules to drop | `break_appeal.h`: `LastResort < ViolatingBreakAvoid < ViolatingOrphansAndWidows < Perfect`; the tutorial: "highest appeal (primary criterion) that also fits as much content as possible" |
+
+Where Chrome departs from the spec, and what we follow:
+
+- **R2, three lines of which two fit.** The spec text prefers moving the
+  paragraph; Chrome breaks 2 / 1 and calls it a perfect break. We follow
+  Chrome, measured on `para-n3-f2`.
+- **Table rows.** css-tables-3 §6.1 says a row under half the page height
+  should stay whole. Chrome does not do that: a three-line row breaks 2 / 1
+  like a paragraph (measured, `row-n3-f2`). We follow Chrome.
+- **Prince 17** uses orphans 1 / widows 1 by default and drops a
+  negative-margin sibling after a split. It is a second opinion, not the
+  reference, wherever it differs from Chrome.
+
+### What the walker lacks
+
+Chromium's fragmentation rests on four things. The walker has none of them as
+a concept; it has local checks that each cover one rule in one place.
+
+| Chromium | fulgur today | Bugs that follow |
+|---|---|---|
+| A **break token**: what a fragment of a box contains (line range, consumed height) and so which edges it has | A `Fragment` is a rectangle. `render.rs` works out afterwards which lines a rectangle holds, by adding up line heights (`paragraph_lines_for_page`), and draws a full box per slice | Lines lost when the paragraph has padding, a border or an inline-block (pagination measures Parley's line metrics, the renderer re-stacks lines with its own aligned heights); a border drawn on both sides of a cut; the list marker drawn on every slice; a leaf with a `height` cannot be sliced (R7) |
+| **Break appeal** on every candidate break, and the best earlier break remembered | `avoid_fits_whole_page`, `leading_unbreakable_extent`, the orphans check, `below_sibling`: one yes/no check per rule, each in both walkers | The rules do not compose. No place for `break-after: avoid` (a heading keeps with the next block), `break-inside: avoid` on a `<tbody>`, or R6 |
+| **The page's own height** for each page | One `page_height_px`; page 0's shorter height is corrected in the body walker only | Nested content on page 1 is drawn up to the body's offset below the content box; named pages of another size would do the same |
+| **Parallel flows** | `RowState` restores the cursor around a sequential walk of the cells | The co-split findings of step 2; a table without a repeating header did not co-split at all |
+
+### Shape of the implementation: four layers, one direction
+
+Bert's constraint (2026-11-12): the capabilities must not be machinery slapped
+onto the walker. They are broken down by kind, each kind lives in one place,
+and the walker's main path (a box fits, place it, move on) stays as it is.
+
+Each rule above is one of four kinds of thing, and each kind has one home:
+
+| Layer | What it is | Knows about | Rules | Exists today as |
+|---|---|---|---|---|
+| **Facts** | Read-only description of the laid-out tree, built before or beside the walk: the boxes of a container in order, what kind each is (monolithic, lines, block container, row of parallel boxes), its line extents, its break properties | Blitz, Taffy, styles | R1, R4, R9, and the inputs of the others | `flow_items`, `flow_rows`, `leading_unbreakable_extent`, `avoids_break_inside` (parked branch) |
+| **Decision** | Pure functions: given the facts of one box and the space left, where is the break and how good is it | Numbers only: heights, counts, an appeal. No document, no geometry table | R2, R3, R6, R10, R11 | `lines_before_break` (parked branch); otherwise spread through both walkers as inline `if`s |
+| **Walk** | Places boxes in order and carries the cursor. When a box does not fit it asks the decision layer once and acts on the answer | Pages, cursor, previous box | R7, R8 (placement and carried height) | `PrevBox::place`, the two walkers |
+| **Record** | What each fragment holds, written by the walk, read by the renderer | Nothing; it is data | R5 | `Fragment` (a rectangle only) |
+
+The dependencies run one way: the walk reads facts and calls decisions; the
+renderer reads the record. A decision never touches the geometry table, a fact
+never depends on the page, and the renderer never re-derives what the walk
+decided.
+
+What this rules out:
+
+- **A rule written as a branch in the walk.** `avoid_fits_whole_page`, the
+  orphans pre-check and `below_sibling` are decisions living in the walk,
+  once per walker. They move to the decision layer; the walk keeps one
+  question: "this box does not fit: break before it, inside it, or place it
+  anyway?"
+- **Cost on the main path.** Facts beyond the box list and every decision are
+  computed only when a box does not fit. A document that fits its pages runs
+  the walk it runs today.
+- **A fix in the renderer for a pagination decision**, such as
+  `is_continuation_fragment` on the parked branch, which guesses from the
+  fragment list what the walk already knew.
+- **State added to the walk for one case.** New walk state has to be one of:
+  the cursor, the previous box, or the page. Anything else is a fact (compute
+  it) or a record (write it).
+
+Each layer is tested at its own level: decisions with plain numbers and no
+document, facts against a parsed document, the walk and record through the
+break matrix.
+
+### What to add, in this order
+
+Each step is a capability, not a case. Each keeps the output contract of
+"What must not change" above and reports its blast radius the same way. Each
+names the layer it adds to: step 1 is the record, step 2 the walk, steps 3 and
+5 the decision layer (step 5 also moves the existing inline checks into it),
+step 4 the walk's page, step 6 the walk itself.
+
+1. **Fragment content (the break token).** `PaginationGeometry` records, per
+   fragment, what it holds: for a paragraph the line range; for any box
+   whether the fragment has the box's start edge and its end edge (the first
+   line sits below the top border and padding only when the fragment has the
+   start edge, so its top needs no field of its own). The renderer draws that and derives nothing. Pagination
+   measures lines with the heights the renderer stacks them with, so the two
+   cannot disagree.
+   Fixes: lost lines (padding, border, inline-block), borders at a cut, the
+   marker (replaces `is_continuation_fragment`), and makes R5 one rule.
+2. **Consumed height (R7).** A box that breaks fills the page and carries its
+   remaining height. One slicing routine for a leaf with a `height`, used by
+   both walkers, replacing the body walker's oversized-only slice loop.
+   Fixes: the five "leaf block" matrix rows, and a paragraph with a `height`
+   larger than its lines.
+3. **Split paragraphs in place (R2, R6).** The parked branch, rebuilt on 1 and
+   2: `lines_before_break` is already Chromium's formula. Adds R6 (pull lines
+   over rather than strand the bottom padding).
+4. **Page heights.** The nested walker takes the height of the page it is on.
+   Replaces the page-0 shift in the body walker.
+5. **Break appeal (R3, R11).** One function ranks the break before a box
+   against the best break inside it. `avoid` on a row, a row group and a cell,
+   and `break-after: avoid`, become inputs to it instead of separate checks.
+   This is the step that needs the walker to look ahead: it can, because all
+   geometry is fixed before pagination starts, so the break points of a
+   subtree can be listed without laying anything out again.
+6. **One walker**, as planned in step 4 above, with rows as parallel flows
+   (R9) rather than a restored cursor.
+
+Steps 1–3 remove the content-loss class. Steps 4–6 remove the reasons the
+review rounds keep finding the same kind of problem.
+
+### Decisions (Bert, 2026-11-12)
+
+1. **Order.** Steps 1–3 first, then 4–6.
+2. **PR #10** is merged into `paperworx/repros` (squash, `e39889ac`); the
+   steps branch from there.
+3. **`break-after: avoid` and `break-before: avoid`** are parsed as part of
+   step 5 (`BreakBefore` and `BreakAfter` in `draw_primitives.rs` have only
+   `Auto` and `Page` today).
+4. **Upstream.** Fork-only. Step 1 changes `PaginationGeometry`, which makes a
+   later upstream sync of `pagination_layout.rs` and `render.rs` harder; that
+   cost is accepted.
+
+### Step 1 as built (2026-11-12)
+
+Branch `paperworx/fragment-part`. `Fragment` has a `part: BoxPart`
+(`start_edge`, `end_edge`, `lines: Option<LineSlice>`); `BoxPart::WHOLE` is
+every box that did not break.
+
+- **Record.** `fragment_inline_root` writes the line range of each fragment
+  of a broken paragraph. `mark_broken_edges` runs once over the finished
+  table and gives every broken box its start edge on its first page and its
+  end edge on its last. Boxes with two fragments on one page (multicol) and
+  repeated boxes are left whole.
+- **Walk.** A broken paragraph counts its border and padding at the edges it
+  has. An unsplit paragraph is as tall as its laid-out box in both walkers.
+  Whether it fits the rest of the page is still asked of its lines plus its
+  own border and padding.
+- **Renderer.** `lines_of_slice` takes lines by index, `BlockStyle::sliced`
+  removes border, padding and radii at a missing edge, and the marker is
+  drawn only with the start edge.
+
+Not done, and where it goes:
+
+- Lines are still measured by Parley's ink extent when a paragraph breaks;
+  lines resized for an inline box or inline image are taller when drawn than
+  layout knows. Own step after step 3: one line-box function for pagination
+  and convert, with the inline box's baseline read from the DOM.
+- A padded paragraph that does not fit the rest of the page moves whole
+  (Chrome splits it); the bottom padding is not part of the fit test. Step 3.
+- A box with a `height` that crosses a page is not sliced; its background is
+  positioned per slice rather than as if unbroken; tables do not read the
+  edges. Step 2.
+- `paragraph_lines_for_page` keeps its height-matching path for paragraphs
+  sliced by the block path (`break-inside: avoid` or a transform, taller
+  than a page) and for multicol.
+- Chrome's usable A4 page with 20mm margins is 972px tall, fulgur's
+  971.34px, so a fit that hinges on less than a pixel can differ.
+
+### Measured, to carry into the steps
+
+- The parked branch matches Chrome on 110 plain-paragraph probes, fixes
+  paperworx repro 16 (a table row splits; `avoid` on a `<tr>` holds), and adds
+  18 matrix rows. Its `lines_before_break`, `paragraph_leading_height`,
+  `avoids_break_inside` and the plain-table co-split carry over.
+- Its known failures, all from the missing break token: a padded or bordered
+  paragraph split mid-page loses a line or draws one past the page bottom; a
+  paragraph with an inline-block loses 3–6 words; a negative body offset
+  misplaces page 1; `avoid` on a `<tbody>` is not honoured.
+- Found on the way and older than this work: at body level, the block after a
+  multi-line paragraph with padding or a border overlaps it by the padding
+  height; a container's bottom padding and border are dropped after its last
+  child split; a table cell's `height` shorter than its content does not grow
+  the row (Blitz layout, not pagination).

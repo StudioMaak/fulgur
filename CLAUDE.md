@@ -448,6 +448,37 @@ macOS, it costs one build, and it is what lets parallel work report its blast ra
 before anyone regenerates anything. Repros 10-12 predicted 17 moving fixtures this way and
 the container named exactly those 17.
 
+### Pagination ground rules: spec and reference first, then code
+
+Set by Bert on 2026-11-12, after a paragraph-splitting fix derived from probes
+alone lost lines in padded paragraphs. For any change to pagination
+(`pagination_layout.rs`, the paragraph and block slicing in `render.rs`), in
+this order:
+
+1. **Spec.** Quote the text that governs the case: css-break-3 / css-break-4,
+   css-tables-3, css-page-3.
+2. **Reference implementation.** Find the Chromium LayoutNG code that
+   implements it and how it reasons: `third_party/blink/renderer/core/layout/`
+   — `block_layout_algorithm.cc`, `fragmentation_utils.cc`, `break_appeal.h`,
+   `block_break_token.h`, `table/`, and `block_fragmentation_tutorial.md`.
+   Where Chrome departs from the spec, say so and say which one we follow.
+3. **Model.** Ask what the walker has to know or remember to follow the rule.
+   If it cannot hold that (a fragment's content, a better earlier break, a
+   page's own height), widen the walker first. Do not fit the case into the
+   existing walk with another local check.
+   And keep it in its layer: a fact about the tree, a pure decision, the
+   walk, or the record the renderer reads (see the plan doc). A rule is not a
+   new branch on the walk's main path.
+4. **Show Bert steps 1–3** before writing code.
+5. **Code, then measure.** Probes against Chrome and Prince verify the rule;
+   they are not where the rule comes from. A probe set built from the cases
+   you thought of will pass; the padded and inline-block paragraphs were found
+   by an independent reviewer, not by the 110 probes that all matched.
+
+The current model, its gaps and the planned order are in
+`docs/plans/2026-11-11-pagination-walker-box-list.md`, section "Fragmentation
+model".
+
 ### Never trust a README over a measurement
 
 WeasyPrint 69 and Chrome 151 headless-shell **agree to ~0.1 mm** on every case tested, so

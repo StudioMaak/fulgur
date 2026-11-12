@@ -437,6 +437,7 @@ mod tests {
                         y: 0.0_f32.as_px(),
                         width: 0.0_f32.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: crate::pagination_layout::BoxPart::WHOLE,
                     },
                     Fragment {
                         page_index: 3,
@@ -444,6 +445,7 @@ mod tests {
                         y: 0.0_f32.as_px(),
                         width: 0.0_f32.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: crate::pagination_layout::BoxPart::WHOLE,
                     },
                 ],
                 is_repeat: false,

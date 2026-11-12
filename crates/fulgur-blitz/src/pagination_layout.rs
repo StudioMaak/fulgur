@@ -83,6 +83,43 @@ pub struct Fragment {
     pub y: crate::units::Px,
     pub width: crate::units::Px,
     pub height: crate::units::Px,
+    /// Which part of the source box this fragment holds. Written by the walk,
+    /// read by the renderer.
+    pub part: BoxPart,
+}
+
+/// Which part of its box a fragment holds. The walk writes it; the renderer
+/// reads it and derives nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxPart {
+    /// The fragment has the box's block-start border and padding.
+    pub start_edge: bool,
+    /// The fragment has the box's block-end border and padding.
+    pub end_edge: bool,
+    /// For a paragraph: the lines this fragment holds.
+    pub lines: Option<LineSlice>,
+}
+
+impl BoxPart {
+    /// The whole box: both edges, no line slice.
+    pub const WHOLE: BoxPart = BoxPart {
+        start_edge: true,
+        end_edge: true,
+        lines: None,
+    };
+}
+
+/// A run of a paragraph's lines held by one fragment.
+///
+/// The first line sits at the top of the fragment's content: below the
+/// box's top border and padding when the fragment has the start edge, at the
+/// fragment's `y` otherwise.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineSlice {
+    /// Index of the first line.
+    pub start: u32,
+    /// One past the last line.
+    pub end: u32,
 }
 
 /// Per-source-node geometry: every page on which the node has a placement.
@@ -278,7 +315,40 @@ fn run_pass_inner<'a>(
         // layout is what actually does the pagination work.
         tree.fragment_pagination_root();
     }
-    tree.take_geometry()
+    let mut geometry = tree.take_geometry();
+    mark_broken_edges(&mut geometry);
+    geometry
+}
+
+/// Record, for every box the walk broke across pages, which fragment has its
+/// start edge and which its end edge: the fragment on the first page it
+/// occupies and the one on the last (css-break-3 §5.4, `box-decoration-break:
+/// slice`: "no border and no padding are inserted at a break").
+///
+/// Runs once over the finished table and touches only boxes with more than
+/// one fragment, so a box that fits its page is never visited twice. A box
+/// with two fragments on one page (multicol columns) is left as the walk
+/// wrote it: which column edge is a break is the multicol pass's to say.
+fn mark_broken_edges(geometry: &mut PaginationGeometryTable) {
+    for geom in geometry.values_mut() {
+        if !geom.is_split() {
+            continue;
+        }
+        let one_per_page = geom
+            .fragments
+            .windows(2)
+            .all(|pair| pair[0].page_index < pair[1].page_index);
+        if !one_per_page {
+            continue;
+        }
+        // Pages strictly increase, so the first and last fragment are the
+        // first and last page.
+        let last = geom.fragments.len() - 1;
+        for (i, frag) in geom.fragments.iter_mut().enumerate() {
+            frag.part.start_edge = i == 0;
+            frag.part.end_edge = i == last;
+        }
+    }
 }
 
 impl<'a> PaginationLayoutTree<'a> {
@@ -478,6 +548,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 y: 0.0_f32.as_px(),
                 width: body_w.as_px(),
                 height: body_layout.size.height.as_px(),
+                part: BoxPart::WHOLE,
             });
 
         // Prefer body's `layout_children` — same rationale as
@@ -576,6 +647,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             y: cursor_y.as_px(),
                             width: 0.0_f32.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                     emitted += 1;
                 }
@@ -662,6 +734,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             y: cursor_y.as_px(),
                             width: child_w.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                     emitted += 1;
                 }
@@ -777,10 +850,11 @@ impl<'a> PaginationLayoutTree<'a> {
                 // the child" fallback (CSS Fragmentation §4.2, class A
                 // break point) taken when the inline split path can't
                 // honour widow / orphan constraints within the strip.
-                let para_total_h = line_metrics
-                    .last()
-                    .map(|l| l.1 - line_metrics[0].0)
-                    .unwrap_or(child_h);
+                // Measured by the lines and the box's own border and padding,
+                // not by `child_h`: a `height` taller than the lines must not
+                // send a paragraph whose lines fit to the next page.
+                let insets = BlockInsets::of(&layout);
+                let para_total_h = paragraph_fit_height(&line_metrics, insets);
                 if cursor_y > 0.0 && cursor_y + para_total_h > capacity(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
@@ -795,6 +869,8 @@ impl<'a> PaginationLayoutTree<'a> {
                     page_index,
                     self.page_height_px,
                     &line_metrics,
+                    insets,
+                    child_h,
                 );
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
@@ -1049,6 +1125,7 @@ impl<'a> PaginationLayoutTree<'a> {
                         y: cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: first_slice_h.as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 record_subtree_descendants(
                     &mut self.geometry,
@@ -1128,6 +1205,7 @@ impl<'a> PaginationLayoutTree<'a> {
                                 y: 0.0_f32.as_px(),
                                 width: child_w.as_px(),
                                 height: last_slice_h.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                         remaining -= last_slice_h;
                     }
@@ -1170,6 +1248,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 y: cursor_y.as_px(),
                 width: child_w.as_px(),
                 height: child_h.as_px(),
+                part: BoxPart::WHOLE,
             };
             self.geometry
                 .entry(child_id)
@@ -1387,6 +1466,7 @@ fn record_subtree_descendants(
                         y: child_y.as_px(),
                         width: 0.0_f32.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             if child
@@ -1418,6 +1498,7 @@ fn record_subtree_descendants(
                 y: child_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -2544,6 +2625,7 @@ fn record_band_template(
                 y: cell_y.as_px(),
                 width: layout.size.width.as_px(),
                 height: layout.size.height.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -2801,6 +2883,7 @@ fn fragment_repeating_table(
                     y: first_table_top.as_px(),
                     width: parent_w.as_px(),
                     height: header.band_height_px.as_px(),
+                    part: BoxPart::WHOLE,
                 },
             );
         first_table_top
@@ -2951,6 +3034,7 @@ fn fragment_block_subtree_inner(
                 y: cursor_in.as_px(),
                 width: parent_w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
         return (page_in, cursor_in + h);
     }
@@ -3191,6 +3275,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3236,6 +3321,7 @@ fn fragment_block_subtree_inner(
                         y: cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             // Honour `break-after: page` for zero-height elements
@@ -3252,6 +3338,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3317,6 +3404,7 @@ fn fragment_block_subtree_inner(
                     y: page_start_y.as_px(),
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
+                    part: BoxPart::WHOLE,
                 });
             page_index += 1;
             page_start_y = 0.0;
@@ -3392,10 +3480,10 @@ fn fragment_block_subtree_inner(
             // itself this paragraph (`cursor_y == page_start_y`, the
             // fulgur-2s7p.1 repro shape), this is skipped and the split
             // begins right where the container currently sits.
-            let para_total_h = line_metrics
-                .last()
-                .map(|l| l.1 - line_metrics[0].0)
-                .unwrap_or(child_h);
+            // Measured by the lines and the box's own border and padding, not
+            // by `child_h` (see the body walker's same pre-check).
+            let insets = BlockInsets::of(&layout);
+            let para_total_h = paragraph_fit_height(&line_metrics, insets);
             // codex P1: `entry_page_index` is captured *before* the
             // split-before advance below, so `new_page_index >
             // entry_page_index` (checked further down) is true whenever
@@ -3454,6 +3542,7 @@ fn fragment_block_subtree_inner(
                             } else {
                                 (cursor_y - page_start_y).as_px()
                             },
+                            part: BoxPart::WHOLE,
                         });
                 }
                 page_index += 1;
@@ -3479,6 +3568,8 @@ fn fragment_block_subtree_inner(
                 page_index,
                 page_height_px,
                 &line_metrics,
+                insets,
+                child_h,
             );
             // Same shape as the recursion branch's fulgur-oc51 fix
             // below: without a parent fragment per page the split
@@ -3502,6 +3593,7 @@ fn fragment_block_subtree_inner(
                                 y: page_start_y.as_px(),
                                 width: parent_w.as_px(),
                                 height: first_height.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                     }
                 }
@@ -3521,6 +3613,7 @@ fn fragment_block_subtree_inner(
                                 y: 0.0_f32.as_px(),
                                 width: parent_w.as_px(),
                                 height: page_height_px.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                     }
                 }
@@ -3626,6 +3719,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3719,6 +3813,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             page_index += 1;
@@ -3854,6 +3949,7 @@ fn fragment_block_subtree_inner(
                                     y: page_start_y.as_px(),
                                     width: parent_w.as_px(),
                                     height: prev_height.as_px(),
+                                    part: BoxPart::WHOLE,
                                 });
                         } else if let Some(fragment) = geometry
                             .entry(parent_id)
@@ -3881,6 +3977,7 @@ fn fragment_block_subtree_inner(
                                     y: 0.0_f32.as_px(),
                                     width: parent_w.as_px(),
                                     height: page_height_px.as_px(),
+                                    part: BoxPart::WHOLE,
                                 });
                         }
                     }
@@ -3920,6 +4017,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3961,6 +4059,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             page_index += 1;
@@ -3987,6 +4086,7 @@ fn fragment_block_subtree_inner(
                 y: child_page_y.as_px(),
                 width: child_w.as_px(),
                 height: child_h.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -4023,6 +4123,7 @@ fn fragment_block_subtree_inner(
                     y: page_start_y.as_px(),
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
+                    part: BoxPart::WHOLE,
                 });
             page_index += 1;
             cursor_y = 0.0;
@@ -4066,6 +4167,7 @@ fn fragment_block_subtree_inner(
             y: page_start_y.as_px(),
             width: parent_w.as_px(),
             height: (cursor_y - page_start_y).as_px(),
+            part: BoxPart::WHOLE,
         });
 
     (page_index, cursor_y)
@@ -4145,6 +4247,8 @@ fn fragment_inline_root(
     initial_page_index: u32,
     page_height_px: f32,
     line_metrics: &[(f32, f32)],
+    insets: BlockInsets,
+    box_height: f32,
 ) -> (u32, f32, usize) {
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0);
@@ -4158,7 +4262,16 @@ fn fragment_inline_root(
 
     for (i, &(_line_top_local, line_bottom_local)) in line_metrics.iter().enumerate() {
         let frag_top_local = line_metrics[fragment_start_idx].0;
-        let projected_bottom_in_body = paragraph_top_in_body + (line_bottom_local - frag_top_local);
+        // Border and padding above the current fragment's first line. Only
+        // the fragment with the box's start edge has them (css-break-3 §5.4:
+        // "no border and no padding are inserted at a break").
+        let top_inset = if fragment_start_idx == 0 {
+            insets.top
+        } else {
+            0.0
+        };
+        let projected_bottom_in_body =
+            paragraph_top_in_body + top_inset + (line_bottom_local - frag_top_local);
 
         if projected_bottom_in_body > page_height_px && i > fragment_start_idx {
             // fulgur-s67g Phase 2.1: honour widow / orphan minimums.
@@ -4191,13 +4304,21 @@ fn fragment_inline_root(
             // Emit them as one fragment, advance to the next page, and
             // start the next fragment at line i.
             let prev_line_bottom = line_metrics[i - 1].1;
-            let frag_h = prev_line_bottom - frag_top_local;
+            let frag_h = top_inset + (prev_line_bottom - frag_top_local);
             let frag = Fragment {
                 page_index,
                 x: paragraph_x.as_px(),
                 y: paragraph_top_in_body.as_px(),
                 width: width.as_px(),
                 height: frag_h.as_px(),
+                part: BoxPart {
+                    start_edge: fragment_start_idx == 0,
+                    end_edge: false,
+                    lines: Some(LineSlice {
+                        start: fragment_start_idx as u32,
+                        end: i as u32,
+                    }),
+                },
             };
             geometry.entry(child_id).or_default().fragments.push(frag);
             emitted += 1;
@@ -4208,22 +4329,69 @@ fn fragment_inline_root(
         }
     }
 
-    // Final fragment covers lines [fragment_start_idx, end).
+    // Final fragment covers lines [fragment_start_idx, end) and has the
+    // box's end edge.
     let frag_top_local = line_metrics[fragment_start_idx].0;
     let last_bottom_local = line_metrics.last().expect("non-empty checked above").1;
-    let frag_h = last_bottom_local - frag_top_local;
+    // A paragraph that did not break is as tall as layout made its box, like
+    // any other block: a `height` or `min-height` can make that taller than
+    // its lines. One that broke ends below its last line.
+    let (frag_h, part) = if fragment_start_idx == 0 {
+        (box_height, BoxPart::WHOLE)
+    } else {
+        (
+            last_bottom_local - frag_top_local + insets.bottom,
+            BoxPart {
+                start_edge: false,
+                end_edge: true,
+                lines: Some(LineSlice {
+                    start: fragment_start_idx as u32,
+                    end: total_lines as u32,
+                }),
+            },
+        )
+    };
     let frag = Fragment {
         page_index,
         x: paragraph_x.as_px(),
         y: paragraph_top_in_body.as_px(),
         width: width.as_px(),
         height: frag_h.as_px(),
+        part,
     };
     geometry.entry(child_id).or_default().fragments.push(frag);
     emitted += 1;
 
     let cursor_y = paragraph_top_in_body + frag_h;
     (page_index, cursor_y, emitted)
+}
+
+/// A box's border plus padding on the block axis, in CSS px.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct BlockInsets {
+    top: f32,
+    bottom: f32,
+}
+
+impl BlockInsets {
+    fn of(layout: &taffy::Layout) -> Self {
+        Self {
+            top: layout.border.top + layout.padding.top,
+            bottom: layout.border.bottom + layout.padding.bottom,
+        }
+    }
+
+    fn total(self) -> f32 {
+        self.top + self.bottom
+    }
+}
+
+/// The height a paragraph needs to fit a page whole: its lines plus its own
+/// border and padding. Not the laid-out box height, because a `height` taller
+/// than the lines must not send a paragraph whose lines fit to the next page.
+/// `line_metrics` must be non-empty.
+fn paragraph_fit_height(line_metrics: &[(f32, f32)], insets: BlockInsets) -> f32 {
+    line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total()
 }
 
 /// Per-page state for a named string emitted by `string-set:`.
@@ -4535,6 +4703,7 @@ pub fn append_position_fixed_fragments(
                 y: y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
             emitted += 1;
         }
@@ -4631,6 +4800,7 @@ fn record_fixed_subtree_descendants(
                 y: stored_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
             *emitted += 1;
         }
@@ -5299,6 +5469,7 @@ fn record_subtree_fragments_at_offset(
                         y: stored_y.as_px(),
                         width: w.as_px(),
                         height: stored_h.as_px(),
+                        part: BoxPart::WHOLE,
                     });
                     *emitted += 1;
                 }
@@ -5349,6 +5520,7 @@ fn record_subtree_fragments_at_offset(
                             y: stored_y.as_px(),
                             width: 0.0_f32.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                 }
                 continue;
@@ -5873,6 +6045,67 @@ fn compute_pagination_layout(
 
 #[cfg(test)]
 mod tests {
+    fn whole_fragment(page_index: u32) -> super::Fragment {
+        use crate::units::F32Units;
+        super::Fragment {
+            page_index,
+            x: 0.0_f32.as_px(),
+            y: 0.0_f32.as_px(),
+            width: 100.0_f32.as_px(),
+            height: 50.0_f32.as_px(),
+            part: super::BoxPart::WHOLE,
+        }
+    }
+
+    fn edges(geom: &super::PaginationGeometry) -> Vec<(bool, bool)> {
+        geom.fragments
+            .iter()
+            .map(|f| (f.part.start_edge, f.part.end_edge))
+            .collect()
+    }
+
+    #[test]
+    fn mark_broken_edges_gives_the_first_and_last_page_their_edge() {
+        let mut table = super::PaginationGeometryTable::new();
+        table.entry(1).or_default().fragments =
+            vec![whole_fragment(2), whole_fragment(3), whole_fragment(4)];
+        super::mark_broken_edges(&mut table);
+        assert_eq!(
+            edges(&table[&1]),
+            vec![(true, false), (false, false), (false, true)]
+        );
+    }
+
+    #[test]
+    fn mark_broken_edges_leaves_unbroken_repeated_and_same_page_boxes() {
+        let mut table = super::PaginationGeometryTable::new();
+        // One fragment: not broken.
+        table.entry(1).or_default().fragments = vec![whole_fragment(0)];
+        // Repeated on every page (`position: fixed`): each copy is whole.
+        let repeated = table.entry(2).or_default();
+        repeated.fragments = vec![whole_fragment(0), whole_fragment(1)];
+        repeated.is_repeat = true;
+        // Two fragments on one page (multicol columns).
+        table.entry(3).or_default().fragments =
+            vec![whole_fragment(0), whole_fragment(0), whole_fragment(1)];
+        super::mark_broken_edges(&mut table);
+        for id in [1, 2, 3] {
+            assert!(
+                edges(&table[&id]).iter().all(|&e| e == (true, true)),
+                "node {id}: {:?}",
+                table[&id].fragments
+            );
+        }
+    }
+
+    /// The box height of a paragraph with these lines and no border or
+    /// padding, for `fragment_inline_root`'s `box_height`.
+    fn lines_height(lines: &[(f32, f32)]) -> f32 {
+        match (lines.first(), lines.last()) {
+            (Some(first), Some(last)) => last.1 - first.0,
+            _ => 0.0,
+        }
+    }
     use super::*;
     use crate::blitz_adapter;
     use std::ops::DerefMut;
@@ -7169,6 +7402,7 @@ mod tests {
             y: 10.0_f32.as_px(),
             width: 50.0_f32.as_px(),
             height: 20.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         template.entry(8).or_default().fragments.push(Fragment {
             page_index: 0,
@@ -7176,6 +7410,7 @@ mod tests {
             y: 12.0_f32.as_px(),
             width: 30.0_f32.as_px(),
             height: 10.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let table_pages = [(0, 10.0), (1, 0.0)];
         let mut first = PaginationGeometryTable::new();
@@ -7803,6 +8038,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 0,
@@ -7810,6 +8046,7 @@ h2 { string-set: chapter-title content(text); }
             y: 50.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(30).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -7817,6 +8054,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
 
         let mut markers: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
@@ -7861,6 +8099,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 800.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(42).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -7868,6 +8107,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 200.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
 
         let mut markers: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
@@ -9990,7 +10230,8 @@ h2 { string-set: chapter-title content(text); }
     ///
     /// Fixture: 2-column grid row. Column A (60px) establishes the
     /// row's true bottom. Column B is a short 2-line `<p>` with
-    /// `break-after: page` whose own bottom is well under 60. The
+    /// `break-after: page` whose own bottom is well under 60
+    /// (`align-self: start`, so the row does not stretch its box). The
     /// grid's own parent fragment on page 0 — closed by column B's
     /// `break-after: page` — must span the row's true height (60), not
     /// column B's shorter one.
@@ -10000,7 +10241,7 @@ h2 { string-set: chapter-title content(text); }
             <html><body style="margin: 0; padding: 0; font-size: 12px">
               <div id="grid" style="display: grid; grid-template-columns: 60px 60px; width: 120px;">
                 <div id="col_a" style="height: 60px; width: 60px"></div>
-                <p id="col_b" style="margin:0; padding:0; line-height:10px; width:20px; break-after:page">one two</p>
+                <p id="col_b" style="margin:0; padding:0; line-height:10px; width:20px; align-self:start; break-after:page">one two</p>
               </div>
             </body></html>
         "#;
@@ -10284,6 +10525,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 1.0_f32.as_px(),
             height: 1.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         assert_eq!(super::implied_page_count(&geom), 3);
     }
@@ -10300,9 +10542,16 @@ h2 { string-set: chapter-title content(text); }
         // 225 > 200), leaving 1 line in the tail — widow violated.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
         let (new_page, new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, /*child_id=*/ 1, /*paragraph_x=*/ 0.0, /*width=*/ 100.0,
-            /*initial_cursor_y=*/ 0.0, /*initial_page_index=*/ 0,
-            /*page_height_px=*/ 200.0, &lines,
+            &mut geom,
+            /*child_id=*/ 1,
+            /*paragraph_x=*/ 0.0,
+            /*width=*/ 100.0,
+            /*initial_cursor_y=*/ 0.0,
+            /*initial_page_index=*/ 0,
+            /*page_height_px=*/ 200.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -10325,8 +10574,18 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 200 → natural split at line 2 (bottom 225 > 200).
         // first_size = 2 ≥ orphans, remaining_size = 2 ≥ widows. Split OK.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0), (225.0, 300.0)];
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 200.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            200.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
+        );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
         let frags = &geom.get(&1).unwrap().fragments;
@@ -10352,8 +10611,18 @@ h2 { string-set: chapter-title content(text); }
         // Page strip = 100 → natural split at line 1 (bottom 150 > 100).
         // first_size = 1 < orphans=2. Don't split.
         let lines = vec![(0.0, 75.0), (75.0, 150.0), (150.0, 225.0)];
-        let (new_page, _new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 0.0, 0, 100.0, &lines);
+        let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
+        );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
         let frags = &geom.get(&1).unwrap().fragments;
@@ -11335,6 +11604,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         assert!(!geom.is_split());
     }
@@ -11349,6 +11619,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         assert!(geom.is_split());
@@ -11367,6 +11638,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         assert!(
@@ -11395,6 +11667,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11419,6 +11692,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
@@ -11450,6 +11724,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11479,6 +11754,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -11486,6 +11762,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11510,6 +11787,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         let states = collect_counter_states(&geom, &ops);
@@ -11525,8 +11803,18 @@ h2 { string-set: chapter-title content(text); }
     #[test]
     fn fragment_inline_root_empty_line_metrics_returns_early() {
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 1, 0.0, 100.0, 42.0, 3, 800.0, &[]);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            42.0,
+            3,
+            800.0,
+            &[],
+            super::BlockInsets::default(),
+            0.0,
+        );
         assert_eq!(emitted, 0, "empty metrics → no fragments emitted");
         assert_eq!(new_page, 3, "page unchanged");
         assert!(
@@ -11537,6 +11825,135 @@ h2 { string-set: chapter-title content(text); }
             geom.is_empty(),
             "empty metrics must not create a geometry entry"
         );
+    }
+
+    fn uniform_lines(n: usize, h: f32) -> Vec<(f32, f32)> {
+        (0..n).map(|i| (i as f32 * h, (i + 1) as f32 * h)).collect()
+    }
+
+    fn assert_px(actual: f32, expected: f32, what: &str) {
+        assert!(
+            (actual - expected).abs() < 0.01,
+            "{what}: {actual} != {expected}"
+        );
+    }
+
+    /// Without insets the recorded parts cover the lines contiguously, the
+    /// first fragment has only the start edge and the last only the end edge.
+    #[test]
+    fn fragment_inline_root_records_contiguous_line_slices() {
+        // 8 lines of 20px, 100px page: line 5 would end at 120 > 100, and
+        // 5 lines before / 3 after satisfy orphans and widows.
+        let lines = uniform_lines(8, 20.0);
+        let mut geom = PaginationGeometryTable::new();
+        let (page, cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
+        );
+        assert_eq!((page, emitted), (1, 2));
+        let frags = &geom.get(&1).unwrap().fragments;
+        assert_eq!(frags.len(), 2);
+        assert_eq!(
+            frags[0].part,
+            BoxPart {
+                start_edge: true,
+                end_edge: false,
+                lines: Some(LineSlice { start: 0, end: 5 }),
+            }
+        );
+        assert_eq!(
+            frags[1].part,
+            BoxPart {
+                start_edge: false,
+                end_edge: true,
+                lines: Some(LineSlice { start: 5, end: 8 }),
+            }
+        );
+        assert_px(frags[0].height.to_f32(), 100.0, "first height");
+        assert_px(frags[1].height.to_f32(), 60.0, "last height");
+        assert_px(cursor, 60.0, "cursor");
+    }
+
+    /// The top inset counts in the first fragment only and reduces how many
+    /// lines fit; the bottom inset counts in the last fragment only.
+    #[test]
+    fn fragment_inline_root_insets_count_at_the_edges_only() {
+        // 8 lines of 20px, 100px page, top inset 16: line 4 would end at
+        // 16 + 100 = 116 > 100, so the first fragment holds lines 0..4
+        // (16 + 80 = 96). The rest (4 lines) starts at y 0 on page 1:
+        // 80 + bottom inset 10 = 90.
+        let lines = uniform_lines(8, 20.0);
+        let mut geom = PaginationGeometryTable::new();
+        let (page, cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::BlockInsets {
+                top: 16.0,
+                bottom: 10.0,
+            },
+            lines_height(&lines) + 16.0 + 10.0,
+        );
+        assert_eq!((page, emitted), (1, 2));
+        let frags = &geom.get(&1).unwrap().fragments;
+        assert_eq!(
+            frags[0].part.lines,
+            Some(LineSlice { start: 0, end: 4 }),
+            "the top inset costs one line on the first page"
+        );
+        assert!(frags[0].part.start_edge && !frags[0].part.end_edge);
+        assert_px(frags[0].height.to_f32(), 16.0 + 80.0, "first height");
+        assert_eq!(frags[1].part.lines, Some(LineSlice { start: 4, end: 8 }));
+        assert!(!frags[1].part.start_edge && frags[1].part.end_edge);
+        assert_px(frags[1].y.to_f32(), 0.0, "continuation y");
+        assert_px(frags[1].height.to_f32(), 80.0 + 10.0, "last height");
+        assert_px(
+            cursor,
+            frags[1].y.to_f32() + frags[1].height.to_f32(),
+            "cursor",
+        );
+        assert_px(cursor, 90.0, "cursor value");
+    }
+
+    /// A paragraph that fits is one fragment with both edges and both insets.
+    #[test]
+    fn fragment_inline_root_unsplit_with_insets_is_the_whole_box() {
+        let lines = uniform_lines(3, 20.0);
+        let mut geom = PaginationGeometryTable::new();
+        let (page, cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            1,
+            0.0,
+            100.0,
+            0.0,
+            0,
+            1000.0,
+            &lines,
+            super::BlockInsets {
+                top: 16.0,
+                bottom: 10.0,
+            },
+            lines_height(&lines) + 16.0 + 10.0,
+        );
+        assert_eq!((page, emitted), (0, 1));
+        let frags = &geom.get(&1).unwrap().fragments;
+        assert_eq!(frags.len(), 1);
+        assert_eq!(frags[0].part, BoxPart::WHOLE);
+        assert_px(frags[0].height.to_f32(), 16.0 + 60.0 + 10.0, "height");
+        assert_px(cursor, 86.0, "cursor");
     }
 
     /// A paragraph starting partway down a page (non-zero `initial_cursor_y`)
@@ -11553,8 +11970,16 @@ h2 { string-set: chapter-title content(text); }
         let lines = vec![(0.0_f32, 25.0), (25.0, 50.0), (50.0, 75.0), (75.0, 100.0)];
         let mut geom = PaginationGeometryTable::new();
         let (new_page, new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, 1, 5.0, 100.0, /*initial_cursor_y=*/ 50.0,
-            /*initial_page_index=*/ 0, /*page_height_px=*/ 80.0, &lines,
+            &mut geom,
+            1,
+            5.0,
+            100.0,
+            /*initial_cursor_y=*/ 50.0,
+            /*initial_page_index=*/ 0,
+            /*page_height_px=*/ 80.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 2, "expected split into 2 fragments");
         assert_eq!(new_page, 1, "second fragment lands on page 1");
@@ -11602,8 +12027,18 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 50.0, i as f32 * 50.0 + 50.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, new_cursor, emitted) =
-            super::fragment_inline_root(&mut geom, 7, 0.0, 200.0, 0.0, 0, 100.0, &lines);
+        let (new_page, new_cursor, emitted) = super::fragment_inline_root(
+            &mut geom,
+            7,
+            0.0,
+            200.0,
+            0.0,
+            0,
+            100.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
+        );
         assert_eq!(
             emitted, 3,
             "six lines at 50px on a 100px page → 3 fragments"
@@ -11646,8 +12081,18 @@ h2 { string-set: chapter-title content(text); }
             .map(|i| (i as f32 * 10.0, i as f32 * 10.0 + 10.0))
             .collect();
         let mut geom = PaginationGeometryTable::new();
-        let (new_page, _new_cursor, _emitted) =
-            super::fragment_inline_root(&mut geom, 7, 0.0, 200.0, 0.0, 0, 25.0, &lines);
+        let (new_page, _new_cursor, _emitted) = super::fragment_inline_root(
+            &mut geom,
+            7,
+            0.0,
+            200.0,
+            0.0,
+            0,
+            25.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
+        );
         assert!(
             new_page <= crate::MAX_PAGES,
             "fragment_inline_root must clamp page advancement to MAX_PAGES \
@@ -11683,7 +12128,16 @@ h2 { string-set: chapter-title content(text); }
             .collect();
         let mut geom = PaginationGeometryTable::new();
         let (new_page, _new_cursor, emitted) = super::fragment_inline_root(
-            &mut geom, 99, 0.0, 100.0, 0.0, /*initial_page_index=*/ 2, 100.0, &lines,
+            &mut geom,
+            99,
+            0.0,
+            100.0,
+            0.0,
+            /*initial_page_index=*/ 2,
+            100.0,
+            &lines,
+            super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 2, "4 lines → 2 fragments");
         let frags = &geom.get(&99).unwrap().fragments;
@@ -11761,6 +12215,7 @@ h2 { string-set: chapter-title content(text); }
             y: 20.0_f32.as_px(),
             width: 30.0_f32.as_px(),
             height: 40.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         };
         let c = f.clone();
         assert_eq!(f, c);
@@ -11774,6 +12229,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 1.0_f32.as_px(),
             height: 1.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         };
         let dbg = format!("{f:?}");
         assert!(dbg.contains("Fragment"), "got: {dbg}");
@@ -11792,6 +12248,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 50.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let c = g.clone();
         assert!(c.is_repeat);
@@ -11829,6 +12286,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let store = crate::gcpm::running::RunningElementStore::new();
         let states = collect_running_element_states(&geom, &store);
@@ -11866,6 +12324,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         entry.fragments.push(Fragment {
             page_index: 1,
@@ -11873,6 +12332,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut store = crate::gcpm::running::RunningElementStore::new();
         let instance_id = store.register(7, "banner".into(), "<p>B</p>".into());
@@ -11908,6 +12368,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 50.0_f32.as_px(),
                 height: 20.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut store = crate::gcpm::running::RunningElementStore::new();
@@ -11935,6 +12396,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 50.0_f32.as_px(),
                 height: 10.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut store = crate::gcpm::running::RunningElementStore::new();
@@ -11957,6 +12419,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -11964,6 +12427,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut store = crate::gcpm::running::RunningElementStore::new();
         store.register(20, "chapter".into(), "<h2>Ch2</h2>".into());
@@ -11990,6 +12454,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         // node 77 is in the store but has no geometry entry → loop never visits it.
         let mut store = crate::gcpm::running::RunningElementStore::new();
