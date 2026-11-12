@@ -817,11 +817,12 @@ impl<'a> PaginationLayoutTree<'a> {
                 // the child" fallback (CSS Fragmentation §4.2, class A
                 // break point) taken when the inline split path can't
                 // honour widow / orphan constraints within the strip.
+                // Measured by the lines and the box's own border and padding,
+                // not by `child_h`: a `height` taller than the lines must not
+                // send a paragraph whose lines fit to the next page.
                 let insets = BlockInsets::of(&layout);
-                let para_total_h = line_metrics
-                    .last()
-                    .map(|l| l.1 - line_metrics[0].0 + insets.total())
-                    .unwrap_or(child_h);
+                let para_total_h =
+                    line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total();
                 if cursor_y > 0.0 && cursor_y + para_total_h > capacity(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
@@ -837,6 +838,7 @@ impl<'a> PaginationLayoutTree<'a> {
                     self.page_height_px,
                     &line_metrics,
                     insets,
+                    child_h,
                 );
                 page_index = new_page_index;
                 cursor_y = new_cursor_y;
@@ -3446,11 +3448,11 @@ fn fragment_block_subtree_inner(
             // itself this paragraph (`cursor_y == page_start_y`, the
             // fulgur-2s7p.1 repro shape), this is skipped and the split
             // begins right where the container currently sits.
+            // Measured by the lines and the box's own border and padding, not
+            // by `child_h` (see the body walker's same pre-check).
             let insets = BlockInsets::of(&layout);
-            let para_total_h = line_metrics
-                .last()
-                .map(|l| l.1 - line_metrics[0].0 + insets.total())
-                .unwrap_or(child_h);
+            let para_total_h =
+                line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total();
             // codex P1: `entry_page_index` is captured *before* the
             // split-before advance below, so `new_page_index >
             // entry_page_index` (checked further down) is true whenever
@@ -3536,6 +3538,7 @@ fn fragment_block_subtree_inner(
                 page_height_px,
                 &line_metrics,
                 insets,
+                child_h,
             );
             // Same shape as the recursion branch's fulgur-oc51 fix
             // below: without a parent fragment per page the split
@@ -4214,6 +4217,7 @@ fn fragment_inline_root(
     page_height_px: f32,
     line_metrics: &[(f32, f32)],
     insets: BlockInsets,
+    box_height: f32,
 ) -> (u32, f32, usize) {
     if line_metrics.is_empty() {
         return (initial_page_index, initial_cursor_y, 0);
@@ -4295,7 +4299,14 @@ fn fragment_inline_root(
     // box's end edge.
     let frag_top_local = line_metrics[fragment_start_idx].0;
     let last_bottom_local = line_metrics.last().expect("non-empty checked above").1;
-    let frag_h = top_inset + (last_bottom_local - frag_top_local) + insets.bottom;
+    // A paragraph that did not break is as tall as layout made its box, like
+    // any other block: a `height` or `min-height` can make that taller than
+    // its lines. One that broke ends below its last line.
+    let frag_h = if fragment_start_idx == 0 {
+        box_height
+    } else {
+        last_bottom_local - frag_top_local + insets.bottom
+    };
     let frag = Fragment {
         page_index,
         x: paragraph_x.as_px(),
@@ -5994,6 +6005,14 @@ fn compute_pagination_layout(
 
 #[cfg(test)]
 mod tests {
+    /// The box height of a paragraph with these lines and no border or
+    /// padding, for `fragment_inline_root`'s `box_height`.
+    fn lines_height(lines: &[(f32, f32)]) -> f32 {
+        match (lines.first(), lines.last()) {
+            (Some(first), Some(last)) => last.1 - first.0,
+            _ => 0.0,
+        }
+    }
     use super::*;
     use crate::blitz_adapter;
     use std::ops::DerefMut;
@@ -10118,7 +10137,8 @@ h2 { string-set: chapter-title content(text); }
     ///
     /// Fixture: 2-column grid row. Column A (60px) establishes the
     /// row's true bottom. Column B is a short 2-line `<p>` with
-    /// `break-after: page` whose own bottom is well under 60. The
+    /// `break-after: page` whose own bottom is well under 60
+    /// (`align-self: start`, so the row does not stretch its box). The
     /// grid's own parent fragment on page 0 — closed by column B's
     /// `break-after: page` — must span the row's true height (60), not
     /// column B's shorter one.
@@ -10128,7 +10148,7 @@ h2 { string-set: chapter-title content(text); }
             <html><body style="margin: 0; padding: 0; font-size: 12px">
               <div id="grid" style="display: grid; grid-template-columns: 60px 60px; width: 120px;">
                 <div id="col_a" style="height: 60px; width: 60px"></div>
-                <p id="col_b" style="margin:0; padding:0; line-height:10px; width:20px; break-after:page">one two</p>
+                <p id="col_b" style="margin:0; padding:0; line-height:10px; width:20px; align-self:start; break-after:page">one two</p>
               </div>
             </body></html>
         "#;
@@ -10438,6 +10458,7 @@ h2 { string-set: chapter-title content(text); }
             /*page_height_px=*/ 200.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 1, "widow violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -10470,6 +10491,7 @@ h2 { string-set: chapter-title content(text); }
             200.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 2, "valid split → 2 fragments");
         assert_eq!(new_page, 1);
@@ -10506,6 +10528,7 @@ h2 { string-set: chapter-title content(text); }
             100.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 1, "orphan violation → single oversized fragment");
         assert_eq!(new_page, 0);
@@ -11697,6 +11720,7 @@ h2 { string-set: chapter-title content(text); }
             800.0,
             &[],
             super::BlockInsets::default(),
+            0.0,
         );
         assert_eq!(emitted, 0, "empty metrics → no fragments emitted");
         assert_eq!(new_page, 3, "page unchanged");
@@ -11739,6 +11763,7 @@ h2 { string-set: chapter-title content(text); }
             100.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!((page, emitted), (1, 2));
         let frags = &geom.get(&1).unwrap().fragments;
@@ -11787,6 +11812,7 @@ h2 { string-set: chapter-title content(text); }
                 top: 16.0,
                 bottom: 10.0,
             },
+            lines_height(&lines) + 16.0 + 10.0,
         );
         assert_eq!((page, emitted), (1, 2));
         let frags = &geom.get(&1).unwrap().fragments;
@@ -11827,6 +11853,7 @@ h2 { string-set: chapter-title content(text); }
                 top: 16.0,
                 bottom: 10.0,
             },
+            lines_height(&lines) + 16.0 + 10.0,
         );
         assert_eq!((page, emitted), (0, 1));
         let frags = &geom.get(&1).unwrap().fragments;
@@ -11859,6 +11886,7 @@ h2 { string-set: chapter-title content(text); }
             /*page_height_px=*/ 80.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 2, "expected split into 2 fragments");
         assert_eq!(new_page, 1, "second fragment lands on page 1");
@@ -11916,6 +11944,7 @@ h2 { string-set: chapter-title content(text); }
             100.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(
             emitted, 3,
@@ -11969,6 +11998,7 @@ h2 { string-set: chapter-title content(text); }
             25.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert!(
             new_page <= crate::MAX_PAGES,
@@ -12014,6 +12044,7 @@ h2 { string-set: chapter-title content(text); }
             100.0,
             &lines,
             super::BlockInsets::default(),
+            lines_height(&lines),
         );
         assert_eq!(emitted, 2, "4 lines → 2 fragments");
         let frags = &geom.get(&99).unwrap().fragments;
