@@ -175,7 +175,7 @@ Branch `paperworx/walker-place-by-prev`, on top of the phase A matrix rows.
 - A container holding a running element or a `string-set` heading near the bottom of a page leaves the next page empty and puts its content one page later. Prince does not.
 - Headings do not keep with the next block (`break-after: avoid`), which is the rest of the difference to Prince in `examples/transform`.
 
-## Fragmentation model (design, 2026-11-12 — for review, no code yet)
+## Fragmentation model (design, 2026-11-12)
 
 Written after the paragraph-splitting attempt (branch
 `paperworx/paragraph-split-in-place`, parked, two local commits). That fix
@@ -308,19 +308,17 @@ step 4 the walk's page, step 6 the walk itself.
 Steps 1–3 remove the content-loss class. Steps 4–6 remove the reasons the
 review rounds keep finding the same kind of problem.
 
-### Open questions for Bert
+### Decisions (Bert, 2026-11-12)
 
-1. **Order.** Steps 1–3 first (they fix what is lost or drawn wrong today), or
-   step 5 first (keep-with-next for headings is visible in every document)?
-2. **PR #10.** Merge it as it stands and build on it, or hold it until step 1
-   is in, since step 1 changes what a `Fragment` means?
-3. **`break-after: avoid` and `break-before: avoid`** are not parsed today
-   (`BreakBefore` and `BreakAfter` in `draw_primitives.rs` have only `Auto`
-   and `Page`). Adding
-   them is part of step 5.
-4. **Upstream.** Step 1 changes a public-ish type (`PaginationGeometry`). It
-   makes a later upstream sync of `pagination_layout.rs` and `render.rs`
-   harder. Still fork-only?
+1. **Order.** Steps 1–3 first, then 4–6.
+2. **PR #10** is merged into `paperworx/repros` (squash, `e39889ac`); the
+   steps branch from there.
+3. **`break-after: avoid` and `break-before: avoid`** are parsed as part of
+   step 5 (`BreakBefore` and `BreakAfter` in `draw_primitives.rs` have only
+   `Auto` and `Page` today).
+4. **Upstream.** Fork-only. Step 1 changes `PaginationGeometry`, which makes a
+   later upstream sync of `pagination_layout.rs` and `render.rs` harder; that
+   cost is accepted.
 
 ### Measured, to carry into the steps
 
