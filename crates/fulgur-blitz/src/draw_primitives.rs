@@ -1013,6 +1013,28 @@ impl BlockStyle {
             || !self.box_shadows.is_empty()
     }
 
+    /// The style of one fragment of a box broken across pages, with the
+    /// border, padding and corner radii removed at each edge the fragment
+    /// does not have (css-break-3 §5.4, `box-decoration-break: slice`: "no
+    /// border and no padding are inserted at a break").
+    pub fn sliced(&self, start_edge: bool, end_edge: bool) -> Self {
+        use crate::units::Pt;
+        let mut style = self.clone();
+        // (side, the two corners on that side) in the array orders above.
+        for (has_edge, side, corners) in [(start_edge, 0, [0, 1]), (end_edge, 2, [2, 3])] {
+            if has_edge {
+                continue;
+            }
+            style.border_widths[side] = Pt::ZERO;
+            style.border_styles[side] = BorderStyleValue::None;
+            style.padding[side] = Pt::ZERO;
+            for corner in corners {
+                style.border_radii[corner] = [Pt::ZERO; 2];
+            }
+        }
+        style
+    }
+
     /// Returns (left_inset, top_inset) for content positioning inside border+padding.
     pub fn content_inset(&self) -> (f32, f32) {
         (
@@ -1704,6 +1726,68 @@ mod dp_unit_tests {
     use super::*;
     use crate::units::F32Units;
     use std::sync::Arc;
+
+    fn boxed_style() -> BlockStyle {
+        BlockStyle {
+            border_widths: [
+                3.0_f32.as_pt(),
+                1.0_f32.as_pt(),
+                4.0_f32.as_pt(),
+                2.0_f32.as_pt(),
+            ],
+            padding: [
+                5.0_f32.as_pt(),
+                6.0_f32.as_pt(),
+                7.0_f32.as_pt(),
+                8.0_f32.as_pt(),
+            ],
+            border_radii: [[9.0_f32.as_pt(); 2]; 4],
+            border_styles: [BorderStyleValue::Solid; 4],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn block_style_sliced_both_edges_is_unchanged() {
+        let s = boxed_style();
+        let t = s.sliced(true, true);
+        assert_eq!(t.border_widths, s.border_widths);
+        assert_eq!(t.padding, s.padding);
+        assert_eq!(t.border_radii, s.border_radii);
+        assert_eq!(t.border_styles, s.border_styles);
+    }
+
+    #[test]
+    fn block_style_sliced_without_start_edge_drops_top() {
+        let s = boxed_style();
+        let t = s.sliced(false, true);
+        assert_eq!(t.border_widths[0], crate::units::Pt::ZERO);
+        assert_eq!(t.padding[0], crate::units::Pt::ZERO);
+        assert_eq!(t.border_styles[0], BorderStyleValue::None);
+        assert_eq!(t.border_radii[0], [crate::units::Pt::ZERO; 2]);
+        assert_eq!(t.border_radii[1], [crate::units::Pt::ZERO; 2]);
+        // Everything else untouched.
+        assert_eq!(t.border_widths[1..], s.border_widths[1..]);
+        assert_eq!(t.padding[1..], s.padding[1..]);
+        assert_eq!(t.border_styles[1..], s.border_styles[1..]);
+        assert_eq!(t.border_radii[2..], s.border_radii[2..]);
+    }
+
+    #[test]
+    fn block_style_sliced_without_end_edge_drops_bottom() {
+        let s = boxed_style();
+        let t = s.sliced(true, false);
+        assert_eq!(t.border_widths[2], crate::units::Pt::ZERO);
+        assert_eq!(t.padding[2], crate::units::Pt::ZERO);
+        assert_eq!(t.border_styles[2], BorderStyleValue::None);
+        assert_eq!(t.border_radii[2], [crate::units::Pt::ZERO; 2]);
+        assert_eq!(t.border_radii[3], [crate::units::Pt::ZERO; 2]);
+        assert_eq!(t.border_widths[..2], s.border_widths[..2]);
+        assert_eq!(t.border_widths[3], s.border_widths[3]);
+        assert_eq!(t.padding[..2], s.padding[..2]);
+        assert_eq!(t.padding[3], s.padding[3]);
+        assert_eq!(t.border_radii[..2], s.border_radii[..2]);
+    }
 
     // ── DestinationRegistry transform stack ─────────────────
 

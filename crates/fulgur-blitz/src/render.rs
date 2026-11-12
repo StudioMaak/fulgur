@@ -1066,6 +1066,21 @@ fn finish_tagged(
     }
 }
 
+/// The block entry to paint for one fragment: the entry itself for a whole
+/// box, or a copy whose style has no border, padding or radii at the edges
+/// the fragment does not have. Only a box broken across pages pays the copy.
+fn block_for_part(
+    block: &crate::drawables::BlockEntry,
+    part: crate::pagination_layout::BoxPart,
+) -> std::borrow::Cow<'_, crate::drawables::BlockEntry> {
+    if part.start_edge && part.end_edge {
+        return std::borrow::Cow::Borrowed(block);
+    }
+    let mut sliced = block.clone();
+    sliced.style = block.style.sliced(part.start_edge, part.end_edge);
+    std::borrow::Cow::Owned(sliced)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_fragment(
     canvas: &mut crate::draw_primitives::Canvas<'_, '_>,
@@ -1095,7 +1110,11 @@ pub(crate) fn dispatch_fragment(
     // share a single opacity group. See `draw_list_item_with_block`
     // for the v1 mirror.
     if let Some(li) = drawables.list_items.get(&node_id) {
-        let block_for_li = drawables.block_styles.get(&node_id);
+        let block_for_li = drawables
+            .block_styles
+            .get(&node_id)
+            .map(|b| block_for_part(b, frag.part));
+        let block_for_li = block_for_li.as_deref();
         let para_for_li = drawables.paragraphs.get(&node_id);
         draw_list_item_with_block(
             canvas,
@@ -1129,6 +1148,8 @@ pub(crate) fn dispatch_fragment(
     // same node_id: combine into one `draw_with_opacity` group. See
     // `draw_block_with_inner_content` for the v1 mirror.
     if let Some(block) = drawables.block_styles.get(&node_id) {
+        let block = block_for_part(block, frag.part);
+        let block = block.as_ref();
         // Suppress the inline-paragraph branch of
         // `draw_block_with_inner_content` when paragraph_slices owns
         // this NodeId (Case A: container is itself the inline root, so
@@ -1807,6 +1828,8 @@ fn draw_under_clip(
     margin_top_pt: f32,
     page_index: u32,
 ) {
+    let block = block_for_part(block, frag.part);
+    let block = block.as_ref();
     use crate::draw_primitives::draw_with_opacity;
 
     let total_width = block
@@ -1859,6 +1882,7 @@ fn draw_under_clip(
         // must also stay outside the clip path pushed below.
         if let Some(li) = list_item
             && li.visible
+            && frag.part.start_edge
         {
             draw_list_item_marker_tagged(canvas, li, node_id, drawables, x_pt, y_pt);
         }
@@ -2186,6 +2210,8 @@ fn draw_under_opacity(
     margin_top_pt: f32,
     page_index: u32,
 ) {
+    let block = block_for_part(block, frag.part);
+    let block = block.as_ref();
     use crate::draw_primitives::draw_with_opacity;
 
     draw_with_opacity(canvas, block.opacity, |canvas| {
@@ -3253,7 +3279,7 @@ fn draw_list_item_with_block(
     let inner_y = y + inset.1;
 
     draw_with_opacity(canvas, list_item.opacity, |canvas| {
-        if list_item.visible {
+        if list_item.visible && frag.part.start_edge {
             draw_list_item_marker_tagged(canvas, list_item, node_id, drawables, x, y);
         }
         if let Some(b) = block {
@@ -3465,6 +3491,10 @@ fn paragraph_lines_for_page(
 ) -> Option<Vec<crate::paragraph::ShapedLine>> {
     let target_pos = fragments.iter().position(|f| f.page_index == page_index)?;
 
+    if let Some(slice) = fragments[target_pos].part.lines {
+        return lines_of_slice(all_lines, slice);
+    }
+
     if !is_split {
         return Some(all_lines.to_vec());
     }
@@ -3520,6 +3550,46 @@ fn paragraph_lines_for_page(
         })
         .collect();
     Some(sliced)
+}
+
+/// The lines a fragment recorded as its own, rebased so the first of them
+/// starts at the fragment's content top.
+///
+/// The rebase uses the heights these lines are drawn with, so the slice
+/// lands where an unbroken paragraph would have drawn it. The walk counts
+/// the same Parley lines convert shapes, one `ShapedLine` each, so the range
+/// is always inside `all_lines`; the clamp only keeps a release build from
+/// panicking if that ever stops holding.
+fn lines_of_slice(
+    all_lines: &[crate::paragraph::ShapedLine],
+    slice: crate::pagination_layout::LineSlice,
+) -> Option<Vec<crate::paragraph::ShapedLine>> {
+    debug_assert!(
+        slice.end as usize <= all_lines.len(),
+        "line slice {slice:?} outside a paragraph of {} lines",
+        all_lines.len()
+    );
+    let start = (slice.start as usize).min(all_lines.len());
+    let end = (slice.end as usize).min(all_lines.len());
+    if end <= start {
+        return None;
+    }
+    let consumed: crate::units::Pt = all_lines[..start].iter().map(|l| l.height).sum();
+    Some(
+        all_lines[start..end]
+            .iter()
+            .cloned()
+            .map(|mut line| {
+                line.baseline -= consumed;
+                for item in &mut line.items {
+                    if let crate::paragraph::LineItem::Image(img) = item {
+                        img.computed_y -= consumed;
+                    }
+                }
+                line
+            })
+            .collect(),
+    )
 }
 
 /// Build krilla Metadata from Config.
@@ -5178,6 +5248,61 @@ mod tests {
             (sliced[0].baseline.to_f32() - 9.0).abs() < 0.01,
             "baseline rebased: 21pt - 12pt consumed = 9pt"
         );
+    }
+
+    fn slice(start: u32, end: u32) -> crate::pagination_layout::LineSlice {
+        crate::pagination_layout::LineSlice { start, end }
+    }
+
+    fn four_lines() -> Vec<crate::paragraph::ShapedLine> {
+        vec![
+            make_line(12.0, 9.0),
+            make_line(12.0, 21.0),
+            make_line(12.0, 33.0),
+            make_line(12.0, 45.0),
+        ]
+    }
+
+    #[test]
+    fn lines_of_slice_first_part_keeps_baselines() {
+        let got = lines_of_slice(&four_lines(), slice(0, 2)).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!((got[0].baseline.to_f32() - 9.0).abs() < 0.01);
+        assert!((got[1].baseline.to_f32() - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn lines_of_slice_later_part_rebases_by_consumed_heights() {
+        let got = lines_of_slice(&four_lines(), slice(2, 4)).unwrap();
+        assert_eq!(got.len(), 2);
+        // Consumed: 2 x 12pt.
+        assert!((got[0].baseline.to_f32() - 9.0).abs() < 0.01);
+        assert!((got[1].baseline.to_f32() - 21.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn paragraph_lines_for_page_prefers_recorded_line_slice() {
+        // Fragment heights include a 16px inset, which the height walk
+        // would read as "one line only" (16px = 12pt); the recorded slice
+        // says two.
+        let lines = four_lines();
+        let mut first = make_fragment(0, 16.0);
+        first.part = crate::pagination_layout::BoxPart {
+            start_edge: true,
+            end_edge: false,
+            lines: Some(slice(0, 2)),
+        };
+        let mut second = make_fragment(1, 16.0);
+        second.part = crate::pagination_layout::BoxPart {
+            start_edge: false,
+            end_edge: true,
+            lines: Some(slice(2, 4)),
+        };
+        let fragments = vec![first, second];
+        let p0 = paragraph_lines_for_page(&lines, &fragments, 0, true).unwrap();
+        let p1 = paragraph_lines_for_page(&lines, &fragments, 1, true).unwrap();
+        assert_eq!((p0.len(), p1.len()), (2, 2));
+        assert!((p1[0].baseline.to_f32() - 9.0).abs() < 0.01);
     }
 
     #[test]

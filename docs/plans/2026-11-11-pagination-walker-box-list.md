@@ -279,9 +279,10 @@ names the layer it adds to: step 1 is the record, step 2 the walk, steps 3 and
 step 4 the walk's page, step 6 the walk itself.
 
 1. **Fragment content (the break token).** `PaginationGeometry` records, per
-   fragment, what it holds: for a paragraph the line range and the top of its
-   first line; for any box whether the fragment has the box's start edge and
-   its end edge. The renderer draws that and derives nothing. Pagination
+   fragment, what it holds: for a paragraph the line range; for any box
+   whether the fragment has the box's start edge and its end edge (the first
+   line sits below the top border and padding only when the fragment has the
+   start edge, so its top needs no field of its own). The renderer draws that and derives nothing. Pagination
    measures lines with the heights the renderer stacks them with, so the two
    cannot disagree.
    Fixes: lost lines (padding, border, inline-block), borders at a cut, the
