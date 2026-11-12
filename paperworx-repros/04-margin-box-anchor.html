@@ -1,0 +1,19 @@
+<!doctype html>
+<!--
+DEFECT 4 — margin-box slots are not anchored to their named position.
+
+Expected (WeasyPrint 69 and Chrome 151 agree): the box sits at the RIGHT of the
+bottom edge band, x ~= 176.5mm on A4 with 25mm margins.
+Actual (fulgur 0.40.0): x = 25.0mm — the LEFT margin.
+
+`@bottom-center` also lands at 25.0mm. `@bottom-left` is correct by coincidence.
+With all ten slots declared, fulgur distributes them sequentially left-to-right
+(top-left 25.0 / top-center 73.9 / top-right 136.1) instead of anchoring each
+(WeasyPrint: 25.0 / 97.9 / 172.8).
+
+Vertical is also off: bottom boxes land at y=272.0 vs 282.9; top boxes at
+y=0.0 (the paper edge) vs 10.9.
+-->
+<html><head><meta charset="utf-8"><style>
+  @page { size: A4; margin: 25mm; @bottom-right { content: "MARK"; font-size: 8pt } }
+</style></head><body><p>body</p></body></html>

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<!--
+  Repro 9 — a GCPM construct declared on anything other than a bare tag /
+  class / id selector was dropped silently.
+
+  `section[data-section="hdr"]` is the shape a themed document actually
+  writes. The `position: running(rh)` on it was never seen, so the element was
+  neither harvested into `@top-center` nor taken out of the flow: it printed in
+  the body and displaced everything after it, on every page it appeared.
+
+  Render this file and its control (`09b-gcpm-simple-selector.html`, identical
+  but for the selector). Both engines must produce the same two lines in the
+  same two places; before the fix fulgur produced RUNHEAD in the body of this
+  one and nothing in the margin band.
+
+    uvx --from weasyprint weasyprint 09-gcpm-compound-selector.html a.pdf
+    fulgur render -o b.pdf 09-gcpm-compound-selector.html
+    pdftotext -bbox -f 1 -l 1 a.pdf -
+-->
+<html><head><meta charset="utf-8"><title>GCPM on a compound selector</title><style>
+@page { size: A4; margin: 20mm; @top-center { content: element(rh); } }
+body { margin: 0; font: 10pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+section[data-role="hdr"] { position: running(rh); height: 24pt; }
+p { margin: 0 0 6pt 0; }
+</style></head><body>
+<section data-role="hdr">RUNHEAD</section>
+<p>BODY-FIRST</p>
+<p>body b</p>
+<p>body c</p>
+</body></html>

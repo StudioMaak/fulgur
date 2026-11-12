@@ -1,0 +1,134 @@
+//! Development CLI for selecting independently implemented Fulgur backends.
+
+use clap::{Parser, Subcommand, ValueEnum};
+use fulgur_core::{Error, Result};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+mod blitz;
+mod options;
+
+#[derive(Parser)]
+#[command(
+    name = "fulgur-dev",
+    about = "Development CLI for Fulgur layout backends"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Render an HTML file to PDF using the selected backend.
+    Render {
+        /// Input HTML file.
+        input: PathBuf,
+        /// Output PDF file.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Layout backend.
+        #[arg(long, value_enum, default_value = "blitz")]
+        engine: EngineChoice,
+        /// Paint each page as soon as it is laid out, while the input is
+        /// still being read (Raikiri only).
+        #[arg(long)]
+        stream: bool,
+        /// How SVG pictures whose element declares no
+        /// `--raikiri-svg-rendering` are drawn (Raikiri only).
+        #[arg(long, value_enum)]
+        svg_rendering: Option<SvgRenderingChoice>,
+        /// Device pixels per CSS pixel of SVG drawn as pixels (Raikiri only).
+        #[arg(long)]
+        svg_raster_scale: Option<f32>,
+        #[command(flatten)]
+        args: options::RenderArgs,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum EngineChoice {
+    Blitz,
+    Raikiri,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SvgRenderingChoice {
+    Vector,
+    Raster,
+}
+
+impl From<SvgRenderingChoice> for fulgur_raikiri::SvgRendering {
+    fn from(choice: SvgRenderingChoice) -> Self {
+        match choice {
+            SvgRenderingChoice::Vector => Self::Vector,
+            SvgRenderingChoice::Raster => Self::Raster,
+        }
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    match cli.command {
+        Commands::Render {
+            input,
+            output,
+            engine,
+            stream,
+            svg_rendering,
+            svg_raster_scale,
+            args,
+        } => {
+            let config = args.config();
+            config.validate()?;
+            let assets = args.assets()?;
+            let system_fonts = args.system_fonts();
+            if engine == EngineChoice::Blitz
+                && (svg_rendering.is_some() || svg_raster_scale.is_some())
+            {
+                return Err(Error::Other(
+                    "--svg-rendering and --svg-raster-scale require --engine raikiri".into(),
+                ));
+            }
+            if let Some(scale) = svg_raster_scale
+                && !(scale.is_finite() && scale > 0.0)
+            {
+                return Err(Error::Other(
+                    "--svg-raster-scale must be a number greater than zero".into(),
+                ));
+            }
+            let defaults = fulgur_raikiri::RenderOptions::default();
+            let options = fulgur_raikiri::RenderOptions {
+                assets: Some(&assets),
+                system_fonts,
+                svg_rendering: svg_rendering.map_or(defaults.svg_rendering, Into::into),
+                svg_raster_scale: svg_raster_scale.unwrap_or(defaults.svg_raster_scale),
+            };
+            let bytes = match (engine, stream) {
+                (EngineChoice::Blitz, false) => {
+                    blitz::render(&input, &config, Some(&assets), system_fonts)
+                }
+                (EngineChoice::Blitz, true) => {
+                    Err(Error::Other("--stream requires --engine raikiri".into()))
+                }
+                (EngineChoice::Raikiri, false) => {
+                    fulgur_raikiri::render_with_options(&input, &config, &options)
+                }
+                (EngineChoice::Raikiri, true) => {
+                    fulgur_raikiri::render_streaming(&input, &config, &options)
+                }
+            }?;
+            std::fs::write(output, bytes)?;
+            Ok(())
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match run(Cli::parse()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}

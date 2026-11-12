@@ -1,0 +1,19 @@
+<!doctype html>
+<!--
+DEFECT 1 — a running element is placed on page 1 only, not repeated per page.
+
+Expected (WeasyPrint 69): "RUNHEAD" appears on BOTH pages (2/2).
+Actual (fulgur 0.40.0): 1/2 — page 1 only.
+
+With a real theme's full stylesheet it disappeared entirely (0/9 on a 9-page
+document). Note @top-LEFT appeared to work in an earlier probe, so compare slots.
+-->
+<html><head><meta charset="utf-8"><style>
+  @page { size: A4; margin: 25mm; @top-center { content: element(rh); vertical-align: bottom } }
+  .rh { position: running(rh); font-size: 9pt }
+</style></head><body>
+  <section class="rh">RUNHEAD marker</section>
+  <p>page one body</p>
+  <div style="break-before: page"></div>
+  <p>page two body</p>
+</body></html>

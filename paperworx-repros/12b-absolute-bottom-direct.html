@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<!--
+  Repro 12's control — identical to `12-absolute-bottom-nested.html` with the
+  unstyled `<section data-section="outer">` wrapper removed, so the
+  absolutely-positioned block is a direct child of `<body>`.
+
+  fulgur pins it correctly here (282.22mm against WeasyPrint's 282.70), which
+  is what makes the wrapper the single variable under test.
+-->
+<html><head><meta charset="utf-8"><title>absolute bottom, direct child (control)</title><style>
+@page { size: A4; margin: 62pt 30pt 38.5pt 10mm; }
+body { margin: 0; font: 10pt/1.2 "Liberation Sans", Arimo, sans-serif; }
+p { margin: 0; }
+section[data-section="foot"] { position: absolute; bottom: 0; left: 0; right: 0; }
+section[data-section="filler"] { margin-top: 120pt; }
+</style></head><body>
+<p>FLOW-TOP</p>
+<section data-section="filler"><p>FLOW-MID</p></section>
+<section data-section="foot"><p>PINNED-BOTTOM</p></section>
+</body></html>
