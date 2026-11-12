@@ -334,10 +334,6 @@ fn mark_broken_edges(geometry: &mut PaginationGeometryTable) {
         if !geom.is_split() {
             continue;
         }
-        let pages = geom.fragments.iter().map(|f| f.page_index);
-        let (Some(first_page), Some(last_page)) = (pages.clone().min(), pages.max()) else {
-            continue;
-        };
         let one_per_page = geom
             .fragments
             .windows(2)
@@ -345,9 +341,12 @@ fn mark_broken_edges(geometry: &mut PaginationGeometryTable) {
         if !one_per_page {
             continue;
         }
-        for frag in &mut geom.fragments {
-            frag.part.start_edge = frag.page_index == first_page;
-            frag.part.end_edge = frag.page_index == last_page;
+        // Pages strictly increase, so the first and last fragment are the
+        // first and last page.
+        let last = geom.fragments.len() - 1;
+        for (i, frag) in geom.fragments.iter_mut().enumerate() {
+            frag.part.start_edge = i == 0;
+            frag.part.end_edge = i == last;
         }
     }
 }
@@ -855,8 +854,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 // not by `child_h`: a `height` taller than the lines must not
                 // send a paragraph whose lines fit to the next page.
                 let insets = BlockInsets::of(&layout);
-                let para_total_h =
-                    line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total();
+                let para_total_h = paragraph_fit_height(&line_metrics, insets);
                 if cursor_y > 0.0 && cursor_y + para_total_h > capacity(page_index) {
                     page_index += 1;
                     cursor_y = 0.0;
@@ -3485,8 +3483,7 @@ fn fragment_block_subtree_inner(
             // Measured by the lines and the box's own border and padding, not
             // by `child_h` (see the body walker's same pre-check).
             let insets = BlockInsets::of(&layout);
-            let para_total_h =
-                line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total();
+            let para_total_h = paragraph_fit_height(&line_metrics, insets);
             // codex P1: `entry_page_index` is captured *before* the
             // split-before advance below, so `new_page_index >
             // entry_page_index` (checked further down) is true whenever
@@ -4262,13 +4259,17 @@ fn fragment_inline_root(
     let mut fragment_start_idx: usize = 0;
     let mut emitted = 0usize;
     let total_lines = line_metrics.len();
-    // Border and padding above the current fragment's first line. Only the
-    // fragment with the box's start edge has them (css-break-3 §5.4: "no
-    // border and no padding are inserted at a break").
-    let mut top_inset = insets.top;
 
     for (i, &(_line_top_local, line_bottom_local)) in line_metrics.iter().enumerate() {
         let frag_top_local = line_metrics[fragment_start_idx].0;
+        // Border and padding above the current fragment's first line. Only
+        // the fragment with the box's start edge has them (css-break-3 §5.4:
+        // "no border and no padding are inserted at a break").
+        let top_inset = if fragment_start_idx == 0 {
+            insets.top
+        } else {
+            0.0
+        };
         let projected_bottom_in_body =
             paragraph_top_in_body + top_inset + (line_bottom_local - frag_top_local);
 
@@ -4325,7 +4326,6 @@ fn fragment_inline_root(
             page_index += 1;
             paragraph_top_in_body = 0.0;
             fragment_start_idx = i;
-            top_inset = 0.0;
         }
     }
 
@@ -4336,21 +4336,11 @@ fn fragment_inline_root(
     // A paragraph that did not break is as tall as layout made its box, like
     // any other block: a `height` or `min-height` can make that taller than
     // its lines. One that broke ends below its last line.
-    let frag_h = if fragment_start_idx == 0 {
-        box_height
+    let (frag_h, part) = if fragment_start_idx == 0 {
+        (box_height, BoxPart::WHOLE)
     } else {
-        last_bottom_local - frag_top_local + insets.bottom
-    };
-    let frag = Fragment {
-        page_index,
-        x: paragraph_x.as_px(),
-        y: paragraph_top_in_body.as_px(),
-        width: width.as_px(),
-        height: frag_h.as_px(),
-        // A paragraph that did not break is the whole box, like any other.
-        part: if fragment_start_idx == 0 {
-            BoxPart::WHOLE
-        } else {
+        (
+            last_bottom_local - frag_top_local + insets.bottom,
             BoxPart {
                 start_edge: false,
                 end_edge: true,
@@ -4358,8 +4348,16 @@ fn fragment_inline_root(
                     start: fragment_start_idx as u32,
                     end: total_lines as u32,
                 }),
-            }
-        },
+            },
+        )
+    };
+    let frag = Fragment {
+        page_index,
+        x: paragraph_x.as_px(),
+        y: paragraph_top_in_body.as_px(),
+        width: width.as_px(),
+        height: frag_h.as_px(),
+        part,
     };
     geometry.entry(child_id).or_default().fragments.push(frag);
     emitted += 1;
@@ -4386,6 +4384,14 @@ impl BlockInsets {
     fn total(self) -> f32 {
         self.top + self.bottom
     }
+}
+
+/// The height a paragraph needs to fit a page whole: its lines plus its own
+/// border and padding. Not the laid-out box height, because a `height` taller
+/// than the lines must not send a paragraph whose lines fit to the next page.
+/// `line_metrics` must be non-empty.
+fn paragraph_fit_height(line_metrics: &[(f32, f32)], insets: BlockInsets) -> f32 {
+    line_metrics[line_metrics.len() - 1].1 - line_metrics[0].0 + insets.total()
 }
 
 /// Per-page state for a named string emitted by `string-set:`.

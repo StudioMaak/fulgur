@@ -163,19 +163,28 @@ fn split_list_item_draws_its_marker_once() {
     );
     let Some(w) = render(&body) else { return };
     // pdftotext glues the bullet to the first word of its line ("•L00").
-    let ends = |text: &str| w.iter().find(|x| x.text.ends_with(text)).unwrap().page;
+    let ends = |text: &str| page_of_word_ending(&w, text);
     // The first item has 30 lines and breaks across pages 1 and 2.
     assert_eq!(ends("L00"), 1);
     assert_eq!(ends("L29"), 2);
     assert_eq!(ends("NEXT"), 2);
-    let markers = |page: usize| {
-        w.iter()
-            .filter(|x| x.page == page && x.text.contains('\u{2022}'))
-            .count()
-    };
+    let markers = |page: usize| markers_on(&w, page);
     assert_eq!(markers(1), 1, "marker on the page the item starts");
     // Page 2 carries only NEXT's marker, not a repeat for the first item.
     assert_eq!(markers(2), 1, "no second marker for the continuation");
+}
+
+/// The page of the first word ending in `text`.
+fn page_of_word_ending(words: &[Word], text: &str) -> usize {
+    words.iter().find(|w| w.text.ends_with(text)).unwrap().page
+}
+
+/// How many bullet markers `page` carries.
+fn markers_on(words: &[Word], page: usize) -> usize {
+    words
+        .iter()
+        .filter(|w| w.page == page && w.text.contains('\u{2022}'))
+        .count()
 }
 
 #[test]
@@ -187,14 +196,10 @@ fn split_list_item_holding_a_paragraph_draws_its_marker_once() {
         lines(30)
     );
     let Some(w) = render(&body) else { return };
-    let ends = |text: &str| w.iter().find(|x| x.text.ends_with(text)).unwrap().page;
+    let ends = |text: &str| page_of_word_ending(&w, text);
     assert_eq!(ends("L00"), 1);
     assert_eq!(ends("L29"), 2);
-    let markers = |page: usize| {
-        w.iter()
-            .filter(|x| x.page == page && x.text.contains('\u{2022}'))
-            .count()
-    };
+    let markers = |page: usize| markers_on(&w, page);
     assert_eq!(markers(1), 1, "marker on the page the item starts");
     assert_eq!(markers(2), 1, "only NEXT's marker on the continuation page");
 }

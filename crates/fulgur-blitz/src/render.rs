@@ -1077,7 +1077,7 @@ fn block_for_part(
         return std::borrow::Cow::Borrowed(block);
     }
     let mut sliced = block.clone();
-    sliced.style = block.style.sliced(part.start_edge, part.end_edge);
+    sliced.style = sliced.style.sliced(part.start_edge, part.end_edge);
     std::borrow::Cow::Owned(sliced)
 }
 
@@ -3483,6 +3483,9 @@ fn draw_paragraph_inner_paint(
 /// `position: fixed`). Either case means each fragment carries the
 /// full content, so the function returns every line unmodified.
 /// `true` triggers the cumulative-height slicing logic.
+///
+/// A fragment that recorded its line range (`part.lines`) is drawn from that
+/// record; the height matching below is only for fragments without one.
 fn paragraph_lines_for_page(
     all_lines: &[crate::paragraph::ShapedLine],
     fragments: &[crate::pagination_layout::Fragment],
@@ -3533,13 +3536,20 @@ fn paragraph_lines_for_page(
         return None;
     }
 
-    let sliced: Vec<crate::paragraph::ShapedLine> = all_lines[start_idx..end_idx]
+    Some(rebase_lines(&all_lines[start_idx..end_idx], consumed))
+}
+
+/// Copy `lines` with their paragraph-absolute coordinates (baseline and
+/// inline image `computed_y`) moved up by `consumed`, the height of the
+/// lines drawn in earlier fragments.
+fn rebase_lines(
+    lines: &[crate::paragraph::ShapedLine],
+    consumed: crate::units::Pt,
+) -> Vec<crate::paragraph::ShapedLine> {
+    lines
         .iter()
         .cloned()
         .map(|mut line| {
-            // Rebase paragraph-absolute coords (baseline + inline
-            // image `computed_y`) to fragment-local. Mirror
-            // `ParagraphRender::slice_for_page` exactly.
             line.baseline -= consumed;
             for item in &mut line.items {
                 if let crate::paragraph::LineItem::Image(img) = item {
@@ -3548,8 +3558,7 @@ fn paragraph_lines_for_page(
             }
             line
         })
-        .collect();
-    Some(sliced)
+        .collect()
 }
 
 /// The lines a fragment recorded as its own, rebased so the first of them
@@ -3575,21 +3584,7 @@ fn lines_of_slice(
         return None;
     }
     let consumed: crate::units::Pt = all_lines[..start].iter().map(|l| l.height).sum();
-    Some(
-        all_lines[start..end]
-            .iter()
-            .cloned()
-            .map(|mut line| {
-                line.baseline -= consumed;
-                for item in &mut line.items {
-                    if let crate::paragraph::LineItem::Image(img) = item {
-                        img.computed_y -= consumed;
-                    }
-                }
-                line
-            })
-            .collect(),
-    )
+    Some(rebase_lines(&all_lines[start..end], consumed))
 }
 
 /// Build krilla Metadata from Config.

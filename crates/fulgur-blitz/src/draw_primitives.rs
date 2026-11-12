@@ -1017,9 +1017,9 @@ impl BlockStyle {
     /// border, padding and corner radii removed at each edge the fragment
     /// does not have (css-break-3 §5.4, `box-decoration-break: slice`: "no
     /// border and no padding are inserted at a break").
-    pub fn sliced(&self, start_edge: bool, end_edge: bool) -> Self {
+    pub fn sliced(self, start_edge: bool, end_edge: bool) -> Self {
         use crate::units::Pt;
-        let mut style = self.clone();
+        let mut style = self;
         // (side, the two corners on that side) in the array orders above.
         for (has_edge, side, corners) in [(start_edge, 0, [0, 1]), (end_edge, 2, [2, 3])] {
             if has_edge {
@@ -1750,7 +1750,7 @@ mod dp_unit_tests {
     #[test]
     fn block_style_sliced_both_edges_is_unchanged() {
         let s = boxed_style();
-        let t = s.sliced(true, true);
+        let t = s.clone().sliced(true, true);
         assert_eq!(t.border_widths, s.border_widths);
         assert_eq!(t.padding, s.padding);
         assert_eq!(t.border_radii, s.border_radii);
@@ -1760,7 +1760,7 @@ mod dp_unit_tests {
     #[test]
     fn block_style_sliced_without_start_edge_drops_top() {
         let s = boxed_style();
-        let t = s.sliced(false, true);
+        let t = s.clone().sliced(false, true);
         assert_eq!(t.border_widths[0], crate::units::Pt::ZERO);
         assert_eq!(t.padding[0], crate::units::Pt::ZERO);
         assert_eq!(t.border_styles[0], BorderStyleValue::None);
@@ -1776,7 +1776,7 @@ mod dp_unit_tests {
     #[test]
     fn block_style_sliced_without_end_edge_drops_bottom() {
         let s = boxed_style();
-        let t = s.sliced(true, false);
+        let t = s.clone().sliced(true, false);
         assert_eq!(t.border_widths[2], crate::units::Pt::ZERO);
         assert_eq!(t.padding[2], crate::units::Pt::ZERO);
         assert_eq!(t.border_styles[2], BorderStyleValue::None);
