@@ -315,7 +315,41 @@ fn run_pass_inner<'a>(
         // layout is what actually does the pagination work.
         tree.fragment_pagination_root();
     }
-    tree.take_geometry()
+    let mut geometry = tree.take_geometry();
+    mark_broken_edges(&mut geometry);
+    geometry
+}
+
+/// Record, for every box the walk broke across pages, which fragment has its
+/// start edge and which its end edge: the fragment on the first page it
+/// occupies and the one on the last (css-break-3 §5.4, `box-decoration-break:
+/// slice`: "no border and no padding are inserted at a break").
+///
+/// Runs once over the finished table and touches only boxes with more than
+/// one fragment, so a box that fits its page is never visited twice. A box
+/// with two fragments on one page (multicol columns) is left as the walk
+/// wrote it: which column edge is a break is the multicol pass's to say.
+fn mark_broken_edges(geometry: &mut PaginationGeometryTable) {
+    for geom in geometry.values_mut() {
+        if !geom.is_split() {
+            continue;
+        }
+        let pages = geom.fragments.iter().map(|f| f.page_index);
+        let (Some(first_page), Some(last_page)) = (pages.clone().min(), pages.max()) else {
+            continue;
+        };
+        let one_per_page = geom
+            .fragments
+            .windows(2)
+            .all(|pair| pair[0].page_index < pair[1].page_index);
+        if !one_per_page {
+            continue;
+        }
+        for frag in &mut geom.fragments {
+            frag.part.start_edge = frag.page_index == first_page;
+            frag.part.end_edge = frag.page_index == last_page;
+        }
+    }
 }
 
 impl<'a> PaginationLayoutTree<'a> {
@@ -6005,6 +6039,59 @@ fn compute_pagination_layout(
 
 #[cfg(test)]
 mod tests {
+    fn whole_fragment(page_index: u32) -> super::Fragment {
+        use crate::units::F32Units;
+        super::Fragment {
+            page_index,
+            x: 0.0_f32.as_px(),
+            y: 0.0_f32.as_px(),
+            width: 100.0_f32.as_px(),
+            height: 50.0_f32.as_px(),
+            part: super::BoxPart::WHOLE,
+        }
+    }
+
+    fn edges(geom: &super::PaginationGeometry) -> Vec<(bool, bool)> {
+        geom.fragments
+            .iter()
+            .map(|f| (f.part.start_edge, f.part.end_edge))
+            .collect()
+    }
+
+    #[test]
+    fn mark_broken_edges_gives_the_first_and_last_page_their_edge() {
+        let mut table = super::PaginationGeometryTable::new();
+        table.entry(1).or_default().fragments =
+            vec![whole_fragment(2), whole_fragment(3), whole_fragment(4)];
+        super::mark_broken_edges(&mut table);
+        assert_eq!(
+            edges(&table[&1]),
+            vec![(true, false), (false, false), (false, true)]
+        );
+    }
+
+    #[test]
+    fn mark_broken_edges_leaves_unbroken_repeated_and_same_page_boxes() {
+        let mut table = super::PaginationGeometryTable::new();
+        // One fragment: not broken.
+        table.entry(1).or_default().fragments = vec![whole_fragment(0)];
+        // Repeated on every page (`position: fixed`): each copy is whole.
+        let repeated = table.entry(2).or_default();
+        repeated.fragments = vec![whole_fragment(0), whole_fragment(1)];
+        repeated.is_repeat = true;
+        // Two fragments on one page (multicol columns).
+        table.entry(3).or_default().fragments =
+            vec![whole_fragment(0), whole_fragment(0), whole_fragment(1)];
+        super::mark_broken_edges(&mut table);
+        for id in [1, 2, 3] {
+            assert!(
+                edges(&table[&id]).iter().all(|&e| e == (true, true)),
+                "node {id}: {:?}",
+                table[&id].fragments
+            );
+        }
+    }
+
     /// The box height of a paragraph with these lines and no border or
     /// padding, for `fragment_inline_root`'s `box_height`.
     fn lines_height(lines: &[(f32, f32)]) -> f32 {

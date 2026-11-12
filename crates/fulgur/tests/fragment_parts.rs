@@ -177,3 +177,24 @@ fn split_list_item_draws_its_marker_once() {
     // Page 2 carries only NEXT's marker, not a repeat for the first item.
     assert_eq!(markers(2), 1, "no second marker for the continuation");
 }
+
+#[test]
+fn split_list_item_holding_a_paragraph_draws_its_marker_once() {
+    // The item is a container here, not an inline root: its edges come from
+    // the pass that marks every box the walk broke.
+    let body = format!(
+        "<div class=\"f\">TOP</div><ul><li><p>{}</p></li><li>NEXT</li></ul>",
+        lines(30)
+    );
+    let Some(w) = render(&body) else { return };
+    let ends = |text: &str| w.iter().find(|x| x.text.ends_with(text)).unwrap().page;
+    assert_eq!(ends("L00"), 1);
+    assert_eq!(ends("L29"), 2);
+    let markers = |page: usize| {
+        w.iter()
+            .filter(|x| x.page == page && x.text.contains('\u{2022}'))
+            .count()
+    };
+    assert_eq!(markers(1), 1, "marker on the page the item starts");
+    assert_eq!(markers(2), 1, "only NEXT's marker on the continuation page");
+}
