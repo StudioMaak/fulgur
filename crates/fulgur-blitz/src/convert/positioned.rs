@@ -314,6 +314,7 @@ fn maybe_apply_abs_pseudo_inset_correction(
         y: new_y_px,
         width: pseudo_w_px,
         height: pseudo_h_px,
+        part: crate::pagination_layout::BoxPart::WHOLE,
     });
 }
 

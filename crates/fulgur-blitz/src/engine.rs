@@ -1789,6 +1789,7 @@ mod tests {
             y: 0.0_f32.as_px(),
             width: 0.0_f32.as_px(),
             height: 0.0_f32.as_px(),
+            part: crate::pagination_layout::BoxPart::WHOLE,
         }
     }
 

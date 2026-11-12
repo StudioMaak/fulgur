@@ -5100,6 +5100,7 @@ mod tests {
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: height.as_px(),
+            part: crate::pagination_layout::BoxPart::WHOLE,
         }
     }
 
@@ -5385,6 +5386,7 @@ mod tests {
             y: 0.0_f32.as_px(),
             width: 0.0_f32.as_px(),
             height: height.as_px(),
+            part: crate::pagination_layout::BoxPart::WHOLE,
         }
     }
 

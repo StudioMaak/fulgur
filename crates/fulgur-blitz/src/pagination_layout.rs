@@ -83,6 +83,47 @@ pub struct Fragment {
     pub y: crate::units::Px,
     pub width: crate::units::Px,
     pub height: crate::units::Px,
+    /// Which part of the source box this fragment holds. Written by the walk,
+    /// read by the renderer.
+    pub part: BoxPart,
+}
+
+/// Which part of its box a fragment holds. The walk writes it; the renderer
+/// reads it and derives nothing. The default is the whole box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxPart {
+    /// The fragment has the box's block-start border and padding.
+    pub start_edge: bool,
+    /// The fragment has the box's block-end border and padding.
+    pub end_edge: bool,
+    /// For a paragraph: the lines this fragment holds.
+    pub lines: Option<LineSlice>,
+}
+
+impl BoxPart {
+    /// The whole box: both edges, no line slice.
+    pub const WHOLE: BoxPart = BoxPart {
+        start_edge: true,
+        end_edge: true,
+        lines: None,
+    };
+}
+
+impl Default for BoxPart {
+    fn default() -> Self {
+        Self::WHOLE
+    }
+}
+
+/// A run of a paragraph's lines held by one fragment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineSlice {
+    /// Index of the first line.
+    pub first: u32,
+    /// One past the last line.
+    pub end: u32,
+    /// Top of the first line, measured from the fragment's `y`.
+    pub top: crate::units::Px,
 }
 
 /// Per-source-node geometry: every page on which the node has a placement.
@@ -478,6 +519,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 y: 0.0_f32.as_px(),
                 width: body_w.as_px(),
                 height: body_layout.size.height.as_px(),
+                part: BoxPart::WHOLE,
             });
 
         // Prefer body's `layout_children` — same rationale as
@@ -576,6 +618,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             y: cursor_y.as_px(),
                             width: 0.0_f32.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                     emitted += 1;
                 }
@@ -662,6 +705,7 @@ impl<'a> PaginationLayoutTree<'a> {
                             y: cursor_y.as_px(),
                             width: child_w.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                     emitted += 1;
                 }
@@ -1049,6 +1093,7 @@ impl<'a> PaginationLayoutTree<'a> {
                         y: cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: first_slice_h.as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 record_subtree_descendants(
                     &mut self.geometry,
@@ -1128,6 +1173,7 @@ impl<'a> PaginationLayoutTree<'a> {
                                 y: 0.0_f32.as_px(),
                                 width: child_w.as_px(),
                                 height: last_slice_h.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                         remaining -= last_slice_h;
                     }
@@ -1170,6 +1216,7 @@ impl<'a> PaginationLayoutTree<'a> {
                 y: cursor_y.as_px(),
                 width: child_w.as_px(),
                 height: child_h.as_px(),
+                part: BoxPart::WHOLE,
             };
             self.geometry
                 .entry(child_id)
@@ -1387,6 +1434,7 @@ fn record_subtree_descendants(
                         y: child_y.as_px(),
                         width: 0.0_f32.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             if child
@@ -1418,6 +1466,7 @@ fn record_subtree_descendants(
                 y: child_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -2544,6 +2593,7 @@ fn record_band_template(
                 y: cell_y.as_px(),
                 width: layout.size.width.as_px(),
                 height: layout.size.height.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -2801,6 +2851,7 @@ fn fragment_repeating_table(
                     y: first_table_top.as_px(),
                     width: parent_w.as_px(),
                     height: header.band_height_px.as_px(),
+                    part: BoxPart::WHOLE,
                 },
             );
         first_table_top
@@ -2951,6 +3002,7 @@ fn fragment_block_subtree_inner(
                 y: cursor_in.as_px(),
                 width: parent_w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
         return (page_in, cursor_in + h);
     }
@@ -3191,6 +3243,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3236,6 +3289,7 @@ fn fragment_block_subtree_inner(
                         y: cursor_y.as_px(),
                         width: child_w.as_px(),
                         height: 0.0_f32.as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             // Honour `break-after: page` for zero-height elements
@@ -3252,6 +3306,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3317,6 +3372,7 @@ fn fragment_block_subtree_inner(
                     y: page_start_y.as_px(),
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
+                    part: BoxPart::WHOLE,
                 });
             page_index += 1;
             page_start_y = 0.0;
@@ -3454,6 +3510,7 @@ fn fragment_block_subtree_inner(
                             } else {
                                 (cursor_y - page_start_y).as_px()
                             },
+                            part: BoxPart::WHOLE,
                         });
                 }
                 page_index += 1;
@@ -3502,6 +3559,7 @@ fn fragment_block_subtree_inner(
                                 y: page_start_y.as_px(),
                                 width: parent_w.as_px(),
                                 height: first_height.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                     }
                 }
@@ -3521,6 +3579,7 @@ fn fragment_block_subtree_inner(
                                 y: 0.0_f32.as_px(),
                                 width: parent_w.as_px(),
                                 height: page_height_px.as_px(),
+                                part: BoxPart::WHOLE,
                             });
                     }
                 }
@@ -3626,6 +3685,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3719,6 +3779,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             page_index += 1;
@@ -3854,6 +3915,7 @@ fn fragment_block_subtree_inner(
                                     y: page_start_y.as_px(),
                                     width: parent_w.as_px(),
                                     height: prev_height.as_px(),
+                                    part: BoxPart::WHOLE,
                                 });
                         } else if let Some(fragment) = geometry
                             .entry(parent_id)
@@ -3881,6 +3943,7 @@ fn fragment_block_subtree_inner(
                                     y: 0.0_f32.as_px(),
                                     width: parent_w.as_px(),
                                     height: page_height_px.as_px(),
+                                    part: BoxPart::WHOLE,
                                 });
                         }
                     }
@@ -3920,6 +3983,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
                 page_index += 1;
                 cursor_y = 0.0;
@@ -3961,6 +4025,7 @@ fn fragment_block_subtree_inner(
                         y: page_start_y.as_px(),
                         width: parent_w.as_px(),
                         height: (cursor_y - page_start_y).as_px(),
+                        part: BoxPart::WHOLE,
                     });
             }
             page_index += 1;
@@ -3987,6 +4052,7 @@ fn fragment_block_subtree_inner(
                 y: child_page_y.as_px(),
                 width: child_w.as_px(),
                 height: child_h.as_px(),
+                part: BoxPart::WHOLE,
             });
         record_subtree_descendants(
             geometry,
@@ -4023,6 +4089,7 @@ fn fragment_block_subtree_inner(
                     y: page_start_y.as_px(),
                     width: parent_w.as_px(),
                     height: (cursor_y - page_start_y).as_px(),
+                    part: BoxPart::WHOLE,
                 });
             page_index += 1;
             cursor_y = 0.0;
@@ -4066,6 +4133,7 @@ fn fragment_block_subtree_inner(
             y: page_start_y.as_px(),
             width: parent_w.as_px(),
             height: (cursor_y - page_start_y).as_px(),
+            part: BoxPart::WHOLE,
         });
 
     (page_index, cursor_y)
@@ -4198,6 +4266,7 @@ fn fragment_inline_root(
                 y: paragraph_top_in_body.as_px(),
                 width: width.as_px(),
                 height: frag_h.as_px(),
+                part: BoxPart::WHOLE,
             };
             geometry.entry(child_id).or_default().fragments.push(frag);
             emitted += 1;
@@ -4218,6 +4287,7 @@ fn fragment_inline_root(
         y: paragraph_top_in_body.as_px(),
         width: width.as_px(),
         height: frag_h.as_px(),
+        part: BoxPart::WHOLE,
     };
     geometry.entry(child_id).or_default().fragments.push(frag);
     emitted += 1;
@@ -4535,6 +4605,7 @@ pub fn append_position_fixed_fragments(
                 y: y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
             emitted += 1;
         }
@@ -4631,6 +4702,7 @@ fn record_fixed_subtree_descendants(
                 y: stored_y.as_px(),
                 width: w.as_px(),
                 height: h.as_px(),
+                part: BoxPart::WHOLE,
             });
             *emitted += 1;
         }
@@ -5299,6 +5371,7 @@ fn record_subtree_fragments_at_offset(
                         y: stored_y.as_px(),
                         width: w.as_px(),
                         height: stored_h.as_px(),
+                        part: BoxPart::WHOLE,
                     });
                     *emitted += 1;
                 }
@@ -5349,6 +5422,7 @@ fn record_subtree_fragments_at_offset(
                             y: stored_y.as_px(),
                             width: 0.0_f32.as_px(),
                             height: 0.0_f32.as_px(),
+                            part: BoxPart::WHOLE,
                         });
                 }
                 continue;
@@ -7169,6 +7243,7 @@ mod tests {
             y: 10.0_f32.as_px(),
             width: 50.0_f32.as_px(),
             height: 20.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         template.entry(8).or_default().fragments.push(Fragment {
             page_index: 0,
@@ -7176,6 +7251,7 @@ mod tests {
             y: 12.0_f32.as_px(),
             width: 30.0_f32.as_px(),
             height: 10.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let table_pages = [(0, 10.0), (1, 0.0)];
         let mut first = PaginationGeometryTable::new();
@@ -7803,6 +7879,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 0,
@@ -7810,6 +7887,7 @@ h2 { string-set: chapter-title content(text); }
             y: 50.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(30).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -7817,6 +7895,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
 
         let mut markers: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
@@ -7861,6 +7940,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 800.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(42).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -7868,6 +7948,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 200.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
 
         let mut markers: BTreeMap<usize, Vec<(String, String)>> = BTreeMap::new();
@@ -10284,6 +10365,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 1.0_f32.as_px(),
             height: 1.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         assert_eq!(super::implied_page_count(&geom), 3);
     }
@@ -11335,6 +11417,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         assert!(!geom.is_split());
     }
@@ -11349,6 +11432,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         assert!(geom.is_split());
@@ -11367,6 +11451,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         assert!(
@@ -11395,6 +11480,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11419,6 +11505,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 100.0_f32.as_px(),
                 height: 50.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
@@ -11450,6 +11537,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11479,6 +11567,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -11486,6 +11575,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         ops.insert(
@@ -11510,6 +11600,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let ops: BTreeMap<usize, Vec<crate::gcpm::CounterOp>> = BTreeMap::new();
         let states = collect_counter_states(&geom, &ops);
@@ -11761,6 +11852,7 @@ h2 { string-set: chapter-title content(text); }
             y: 20.0_f32.as_px(),
             width: 30.0_f32.as_px(),
             height: 40.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         };
         let c = f.clone();
         assert_eq!(f, c);
@@ -11774,6 +11866,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 1.0_f32.as_px(),
             height: 1.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         };
         let dbg = format!("{f:?}");
         assert!(dbg.contains("Fragment"), "got: {dbg}");
@@ -11792,6 +11885,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 50.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let c = g.clone();
         assert!(c.is_repeat);
@@ -11829,6 +11923,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let store = crate::gcpm::running::RunningElementStore::new();
         let states = collect_running_element_states(&geom, &store);
@@ -11866,6 +11961,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         entry.fragments.push(Fragment {
             page_index: 1,
@@ -11873,6 +11969,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut store = crate::gcpm::running::RunningElementStore::new();
         let instance_id = store.register(7, "banner".into(), "<p>B</p>".into());
@@ -11908,6 +12005,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 50.0_f32.as_px(),
                 height: 20.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut store = crate::gcpm::running::RunningElementStore::new();
@@ -11935,6 +12033,7 @@ h2 { string-set: chapter-title content(text); }
                 y: 0.0_f32.as_px(),
                 width: 50.0_f32.as_px(),
                 height: 10.0_f32.as_px(),
+                part: BoxPart::WHOLE,
             });
         }
         let mut store = crate::gcpm::running::RunningElementStore::new();
@@ -11957,6 +12056,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         geom.entry(20).or_default().fragments.push(Fragment {
             page_index: 1,
@@ -11964,6 +12064,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         let mut store = crate::gcpm::running::RunningElementStore::new();
         store.register(20, "chapter".into(), "<h2>Ch2</h2>".into());
@@ -11990,6 +12091,7 @@ h2 { string-set: chapter-title content(text); }
             y: 0.0_f32.as_px(),
             width: 100.0_f32.as_px(),
             height: 50.0_f32.as_px(),
+            part: BoxPart::WHOLE,
         });
         // node 77 is in the store but has no geometry entry → loop never visits it.
         let mut store = crate::gcpm::running::RunningElementStore::new();
