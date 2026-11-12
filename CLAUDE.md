@@ -466,6 +466,9 @@ this order:
    If it cannot hold that (a fragment's content, a better earlier break, a
    page's own height), widen the walker first. Do not fit the case into the
    existing walk with another local check.
+   And keep it in its layer: a fact about the tree, a pure decision, the
+   walk, or the record the renderer reads (see the plan doc). A rule is not a
+   new branch on the walk's main path.
 4. **Show Bert steps 1–3** before writing code.
 5. **Code, then measure.** Probes against Chrome and Prince verify the rule;
    they are not where the rule comes from. A probe set built from the cases

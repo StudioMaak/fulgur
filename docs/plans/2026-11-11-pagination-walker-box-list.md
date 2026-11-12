@@ -229,10 +229,54 @@ a concept; it has local checks that each cover one rule in one place.
 | **The page's own height** for each page | One `page_height_px`; page 0's shorter height is corrected in the body walker only | Nested content on page 1 is drawn up to the body's offset below the content box; named pages of another size would do the same |
 | **Parallel flows** | `RowState` restores the cursor around a sequential walk of the cells | The co-split findings of step 2; a table without a repeating header did not co-split at all |
 
+### Shape of the implementation: four layers, one direction
+
+Bert's constraint (2026-11-12): the capabilities must not be machinery slapped
+onto the walker. They are broken down by kind, each kind lives in one place,
+and the walker's main path (a box fits, place it, move on) stays as it is.
+
+Each rule above is one of four kinds of thing, and each kind has one home:
+
+| Layer | What it is | Knows about | Rules | Exists today as |
+|---|---|---|---|---|
+| **Facts** | Read-only description of the laid-out tree, built before or beside the walk: the boxes of a container in order, what kind each is (monolithic, lines, block container, row of parallel boxes), its line extents, its break properties | Blitz, Taffy, styles | R1, R4, R9, and the inputs of the others | `flow_items`, `flow_rows`, `leading_unbreakable_extent`, `avoids_break_inside` (parked branch) |
+| **Decision** | Pure functions: given the facts of one box and the space left, where is the break and how good is it | Numbers only: heights, counts, an appeal. No document, no geometry table | R2, R3, R6, R10, R11 | `lines_before_break` (parked branch); otherwise spread through both walkers as inline `if`s |
+| **Walk** | Places boxes in order and carries the cursor. When a box does not fit it asks the decision layer once and acts on the answer | Pages, cursor, previous box | R7, R8 (placement and carried height) | `PrevBox::place`, the two walkers |
+| **Record** | What each fragment holds, written by the walk, read by the renderer | Nothing; it is data | R5 | `Fragment` (a rectangle only) |
+
+The dependencies run one way: the walk reads facts and calls decisions; the
+renderer reads the record. A decision never touches the geometry table, a fact
+never depends on the page, and the renderer never re-derives what the walk
+decided.
+
+What this rules out:
+
+- **A rule written as a branch in the walk.** `avoid_fits_whole_page`, the
+  orphans pre-check and `below_sibling` are decisions living in the walk,
+  once per walker. They move to the decision layer; the walk keeps one
+  question: "this box does not fit: break before it, inside it, or place it
+  anyway?"
+- **Cost on the main path.** Facts beyond the box list and every decision are
+  computed only when a box does not fit. A document that fits its pages runs
+  the walk it runs today.
+- **A fix in the renderer for a pagination decision**, such as
+  `is_continuation_fragment` on the parked branch, which guesses from the
+  fragment list what the walk already knew.
+- **State added to the walk for one case.** New walk state has to be one of:
+  the cursor, the previous box, or the page. Anything else is a fact (compute
+  it) or a record (write it).
+
+Each layer is tested at its own level: decisions with plain numbers and no
+document, facts against a parsed document, the walk and record through the
+break matrix.
+
 ### What to add, in this order
 
 Each step is a capability, not a case. Each keeps the output contract of
-"What must not change" above and reports its blast radius the same way.
+"What must not change" above and reports its blast radius the same way. Each
+names the layer it adds to: step 1 is the record, step 2 the walk, steps 3 and
+5 the decision layer (step 5 also moves the existing inline checks into it),
+step 4 the walk's page, step 6 the walk itself.
 
 1. **Fragment content (the break token).** `PaginationGeometry` records, per
    fragment, what it holds: for a paragraph the line range and the top of its
