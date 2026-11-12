@@ -321,6 +321,42 @@ review rounds keep finding the same kind of problem.
    later upstream sync of `pagination_layout.rs` and `render.rs` harder; that
    cost is accepted.
 
+### Step 1 as built (2026-11-12)
+
+Branch `paperworx/fragment-part`. `Fragment` has a `part: BoxPart`
+(`start_edge`, `end_edge`, `lines: Option<LineSlice>`); `BoxPart::WHOLE` is
+every box that did not break.
+
+- **Record.** `fragment_inline_root` writes the line range of each fragment
+  of a broken paragraph. `mark_broken_edges` runs once over the finished
+  table and gives every broken box its start edge on its first page and its
+  end edge on its last. Boxes with two fragments on one page (multicol) and
+  repeated boxes are left whole.
+- **Walk.** A broken paragraph counts its border and padding at the edges it
+  has. An unsplit paragraph is as tall as its laid-out box in both walkers.
+  Whether it fits the rest of the page is still asked of its lines plus its
+  own border and padding.
+- **Renderer.** `lines_of_slice` takes lines by index, `BlockStyle::sliced`
+  removes border, padding and radii at a missing edge, and the marker is
+  drawn only with the start edge.
+
+Not done, and where it goes:
+
+- Lines are still measured by Parley's ink extent when a paragraph breaks;
+  lines resized for an inline box or inline image are taller when drawn than
+  layout knows. Own step after step 3: one line-box function for pagination
+  and convert, with the inline box's baseline read from the DOM.
+- A padded paragraph that does not fit the rest of the page moves whole
+  (Chrome splits it); the bottom padding is not part of the fit test. Step 3.
+- A box with a `height` that crosses a page is not sliced; its background is
+  positioned per slice rather than as if unbroken; tables do not read the
+  edges. Step 2.
+- `paragraph_lines_for_page` keeps its height-matching path for paragraphs
+  sliced by the block path (`break-inside: avoid` or a transform, taller
+  than a page) and for multicol.
+- Chrome's usable A4 page with 20mm margins is 972px tall, fulgur's
+  971.34px, so a fit that hinges on less than a pixel can differ.
+
 ### Measured, to carry into the steps
 
 - The parked branch matches Chrome on 110 plain-paragraph probes, fixes
